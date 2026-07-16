@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 import re
 import time
@@ -12,7 +13,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -20,9 +20,16 @@ if str(APP_DIR) in sys.path:
     sys.path.remove(str(APP_DIR))
 sys.path.insert(0, str(APP_DIR))
 
-import livrable_base_calcul as modele
-import livrable_affichage as affichage_module
-from livrable_affichage import (
+import Base as modele
+import affichage as affichage_module
+import parametres as parametres_module
+
+# Streamlit conserve les modules importés entre deux exécutions. Ce rechargement
+# garantit que les libellés, valeurs par défaut et validations restent synchronisés.
+importlib.invalidate_caches()
+parametres_module = importlib.reload(parametres_module)
+
+from affichage import (
     format_seconds,
     make_cavatappi_figure,
     make_cross_section_figure,
@@ -32,15 +39,32 @@ from livrable_affichage import (
     plot_suspended_response,
     plot_time_response_fr,
 )
-from livrable_parametres import (
+from parametres import (
     BLOCKED_RESULT_PATH,
+    AXIAL_MODULUS_LABELS,
+    AXIAL_MODULUS_OPTIONS,
+    BIAS_ANGLE_PROFILE_LABELS,
+    BIAS_ANGLE_PROFILE_OPTIONS,
+    CONSTITUTIVE_LABELS,
+    CONSTITUTIVE_OPTIONS,
     DEFAULT_SETTINGS,
+    HYSTERESIS_RESULT_PATH,
     INTEGRATION_LABELS,
     INTEGRATION_OPTIONS,
+    MAXWELL_ANISOTROPY_LABELS,
+    MAXWELL_ANISOTROPY_OPTIONS,
+    NYLON_CONDITION_LABELS,
+    NYLON_CONDITION_OPTIONS,
+    PRESTRAIN_REFERENCE_LABELS,
+    PRESTRAIN_REFERENCE_OPTIONS,
+    PRESSURE_INPUT_LABELS,
+    PRESSURE_INPUT_OPTIONS,
     PRESSURE_END_FORCE_LABELS,
     PRESSURE_END_FORCE_OPTIONS,
     PRESTRAIN_RESULT_PATH,
     RELAXATION_RESULT_PATH,
+    SECTION_UPDATE_LABELS,
+    SECTION_UPDATE_OPTIONS,
     SettingValue,
     SETTINGS_SCHEMA_VERSION,
     SUSPENDED_RESULT_PATH,
@@ -50,7 +74,7 @@ from livrable_parametres import (
     build_config,
     cycle_period_seconds,
     derived_geometry,
-    geometry_error,
+    settings_error,
     load_result_cache,
     load_settings,
     make_pressure_history,
@@ -59,12 +83,19 @@ from livrable_parametres import (
     save_result_cache,
     save_settings,
 )
-from livrable_parallel import (
+from parallel import (
     run_hysteresis_pressure_rate_case,
     run_hysteresis_prestrain_case,
     run_prestrain_case,
 )
-from livrable_timing import (
+from pression import (
+    estimate_measured_period,
+    infer_column,
+    infer_pressure_unit,
+    measured_pressure_payload,
+    parse_uploaded_numeric_csv,
+)
+from timing import (
     estimate_compute_seconds,
     load_timing_profile,
     model_cost_index,
@@ -93,6 +124,9 @@ BLOCKED_RESULT_IGNORE_KEYS = {
     "relaxation_ramp_time_s",
     "relaxation_hold_time_s",
     "suspended_mass_g",
+    "suspended_duration_s",
+    "suspended_pressure_rate_mpa_s",
+    "suspended_hold_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -108,7 +142,14 @@ RELAXATION_RESULT_IGNORE_KEYS = {
     "hysteresis_prestrain_values",
     "hysteresis_pressure_rates_mpa_s",
     "n_cycles",
+    "use_fixed_duration",
+    "duration_s",
+    "flow_rate_mL_min",
+    "volume_mL",
     "suspended_mass_g",
+    "suspended_duration_s",
+    "suspended_pressure_rate_mpa_s",
+    "suspended_hold_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -124,6 +165,9 @@ PRESTRAIN_RESULT_IGNORE_KEYS = {
     "relaxation_ramp_time_s",
     "relaxation_hold_time_s",
     "suspended_mass_g",
+    "suspended_duration_s",
+    "suspended_pressure_rate_mpa_s",
+    "suspended_hold_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -140,6 +184,12 @@ SUSPENDED_RESULT_IGNORE_KEYS = {
     "hysteresis_pressure_rates_mpa_s",
     "relaxation_ramp_time_s",
     "relaxation_hold_time_s",
+    "n_cycles",
+    "use_fixed_duration",
+    "duration_s",
+    "flow_rate_mL_min",
+    "volume_mL",
+    "nonlinear_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -157,6 +207,9 @@ HYSTERESIS_COMPARE_IGNORE_KEYS = {
     "relaxation_ramp_time_s",
     "relaxation_hold_time_s",
     "suspended_mass_g",
+    "suspended_duration_s",
+    "suspended_pressure_rate_mpa_s",
+    "suspended_hold_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -195,13 +248,14 @@ def parse_positive_float_list(text: object, max_count: int = 8) -> list[float]:
 
 def settings_signature(settings: dict[str, SettingValue], ignore_keys: set[str] | None = None) -> tuple[tuple[str, str], ...]:
     ignored = ignore_keys or set()
-    return tuple(
+    settings_items = tuple(
         sorted(
             (key, str(value))
             for key, value in settings.items()
             if key not in ignored and not key.startswith("_")
         )
     )
+    return (("_model_version", str(modele.MODEL_VERSION)),) + settings_items
 
 
 def result_matches_settings(
@@ -265,79 +319,43 @@ def apply_view_query_params(settings: dict[str, SettingValue]) -> dict[str, Sett
 def inject_keyboard_view_controls(settings: dict[str, SettingValue]) -> None:
     elev = float(settings.get("view_elev_deg", 22.0))
     azim = float(settings.get("view_azim_deg", -58.0))
-    components.html(
-        f"""
-        <script>
-        (() => {{
-            const parentWindow = window.parent;
-            let parentDocument = null;
-            try {{
-                parentDocument = parentWindow.document;
-            }} catch (error) {{
-                parentDocument = document;
-            }}
-
-            const state = {{
-                elev: {elev:.6f},
-                azim: {azim:.6f}
-            }};
+    renderer = st.components.v2.component(
+        "cavatappi_keyboard_view",
+        html="<span aria-hidden='true'></span>",
+        js="""
+        export default function(component) {
+            const state = {
+                elev: Number(component.data.elev),
+                azim: Number(component.data.azim)
+            };
             const clamp = (value, minValue, maxValue) => Math.min(maxValue, Math.max(minValue, value));
-            const wrapAzim = (value) => {{
-                let wrapped = ((value + 180) % 360 + 360) % 360 - 180;
+            const wrapAzim = (value) => {
+                const wrapped = ((value + 180) % 360 + 360) % 360 - 180;
                 return wrapped === -180 ? 180 : wrapped;
-            }};
-            const syncUrl = (replaceOnly) => {{
-                const url = new URL(parentWindow.location.href);
+            };
+            const handler = (event) => {
+                const tagName = event.target?.tagName?.toUpperCase() || "";
+                if (["INPUT", "TEXTAREA", "SELECT"].includes(tagName) || event.ctrlKey || event.metaKey || event.altKey) return;
+                let changed = true;
+                if (event.key === "ArrowLeft") state.azim = wrapAzim(state.azim - 5);
+                else if (event.key === "ArrowRight") state.azim = wrapAzim(state.azim + 5);
+                else if (event.key === "ArrowUp") state.elev = clamp(state.elev + 3, 0, 90);
+                else if (event.key === "ArrowDown") state.elev = clamp(state.elev - 3, 0, 90);
+                else changed = false;
+                if (!changed) return;
+                event.preventDefault();
+                const url = new URL(window.location.href);
                 url.searchParams.set("view_elev_deg", state.elev.toFixed(1));
                 url.searchParams.set("view_azim_deg", state.azim.toFixed(1));
-                if (replaceOnly) {{
-                    parentWindow.history.replaceState(null, "", url.toString());
-                }} else {{
-                    parentWindow.location.href = url.toString();
-                }}
-            }};
-
-            syncUrl(true);
-            if (parentWindow.__cavatappiArrowViewHandler) {{
-                parentDocument.removeEventListener("keydown", parentWindow.__cavatappiArrowViewHandler, true);
-            }}
-
-            const handler = (event) => {{
-                const tagName = event.target && event.target.tagName
-                    ? event.target.tagName.toUpperCase()
-                    : "";
-                if (["INPUT", "TEXTAREA", "SELECT"].includes(tagName) || event.ctrlKey || event.metaKey || event.altKey) {{
-                    return;
-                }}
-
-                let changed = true;
-                if (event.key === "ArrowLeft") {{
-                    state.azim = wrapAzim(state.azim - 5);
-                }} else if (event.key === "ArrowRight") {{
-                    state.azim = wrapAzim(state.azim + 5);
-                }} else if (event.key === "ArrowUp") {{
-                    state.elev = clamp(state.elev + 3, 0, 90);
-                }} else if (event.key === "ArrowDown") {{
-                    state.elev = clamp(state.elev - 3, 0, 90);
-                }} else {{
-                    changed = false;
-                }}
-
-                if (changed) {{
-                    event.preventDefault();
-                    event.stopPropagation();
-                    syncUrl(false);
-                }}
-            }};
-
-            parentWindow.__cavatappiArrowViewHandler = handler;
-            parentDocument.addEventListener("keydown", handler, true);
-        }})();
-        </script>
+                window.location.href = url.toString();
+            };
+            document.addEventListener("keydown", handler, true);
+            return () => document.removeEventListener("keydown", handler, true);
+        }
         """,
-        height=0,
-        width=0,
+        isolate_styles=False,
     )
+    renderer(key="keyboard_view", data={"elev": elev, "azim": azim}, width=1, height=1)
 
 
 def make_suspended_response_figure(data: dict[str, np.ndarray], show_geometry: bool):
@@ -370,7 +388,12 @@ def run_with_progress(label: str, estimated_seconds: float, function, *args):
             )
             time.sleep(0.2)
 
-        result = future.result()
+        try:
+            result = future.result()
+        except Exception as exc:
+            progress.empty()
+            status.error(f"{label} interrompu : {exc}")
+            st.stop()
 
     elapsed = time.perf_counter() - start
     progress.progress(100, text=f"{label} : terminé en {format_seconds(elapsed)}")
@@ -378,11 +401,26 @@ def run_with_progress(label: str, estimated_seconds: float, function, *args):
     return result, elapsed
 
 
-def run_model(settings: dict[str, SettingValue]):
+def run_model(settings: dict[str, SettingValue], measured_history=None):
     config = build_config(settings)
-    pressure_time, pressure_mpa = make_pressure_history(config)
+    if measured_history is None:
+        pressure_time, pressure_mpa = make_pressure_history(config)
+    else:
+        pressure_time = np.asarray(measured_history["time"], dtype=float)
+        pressure_mpa = np.asarray(measured_history["pressure_MPa"], dtype=float)
+        measured_period = estimate_measured_period(pressure_time, pressure_mpa)
+        config.measured_cycle_period_s = measured_period if measured_period is not None else float(pressure_time[-1])
+        if measured_period is not None:
+            config.n_cycles = max(1, int(round(float(pressure_time[-1]) / measured_period)))
+        else:
+            config.n_cycles = 1
     _, data = modele.run_blocked_actuation(config, pressure_time=pressure_time, pressure_MPa=pressure_mpa)
     return config, data, modele.summary(data)
+
+
+def result_cycle_period(config) -> float:
+    measured_period = getattr(config, "measured_cycle_period_s", None)
+    return float(measured_period) if measured_period is not None else cycle_period_seconds(config)
 
 
 def run_relaxation_model(settings: dict[str, SettingValue]):
@@ -616,6 +654,7 @@ def initialize_cached_results() -> None:
         "relaxation_result": RELAXATION_RESULT_PATH,
         "prestrain_study_result": PRESTRAIN_RESULT_PATH,
         "suspended_result": SUSPENDED_RESULT_PATH,
+        "hysteresis_comparison_result": HYSTERESIS_RESULT_PATH,
     }
     for key, path in cache_paths.items():
         if key not in st.session_state:
@@ -634,9 +673,9 @@ settings.setdefault("suspended_show_geometry_plot", INTERFACE_DEFAULT_SUSPENDED_
 settings = apply_view_query_params(settings)
 timing_profile = load_timing_profile(TIMING_PROFILE_PATH)
 
-st.set_page_config(page_title="Calculateur Cavatappi - livrable", layout="wide")
+st.set_page_config(page_title="Calculateur Cavatappi - Beta", layout="wide")
 st.title("Calculateur d'actionneur Cavatappi")
-st.caption("Interface livrable pour la géométrie, l'actionnement bloqué et la visualisation du modèle TCPA.")
+st.caption("Interface de simulation pour la géométrie, l'actionnement et la visualisation du modèle TCPA.")
 
 st.sidebar.header("Paramètres d'entrée")
 if st.sidebar.button("Paramètres par défaut", type="secondary", use_container_width=True):
@@ -656,6 +695,7 @@ with st.sidebar.expander("Géométrie", expanded=True):
             "Rout et Rin règlent l'épaisseur du tube, donc sa raideur et la surface soumise à la pression.",
             "rho0, alpha0 et la longueur initiale définissent l'hélice de départ.",
             "theta_f est l'angle de biais des fibres/matière du tube utilisé pour l'anisotropie.",
+            "La mise à jour hélicoïdale conserve la section initiale ; le mode évolutif actualise aussi les rayons et l'orientation du matériau.",
         ]
     )
     rout_mm = st.number_input("Rayon extérieur du tube Rout (mm)", 0.05, 5.0, float(settings["rout_mm"]), 0.05)
@@ -664,9 +704,32 @@ with st.sidebar.expander("Géométrie", expanded=True):
     rho0_mm = st.number_input("Rayon de ligne centrale rho0 (mm)", 0.05, 10.0, float(settings["rho0_mm"]), 0.05)
     alpha0_deg = st.number_input("Angle hélicoïdal initial alpha0 (deg)", 0.1, 85.0, float(settings["alpha0_deg"]), 0.1)
     theta_f_deg = st.number_input("Angle de biais du tube theta_f (deg)", 0.0, 89.0, float(settings["theta_f_deg"]), 0.1)
+    bias_angle_profile = st.selectbox(
+        "Profil radial de l'angle de biais",
+        BIAS_ANGLE_PROFILE_OPTIONS,
+        index=option_index(BIAS_ANGLE_PROFILE_OPTIONS, settings.get("bias_angle_profile", "paper_linear")),
+        format_func=lambda value: BIAS_ANGLE_PROFILE_LABELS.get(value, value),
+        help=(
+            "La variation linéaire fait évoluer l'angle de biais proportionnellement au rayon. "
+            "La loi en tangente représente un taux de torsion uniforme dans le tube droit."
+        ),
+    )
     initial_length_mm = st.number_input(
         "Longueur initiale de l'actionneur (mm)", 1.0, 500.0, float(settings["initial_length_mm"]), 0.5
     )
+    section_update_mode = st.selectbox(
+        "Mise à jour de la section du tube",
+        SECTION_UPDATE_OPTIONS,
+        index=option_index(SECTION_UPDATE_OPTIONS, settings.get("section_update_mode", "fixed")),
+        format_func=lambda value: SECTION_UPDATE_LABELS.get(value, value),
+    )
+
+uploaded_pressure_payload = None
+measured_pressure_time_column = str(settings.get("measured_pressure_time_column", ""))
+measured_pressure_column = str(settings.get("measured_pressure_column", ""))
+measured_pressure_unit = str(settings.get("measured_pressure_unit", "MPa"))
+measured_pressure_file_hash = str(settings.get("measured_pressure_file_hash", ""))
+measured_pressure_subtract_initial = bool(settings.get("measured_pressure_subtract_initial", True))
 
 with st.sidebar.expander("Pression et actionnement", expanded=True):
     sidebar_help(
@@ -674,29 +737,103 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
             "Ces paramètres définissent le chargement appliqué pendant l'actionnement bloqué.",
             "La précontrainte initiale étire l'actionneur avant l'injection de pression.",
             "La pression maximale fixe l'amplitude du cycle de pression.",
-            "Le débit et le volume par demi-cycle servent à construire la montée et la descente de pression si la durée fixe n'est pas utilisée.",
+            "Le débit et le volume définissent uniquement la durée d'un demi-cycle : ils ne constituent pas un modèle hydraulique pression-volume.",
         ]
     )
+    pressure_input_mode = st.selectbox(
+        "Source de pression",
+        PRESSURE_INPUT_OPTIONS,
+        index=option_index(PRESSURE_INPUT_OPTIONS, settings.get("pressure_input_mode", "generated")),
+        format_func=lambda value: PRESSURE_INPUT_LABELS.get(value, value),
+    )
     eps = st.slider("Précontrainte initiale", 0.0, 1.5, float(settings["eps"]), 0.05)
-    p_max_mpa = st.slider("Pression maximale (MPa)", 0.0, 3.0, float(settings["p_max_mpa"]), 0.05)
+    p_max_mpa = st.slider("Pression maximale (MPa)", 0.0, 1.5, min(float(settings["p_max_mpa"]), 1.5), 0.05)
     n_cycles = st.slider("Cycles", 1, 60, int(settings["n_cycles"]), 1)
     use_fixed_duration = st.checkbox("Utiliser une durée totale fixe", bool(settings["use_fixed_duration"]))
     duration_s = st.number_input("Durée totale (s)", 1.0, 5000.0, float(settings["duration_s"]), 10.0)
     flow_rate_mL_min = st.number_input("Débit (mL/min)", 0.01, 200.0, float(settings["flow_rate_mL_min"]), 0.5)
-    volume_mL = st.number_input("Volume par demi-cycle (mL)", 0.001, 100.0, float(settings["volume_mL"]), 0.05)
-    nonlinear_pressure = st.checkbox("Profil de pression non linéaire", bool(settings["nonlinear_pressure"]))
+    volume_mL = st.number_input("Volume de commande par demi-cycle (mL)", 0.001, 100.0, float(settings["volume_mL"]), 0.05)
+    nonlinear_pressure = st.checkbox(
+        "Profil de pression phénoménologique non linéaire",
+        bool(settings["nonlinear_pressure"]),
+        help="Ce profil utilise des exposants empiriques. Pour un protocole contrôlé, conservez le profil linéaire.",
+    )
+    if use_fixed_duration:
+        st.caption("La durée fixe remplace le débit demandé par un débit effectif calculé à partir du nombre de cycles.")
+    if pressure_input_mode == "measured_csv":
+        uploaded_pressure_file = st.file_uploader(
+            "Historique de pression mesuré",
+            type=["csv", "txt"],
+            help="Le fichier doit contenir une colonne de temps et une colonne de pression.",
+        )
+        if uploaded_pressure_file is not None:
+            raw_pressure_file = uploaded_pressure_file.getvalue()
+            measured_pressure_file_hash = hashlib.sha256(raw_pressure_file).hexdigest()
+            try:
+                uploaded_columns = parse_uploaded_numeric_csv(raw_pressure_file)
+                uploaded_headers = list(uploaded_columns)
+                default_time = (
+                    measured_pressure_time_column
+                    if measured_pressure_time_column in uploaded_headers
+                    else infer_column(uploaded_headers, ("temps", "time", "seconde", "second", " t"), 0)
+                )
+                default_pressure = (
+                    measured_pressure_column
+                    if measured_pressure_column in uploaded_headers
+                    else infer_column(uploaded_headers, ("pression", "pressure", "press"), min(1, len(uploaded_headers) - 1))
+                )
+                measured_pressure_time_column = st.selectbox(
+                    "Colonne de temps",
+                    uploaded_headers,
+                    index=option_index(uploaded_headers, default_time),
+                )
+                measured_pressure_column = st.selectbox(
+                    "Colonne de pression",
+                    uploaded_headers,
+                    index=option_index(uploaded_headers, default_pressure),
+                )
+                unit_options = ["MPa", "bar", "kPa", "psi"]
+                inferred_unit = infer_pressure_unit(measured_pressure_column)
+                selected_unit = measured_pressure_unit if measured_pressure_unit in unit_options else inferred_unit
+                if not str(settings.get("measured_pressure_column", "")):
+                    selected_unit = inferred_unit
+                measured_pressure_unit = st.selectbox(
+                    "Unité de pression du fichier",
+                    unit_options,
+                    index=option_index(unit_options, selected_unit),
+                )
+                measured_pressure_subtract_initial = st.checkbox(
+                    "Soustraire le zéro initial du capteur",
+                    measured_pressure_subtract_initial,
+                )
+                uploaded_pressure_payload = measured_pressure_payload(
+                    uploaded_columns,
+                    measured_pressure_time_column,
+                    measured_pressure_column,
+                    measured_pressure_unit,
+                    measured_pressure_subtract_initial,
+                )
+                st.caption(
+                    f"{len(uploaded_pressure_payload['time'])} points | "
+                    f"durée {uploaded_pressure_payload['time'][-1]:.3f} s | "
+                    f"pression max {np.max(uploaded_pressure_payload['pressure_MPa']):.4f} MPa"
+                )
+            except (ValueError, KeyError) as exc:
+                st.error(f"Historique de pression invalide : {exc}")
+        else:
+            st.info("Chargez un fichier CSV pour pouvoir relancer le calcul avec la pression mesurée.")
 
 with st.sidebar.expander("Masse suspendue"):
     sidebar_help(
         [
             "Ce volet règle le mode d'actionnement libre avec une masse accrochée au bas de l'actionneur.",
             "La masse est convertie en charge F_load = m g.",
-            "Le solveur cherche la géométrie libre qui vérifie les équilibres F, M et T de l'article.",
-            "Ce mode donne un déplacement/strain d'actionnement, pas une force bloquée.",
+            "Le solveur cherche la géométrie libre qui équilibre la force, la flexion et la torsion.",
+            "Ce mode calcule un déplacement et une déformation d'actionnement, pas une force bloquée.",
             "La pression peut monter à vitesse imposée puis redescendre, ou rester maintenue pour observer la relaxation libre.",
         ]
     )
-    suspended_mass_g = st.number_input("Masse suspendue (g)", 0.0, 5000.0, float(settings["suspended_mass_g"]), 10.0)
+    suspended_mass_g = st.number_input("Masse suspendue (g)", 0.1, 5000.0, max(float(settings["suspended_mass_g"]), 0.1), 10.0)
     suspended_duration_s = st.number_input(
         "Durée de simulation masse suspendue (s)",
         0.1,
@@ -795,10 +932,29 @@ with st.sidebar.expander("Matériau tube"):
         ]
     )
     E_axial_mpa = st.number_input("Module axial du tube E_axial (MPa)", 0.001, 10000.0, float(settings["E_axial_mpa"]), 0.1)
+    axial_modulus_mode = st.selectbox(
+        "Convention du module axial",
+        AXIAL_MODULUS_OPTIONS,
+        index=option_index(AXIAL_MODULUS_OPTIONS, settings.get("axial_modulus_mode", "maxwell_sum")),
+        format_func=lambda value: AXIAL_MODULUS_LABELS.get(value, value),
+    )
+    maxwell_anisotropy_mode = st.selectbox(
+        "Anisotropie de la relaxation",
+        MAXWELL_ANISOTROPY_OPTIONS,
+        index=option_index(
+            MAXWELL_ANISOTROPY_OPTIONS,
+            settings.get("maxwell_anisotropy_mode", "paper_equal"),
+        ),
+        format_func=lambda value: MAXWELL_ANISOTROPY_LABELS.get(value, value),
+        help=(
+            "Le mode axial applique la relaxation uniquement à la direction axiale. "
+            "Le mode proportionnel applique les mêmes fractions de relaxation à toutes les directions du matériau."
+        ),
+    )
     E_radius_mpa = st.number_input("Module radial du tube E_radius (MPa)", 0.001, 10000.0, float(settings["E_radius_mpa"]), 0.1)
     G12_mpa = st.number_input("Module de cisaillement du tube G12 (MPa)", 0.001, 10000.0, float(settings["G12_mpa"]), 0.1)
-    nu12 = st.number_input("Coefficient de Poisson nu12", -0.95, 0.95, float(settings["nu12"]), 0.005)
-    nu23 = st.number_input("Coefficient de Poisson nu23", -0.95, 0.95, float(settings["nu23"]), 0.005)
+    nu12 = st.number_input("Coefficient de Poisson nu12", -0.49, 0.49, float(np.clip(settings["nu12"], -0.49, 0.49)), 0.005)
+    nu23 = st.number_input("Coefficient de Poisson nu23", -0.49, 0.49, float(np.clip(settings["nu23"], -0.49, 0.49)), 0.005)
 
 with st.sidebar.expander("Maxwell généralisé"):
     sidebar_help(
@@ -808,6 +964,26 @@ with st.sidebar.expander("Maxwell généralisé"):
             "Chaque branche Ei, etai ajoute une relaxation avec un temps caractéristique proche de etai / Ei.",
             "Des viscosités plus grandes ralentissent la relaxation.",
         ]
+    )
+    constitutive_mode = st.selectbox(
+        "Réponse constitutive",
+        CONSTITUTIVE_OPTIONS,
+        index=option_index(CONSTITUTIVE_OPTIONS, settings.get("constitutive_mode", "generalized_maxwell")),
+        format_func=lambda value: CONSTITUTIVE_LABELS.get(value, value),
+        help="Le mode élastique instantané désactive la relaxation et l'hystérésis sans changer la rigidité instantanée totale.",
+    )
+    prestrain_reference_mode = st.selectbox(
+        "Traitement de la précontrainte",
+        PRESTRAIN_REFERENCE_OPTIONS,
+        index=option_index(
+            PRESTRAIN_REFERENCE_OPTIONS,
+            settings.get("prestrain_reference_mode", "elastic_tk_reference"),
+        ),
+        format_func=lambda value: PRESTRAIN_REFERENCE_LABELS.get(value, value),
+        help=(
+            "Précontrainte élastique conservée : la contrainte créée avant l'actionnement reste une base fixe. "
+            "Précontrainte viscoélastique : la précontrainte est aussi traitée par les branches de Maxwell et peut relaxer."
+        ),
     )
     maxwell_E0_mpa = st.number_input("Ressort permanent E0 (MPa)", 0.0, 10000.0, float(settings["maxwell_E0_mpa"]), 0.1)
     maxwell_E1_mpa = st.number_input("Branche E1 (MPa)", 0.0, 10000.0, float(settings["maxwell_E1_mpa"]), 0.1)
@@ -828,21 +1004,29 @@ with st.sidebar.expander("Nylon"):
     )
     E_nylon_mpa = st.number_input("Module axial du nylon E_nylon (MPa)", 0.001, 100000.0, float(settings["E_nylon_mpa"]), 10.0)
     G_nylon_mpa = st.number_input("Module de cisaillement du nylon G_nylon (MPa)", 0.001, 100000.0, float(settings["G_nylon_mpa"]), 10.0)
-    nylon_scale = st.slider("Facteur de raideur du nylon", 0.0, 5.0, float(settings["nylon_scale"]), 0.05)
-    nylon_axial_prestrain_coupling = st.slider(
-        "Couplage axial du nylon en précontrainte", 0.0, 1.0, float(settings["nylon_axial_prestrain_coupling"]), 0.05
+    nylon_condition_mode = st.selectbox(
+        "Condition mécanique du nylon",
+        NYLON_CONDITION_OPTIONS,
+        index=option_index(NYLON_CONDITION_OPTIONS, settings.get("nylon_condition_mode", "bonded_linear")),
+        format_func=lambda value: NYLON_CONDITION_LABELS.get(value, value),
+        help=(
+            "Linéaire bilatéral autorise le nylon à travailler en traction et en compression. Traction seulement "
+            "représente un filament qui se détend au lieu de pousser. Glissant annule uniquement sa force axiale."
+        ),
     )
-    nylon_axial_actuation_coupling = st.slider(
-        "Couplage axial du nylon en actionnement", 0.0, 1.0, float(settings["nylon_axial_actuation_coupling"]), 0.05
-    )
+    nylon_scale = 1.0
+    nylon_axial_prestrain_coupling = 0.0 if nylon_condition_mode == "axially_sliding_confined" else 1.0
+    nylon_axial_actuation_coupling = nylon_axial_prestrain_coupling
+    st.caption("Les multiplicateurs continus du nylon sont verrouillés à leur valeur physique, sans calibration.")
 
 with st.sidebar.expander("Force de fond pression"):
     sidebar_help(
         [
             "Ce volet ajoute éventuellement une force axiale directe due à la pression sur une surface de fond.",
             "Le mode choisi définit la surface utilisée pour cette force.",
-            "Le facteur permet de désactiver, réduire ou amplifier cette contribution.",
+            "La contribution vaut strictement pression multipliée par aire, sans facteur ajustable.",
             "Par défaut, cette contribution est nulle pour rester proche du modèle mécanique principal.",
+            "Une valeur non nulle ajoute la poussée directe exercée par la pression sur un fond fermé.",
         ]
     )
     pressure_end_force_mode = st.selectbox(
@@ -851,9 +1035,8 @@ with st.sidebar.expander("Force de fond pression"):
         index=option_index(PRESSURE_END_FORCE_OPTIONS, settings["pressure_end_force_mode"]),
         format_func=lambda value: PRESSURE_END_FORCE_LABELS.get(value, value),
     )
-    pressure_end_force_scale = st.number_input(
-        "Facteur de force de fond", 0.0, 10.0, float(settings["pressure_end_force_scale"]), 0.1
-    )
+    pressure_end_force_scale = 0.0 if pressure_end_force_mode == "none" else 1.0
+    st.caption(f"Facteur physique appliqué : {pressure_end_force_scale:.0f}")
 
 with st.sidebar.expander("Solveur"):
     sidebar_help(
@@ -863,9 +1046,8 @@ with st.sidebar.expander("Solveur"):
             "Les couches radiales et divisions angulaires définissent le maillage numérique de la section du tube.",
             "Les étapes de précontrainte divisent l'étirement initial en petits incréments.",
             "Les cœurs CPU parallèles sont utilisés pour les études avec plusieurs simulations indépendantes.",
-            "Incrémentale article : forme la plus proche de l'écriture incrémentale de l'article pour la contrainte totale.",
-            "Explicite article : met à jour explicitement chaque branche de Maxwell, puis reconstruit la contrainte totale.",
-            "Exponentielle stable : intègre la relaxation des branches avec un facteur exponentiel, plus robuste si dt est grand.",
+            "Euler explicite : applique directement la loi incrémentale, mais impose dt < 2 fois le plus petit temps de relaxation.",
+            "Exponentielle cohérente : intègre exactement la relaxation sur chaque pas à déformation affine et utilise le même opérateur pour le gonflement radial.",
         ]
     )
     dt = st.number_input("Pas de temps dt (s)", 0.01, 20.0, float(settings["dt"]), 0.05)
@@ -892,7 +1074,7 @@ with st.sidebar.expander("Visualiseur"):
         ]
     )
     view_elev_deg = st.slider("Élévation de vue (deg)", 0.0, 90.0, float(settings["view_elev_deg"]), 1.0)
-    view_azim_deg = st.slider("Azimut de vue (deg)", -180.0, 180.0, float(settings["view_azim_deg"]), 5.0)
+    view_azim_deg = st.slider("Azimut de vue (deg)", -180.0, 180.0, float(settings["view_azim_deg"]), 1.0)
 
 current_settings = {
     "_settings_schema_version": SETTINGS_SCHEMA_VERSION,
@@ -907,7 +1089,9 @@ current_settings = {
     "rho0_mm": float(rho0_mm),
     "alpha0_deg": float(alpha0_deg),
     "theta_f_deg": float(theta_f_deg),
+    "bias_angle_profile": str(bias_angle_profile),
     "initial_length_mm": float(initial_length_mm),
+    "section_update_mode": str(section_update_mode),
     "pressure_end_force_mode": str(pressure_end_force_mode),
     "pressure_end_force_scale": float(pressure_end_force_scale),
     "n_cycles": int(n_cycles),
@@ -921,6 +1105,12 @@ current_settings = {
     "flow_rate_mL_min": float(flow_rate_mL_min),
     "volume_mL": float(volume_mL),
     "nonlinear_pressure": bool(nonlinear_pressure),
+    "pressure_input_mode": str(pressure_input_mode),
+    "measured_pressure_time_column": str(measured_pressure_time_column),
+    "measured_pressure_column": str(measured_pressure_column),
+    "measured_pressure_unit": str(measured_pressure_unit),
+    "measured_pressure_file_hash": str(measured_pressure_file_hash if pressure_input_mode == "measured_csv" else ""),
+    "measured_pressure_subtract_initial": bool(measured_pressure_subtract_initial),
     "relaxation_ramp_time_s": float(relaxation_ramp_time_s),
     "relaxation_hold_time_s": float(relaxation_hold_time_s),
     "suspended_mass_g": float(suspended_mass_g),
@@ -931,6 +1121,10 @@ current_settings = {
     "dt": float(dt),
     "pre_steps": int(pre_steps),
     "integration": str(integration),
+    "prestrain_reference_mode": str(prestrain_reference_mode),
+    "constitutive_mode": str(constitutive_mode),
+    "maxwell_anisotropy_mode": str(maxwell_anisotropy_mode),
+    "axial_modulus_mode": str(axial_modulus_mode),
     "E_axial_mpa": float(E_axial_mpa),
     "E_radius_mpa": float(E_radius_mpa),
     "G12_mpa": float(G12_mpa),
@@ -947,6 +1141,7 @@ current_settings = {
     "G_nylon_mpa": float(G_nylon_mpa),
     "nylon_axial_prestrain_coupling": float(nylon_axial_prestrain_coupling),
     "nylon_axial_actuation_coupling": float(nylon_axial_actuation_coupling),
+    "nylon_condition_mode": str(nylon_condition_mode),
     "nylon_scale": float(nylon_scale),
     "n_layers": int(n_layers),
     "n_phi": int(n_phi),
@@ -960,15 +1155,60 @@ initialize_cached_results()
 if "hysteresis_comparison_result" not in st.session_state:
     st.session_state["hysteresis_comparison_result"] = None
 
-error = geometry_error(current_settings)
+error = settings_error(current_settings)
 if error:
     st.error(error)
+if nylon_condition_mode != "bonded_linear":
+    st.info(
+        "La condition sélectionnée représente un filament qui peut se détendre ou glisser axialement. "
+        "Aucun coefficient d'ajustement intermédiaire n'est appliqué."
+    )
+maxwell_sum = float(maxwell_E0_mpa + maxwell_E1_mpa + maxwell_E2_mpa + maxwell_E3_mpa)
+effective_axial_modulus = maxwell_sum if axial_modulus_mode == "maxwell_sum" else float(E_axial_mpa)
+if maxwell_sum > 0.0 and abs(effective_axial_modulus - maxwell_sum) / maxwell_sum > 0.05:
+    st.info(
+        f"Le module axial ({float(E_axial_mpa):.2f} MPa) diffère de la somme des modules de Maxwell "
+        f"({maxwell_sum:.2f} MPa). Le modèle conserve E_axial pour l'anisotropie et les modules de Maxwell pour leurs fractions relatives."
+    )
+if constitutive_mode == "instantaneous_elastic":
+    st.info(
+        "Le mode élastique instantané conserve la rigidité instantanée totale mais désactive la relaxation et l'hystérésis. "
+        "Il sert de référence physique, pas de calibration."
+    )
+if maxwell_anisotropy_mode == "axial_test_only":
+    st.caption(
+        "Les paramètres de relaxation proviennent d'un essai de traction : seule la direction matérielle axiale "
+        "reçoit ces branches. La raideur radiale et le cisaillement restent élastiques faute de mesures dédiées."
+    )
+if section_update_mode == "updated":
+    st.caption(
+        "La section radiale évolutive actualise les rayons et l'orientation du matériau à chaque incrément."
+    )
+if str(integration) == "paper_explicit":
+    active_tau = [
+        eta / modulus
+        for modulus, eta in (
+            (float(maxwell_E1_mpa), float(maxwell_eta1_mpa_s)),
+            (float(maxwell_E2_mpa), float(maxwell_eta2_mpa_s)),
+            (float(maxwell_E3_mpa), float(maxwell_eta3_mpa_s)),
+        )
+        if modulus > 0.0
+    ]
+    if active_tau and float(dt) > min(active_tau):
+        st.warning(
+            f"Le pas dépasse le plus petit temps de relaxation ({min(active_tau):.3g} s). "
+            "Euler reste éventuellement stable sous 2 tau, mais peut osciller ; l'intégration exponentielle est recommandée."
+        )
 
-if bool(use_fixed_duration):
+if pressure_input_mode == "measured_csv" and uploaded_pressure_payload is not None:
+    estimated_duration_s = float(uploaded_pressure_payload["time"][-1])
+    estimated_steps = max(1, len(uploaded_pressure_payload["time"]) - 1)
+elif bool(use_fixed_duration):
     estimated_duration_s = float(duration_s)
+    estimated_steps = int(np.ceil(estimated_duration_s / dt))
 else:
     estimated_duration_s = int(n_cycles) * 2.0 * 60.0 * float(volume_mL) / float(flow_rate_mL_min)
-estimated_steps = int(np.ceil(estimated_duration_s / dt))
+    estimated_steps = int(np.ceil(estimated_duration_s / dt))
 estimated_cost = model_cost_index(estimated_steps, n_layers, n_phi, pre_steps)
 estimated_relaxation_steps = int(np.ceil((relaxation_ramp_time_s + relaxation_hold_time_s) / dt))
 estimated_relaxation_cost = model_cost_index(estimated_relaxation_steps, n_layers, n_phi, pre_steps)
@@ -1037,11 +1277,11 @@ hysteresis_comparison_signature = (
     hysteresis_settings_signature,
 )
 
-left, right = st.columns([1.45, 1.0], gap="large")
+left, right = st.columns([1.3, 1.2], gap="large")
 
 with left:
     visual_state = st.radio(
-        "Etat du visualiseur",
+        "État du visualiseur",
         VISUAL_STATE_OPTIONS,
         horizontal=True,
         format_func=lambda value: VISUAL_STATE_LABELS.get(value, value),
@@ -1058,7 +1298,7 @@ with right:
     c2.metric("Pas", f"{geom['pitch0_mm']:.2f} mm")
     c1.metric("Indice rho/Rout", f"{geom['spring_index']:.2f}")
     c2.metric("Mandrin estimé", f"{geom['equivalent_mandrel_diameter_mm']:.2f} mm")
-    c1.metric("Aire de paroi du tube", f"{geom['wall_area_mm2']:.3f} mm2")
+    c1.metric("Aire de paroi du tube", f"{geom['wall_area_mm2']:.3f} mm²")
     c2.metric("Volume interne", f"{geom['tube_internal_volume_ml']:.4f} mL")
     c1.metric("Remplissage nylon", f"{100.0 * geom['nylon_fill_ratio']:.1f} %")
     c2.metric("Longueur précontrainte", f"{geom['prestrained_length_mm']:.2f} mm")
@@ -1078,7 +1318,8 @@ tabs = st.tabs(
     ]
 )
 
-run_disabled = error is not None or estimated_cost > 250_000
+missing_measured_pressure = pressure_input_mode == "measured_csv" and uploaded_pressure_payload is None
+run_disabled = error is not None or estimated_cost > 250_000 or missing_measured_pressure
 relaxation_run_disabled = error is not None or estimated_relaxation_cost > 250_000
 suspended_run_disabled = error is not None or estimated_suspended_cost > 250_000
 prestrain_range_error = float(eps_study_max) <= float(eps_study_min)
@@ -1089,7 +1330,10 @@ with tabs[0]:
     if estimated_cost > 120_000 and not run_disabled:
         st.warning("Cette simulation peut être lente. Augmentez le pas de temps ou réduisez le maillage pour l'interaction.")
     if run_disabled and error is None:
-        st.warning("Les réglages du solveur sont trop lourds pour l'interface interactive.")
+        if missing_measured_pressure:
+            st.warning("Chargez l'historique CSV avant de relancer l'actionnement bloqué.")
+        else:
+            st.warning("Les réglages du solveur sont trop lourds pour l'interface interactive.")
 
     if st.button("Calculer l'actionnement bloqué", disabled=run_disabled):
         (config, data, summary), elapsed_s = run_with_progress(
@@ -1097,6 +1341,7 @@ with tabs[0]:
             estimated_compute_s,
             run_model,
             current_settings,
+            uploaded_pressure_payload,
         )
         timing_profile = record_timing_sample(timing_profile, TIMING_PROFILE_PATH, "blocked", estimated_cost, elapsed_s)
         st.session_state["calculator_result"] = {
@@ -1128,9 +1373,11 @@ with tabs[0]:
         k3.metric("Gain d'actionnement", f"{force_gain:.1f} mN")
         k4.metric("Couple max", f"{summary['torque_act_max_microNm']:.1f} microN m")
         st.caption(
-            f"Durée : {data['time'][-1]:.1f} s | "
-            f"période de cycle : {cycle_period_seconds(config):.2f} s | "
+            f"pression : {'CSV mesuré' if result['settings'].get('pressure_input_mode') == 'measured_csv' else 'profil généré'} | "
+            f"durée : {data['time'][-1]:.1f} s | "
+            f"période de cycle : {result_cycle_period(config):.2f} s | "
             f"échantillons : {len(data['time'])} | "
+            f"résidu maximal : {summary['max_abs_residual_Nmm']:.2e} N·mm | "
             f"calcul : {format_seconds(result.get('elapsed_s', 0.0))} "
             f"(estimé {format_seconds(result.get('estimated_s', 0.0))})"
         )
@@ -1166,7 +1413,7 @@ with tabs[2]:
                     {
                         "label": "calcul courant",
                         "data": result["data"],
-                        "period": cycle_period_seconds(config),
+                        "period": result_cycle_period(config),
                     }
                 ]
                 fig_hyst = plot_hysteresis_overlay(cases, cycles_to_plot, show=False)
@@ -1213,6 +1460,7 @@ with tabs[2]:
             comparison_result["settings"] = dict(current_settings)
             comparison_result["signature"] = hysteresis_comparison_signature
             st.session_state["hysteresis_comparison_result"] = comparison_result
+            save_result_cache(HYSTERESIS_RESULT_PATH, comparison_result)
 
         comparison_result = st.session_state["hysteresis_comparison_result"]
         if comparison_result is None or comparison_result.get("signature") != hysteresis_comparison_signature:
@@ -1380,7 +1628,7 @@ with tabs[5]:
     if bool(suspended_hold_pressure) and float(suspended_duration_s) <= suspended_ramp_time_s:
         st.warning("Le maintien à pression constante ne sera visible que si la durée dépasse le temps de rampe.")
     st.info(
-        "Ce mode résout les équilibres de l'article : "
+        "Ce mode résout les équilibres mécaniques suivants : "
         "F_tube + F_nylon = F_load sin(beta_h), "
         "M_tube + M_nylon = -F_load Rh sin(beta_h), "
         "T_tube + T_nylon = F_load Rh cos(beta_h)."

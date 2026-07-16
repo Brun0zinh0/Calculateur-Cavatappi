@@ -4,8 +4,8 @@ from typing import Any
 
 import numpy as np
 
-import livrable_base_calcul as modele
-from livrable_parametres import build_config, cycle_period_seconds, make_pressure_history
+import Base as modele
+from parametres import build_config, cycle_period_seconds, make_pressure_history
 
 
 def run_blocked_case(settings: dict[str, Any]):

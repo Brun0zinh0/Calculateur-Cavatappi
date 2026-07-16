@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Circle
 
-from livrable_parametres import PSI_TO_MPA, SettingValue, VISUAL_STATE_LABELS, derived_geometry
+from parametres import PSI_TO_MPA, SettingValue, VISUAL_STATE_LABELS, derived_geometry
 
 
 def format_seconds(seconds: float) -> str:

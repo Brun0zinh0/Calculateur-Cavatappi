@@ -3,24 +3,25 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
+
 
 APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-import livrable_base_calcul as modele
-import livrable_parametres as parametres
+import Base as modele
+import parametres
 
 
 def main() -> None:
-    base_path = Path(modele.BASE_PATH).resolve()
+    base_path = Path(modele.__file__).resolve()
     expected_local_base = (APP_DIR / "Base.py").resolve()
 
-    print("Dossier livrable :", APP_DIR)
+    print("Dossier Beta      :", APP_DIR)
     print("Base.py chargé   :", base_path)
     if base_path != expected_local_base:
-        print("Attention : le moteur chargé n'est pas le Base.py local au dossier livrable.")
-        print("Cela reste accepté si Base.py est volontairement dans le dossier parent.")
+        raise AssertionError("Le moteur chargé n'est pas le Base.py local au dossier Beta.")
 
     settings = dict(parametres.DEFAULT_SETTINGS)
     settings.update(
@@ -38,6 +39,10 @@ def main() -> None:
     pressure_time, pressure_mpa = parametres.make_pressure_history(config)
     _, data = modele.run_blocked_actuation(config, pressure_time=pressure_time, pressure_MPa=pressure_mpa)
     resume = modele.summary(data)
+    assert len(data["time"]) >= 2
+    assert float(data["time"][0]) == 0.0
+    assert np.all(np.isfinite(data["force_total_mN"]))
+    assert resume["max_abs_residual_Nmm"] < 1.0e-5
 
     print("Mini-calcul OK")
     print(f"  points calculés : {len(data['time'])}")

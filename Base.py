@@ -1,8 +1,6 @@
 """
 Base.py - module autonome final pour le modele TCPA corrige.
 
-Ce fichier ne depend ni de v5 ni de v6. Il contient directement :
-
     - les valeurs par defaut materiau/geometrie/discretisation,
     - la rotation de raideur corrigee de la V6,
     - le solveur generalized-Maxwell bloque,
@@ -27,6 +25,9 @@ import numpy as np
 from scipy.optimize import brentq, least_squares, minimize_scalar
 
 
+MODEL_VERSION = "2026.07.16-tk-reference-anisotropy-3"
+
+
 # ---------------------------------------------------------------------------
 # Valeurs par defaut et resultats
 # ---------------------------------------------------------------------------
@@ -48,7 +49,7 @@ def default_maxwell_tensile_params(**overrides):
 
 def default_material_params(maxwell=None, **overrides):
     values = {
-        "E_axial": 31.24,
+        "E_axial": 37.76,
         "E_radius": 8.82,
         "G12": 7.24,
         "nu12": 0.205,
@@ -56,6 +57,8 @@ def default_material_params(maxwell=None, **overrides):
         "maxwell": default_maxwell_tensile_params() if maxwell is None else maxwell,
         "E_nylon": 3.69e3,
         "G_nylon": 0.79e3,
+        "maxwell_anisotropy_mode": "paper_equal",
+        "nylon_condition_mode": "bonded_linear",
         "nylon_axial_prestrain_coupling": 1.0,
         "nylon_axial_actuation_coupling": 1.0,
     }
@@ -72,6 +75,8 @@ def default_geometry_params(**overrides):
         "alpha0_deg": 10.53,
         "theta_f_deg": 37.91,
         "initial_length": 32.45,
+        "bias_angle_profile": "paper_linear",
+        "section_update_mode": "fixed",
         "pressure_end_force_mode": "none",
         "pressure_end_force_scale": 0.0,
     }
@@ -99,10 +104,11 @@ def default_simulation_config(**overrides):
         "n_layers": 4,
         "n_phi": 24,
         "pre_steps": 24,
-        "integration": "paper_incremental",
+        "integration": "exponential",
+        "prestrain_reference_mode": "elastic_tk_reference",
         "flow_rate_mL_min": 10.0,
         "volume_mL": 1.50,
-        "nonlinear_pressure": True,
+        "nonlinear_pressure": False,
         "mat": default_material_params(),
         "geom": default_geometry_params(),
     }
@@ -164,6 +170,9 @@ class StepResult:
     Mnylon: float
     Tnylon: float
     Fpressure: float
+    axial_stretch: float
+    Rin: float
+    Rout: float
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +270,35 @@ def effective_poissons(Cbar: np.ndarray) -> Tuple[float, float, float, float]:
     return EL, -v[1], -v[2], -v[3]
 
 
+def _normalize_integration_name(integration: str) -> str:
+    aliases = {
+        "paper_incremental": "paper_explicit",
+        "paper": "paper_explicit",
+        "explicit": "paper_explicit",
+        "stable": "exponential",
+    }
+    normalized = aliases.get(str(integration), str(integration))
+    if normalized not in {"paper_explicit", "exponential"}:
+        raise ValueError("integration must be 'paper_explicit' or 'exponential'.")
+    return normalized
+
+
+def _time_grid_with_events(total_time: float, dt: float, events=()) -> np.ndarray:
+    """Return a bounded grid containing the requested physical transitions."""
+    if total_time < 0.0 or dt <= 0.0:
+        raise ValueError("total_time must be non-negative and dt must be positive.")
+    regular = np.arange(0.0, total_time, dt, dtype=float)
+    values = [regular, np.array([0.0, total_time], dtype=float)]
+    physical_events = np.asarray(list(events), dtype=float)
+    if physical_events.size:
+        physical_events = physical_events[np.isfinite(physical_events)]
+        physical_events = physical_events[(physical_events >= 0.0) & (physical_events <= total_time)]
+        values.append(physical_events)
+    grid = np.unique(np.concatenate(values))
+    grid[np.isclose(grid, total_time, rtol=0.0, atol=1e-12)] = total_time
+    return grid[(grid >= 0.0) & (grid <= total_time)]
+
+
 # ---------------------------------------------------------------------------
 # Solveur principal
 # ---------------------------------------------------------------------------
@@ -274,7 +312,8 @@ class TCPAMaxwellBlockedModel:
         mat=None,
         geom=None,
         disc=None,
-        integration: str = "paper_incremental",
+        integration: str = "exponential",
+        prestrain_reference_mode: str = "elastic_tk_reference",
     ):
         if mat is None:
             mat = default_material_params()
@@ -285,21 +324,45 @@ class TCPAMaxwellBlockedModel:
         self.mat = mat
         self.geom = geom
         self.disc = disc
-        self.integration = integration
+        self.integration = _normalize_integration_name(integration)
+        self.prestrain_reference_mode = str(prestrain_reference_mode)
+        self.maxwell_anisotropy_mode = str(getattr(mat, "maxwell_anisotropy_mode", "paper_equal"))
+        self.nylon_condition_mode = str(getattr(mat, "nylon_condition_mode", "bonded_linear"))
+        self._building_reference_state = False
         self.nylon_axial_prestrain_coupling = float(getattr(mat, "nylon_axial_prestrain_coupling", 1.0))
         self.nylon_axial_actuation_coupling = float(getattr(mat, "nylon_axial_actuation_coupling", 1.0))
         self.pressure_end_force_mode = str(getattr(geom, "pressure_end_force_mode", "none"))
         self.pressure_end_force_scale = float(getattr(geom, "pressure_end_force_scale", 0.0))
+        self.section_update_mode = str(getattr(geom, "section_update_mode", "fixed"))
+        self.bias_angle_profile = str(getattr(geom, "bias_angle_profile", "paper_linear"))
         for name, value in (
             ("nylon_axial_prestrain_coupling", self.nylon_axial_prestrain_coupling),
             ("nylon_axial_actuation_coupling", self.nylon_axial_actuation_coupling),
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1.")
-        if self.pressure_end_force_scale < 0.0:
-            raise ValueError("pressure_end_force_scale must be non-negative.")
         if self.pressure_end_force_mode not in {"none", "projected_inner_area", "axial_inner_area"}:
             raise ValueError("pressure_end_force_mode must be 'none', 'projected_inner_area', or 'axial_inner_area'.")
+        expected_end_scale = 0.0 if self.pressure_end_force_mode == "none" else 1.0
+        if not np.isclose(self.pressure_end_force_scale, expected_end_scale, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                "pressure_end_force_scale is not a calibration parameter: use 0 with mode 'none' "
+                "and 1 with an active pressure-end mode."
+            )
+        if self.section_update_mode not in {"fixed", "updated"}:
+            raise ValueError("section_update_mode must be 'fixed' or 'updated'.")
+        if self.bias_angle_profile not in {"paper_linear", "uniform_twist"}:
+            raise ValueError("bias_angle_profile must be 'paper_linear' or 'uniform_twist'.")
+        if self.prestrain_reference_mode not in {"elastic_tk_reference", "viscoelastic_ramp"}:
+            raise ValueError("prestrain_reference_mode must be 'elastic_tk_reference' or 'viscoelastic_ramp'.")
+        if self.maxwell_anisotropy_mode not in {"paper_equal", "axial_test_only"}:
+            raise ValueError("maxwell_anisotropy_mode must be 'paper_equal' or 'axial_test_only'.")
+        if self.nylon_condition_mode not in {"bonded_linear", "tension_only", "axially_sliding_confined"}:
+            raise ValueError(
+                "nylon_condition_mode must be 'bonded_linear', 'tension_only', or 'axially_sliding_confined'."
+            )
+
+        self._validate_inputs()
 
         self.alpha0 = np.deg2rad(geom.alpha0_deg)
         self.theta_f = np.deg2rad(geom.theta_f_deg)
@@ -314,45 +377,144 @@ class TCPAMaxwellBlockedModel:
         self.phi = np.linspace(0.0, 2.0 * np.pi, disc.n_phi, endpoint=False)
         self.dphi = 2.0 * np.pi / disc.n_phi
 
-        C_local_total = ti_stiffness_from_paper(
+        self.C_local_total = ti_stiffness_from_paper(
             mat.E_axial,
             mat.E_radius,
             mat.G12,
             mat.nu12,
             mat.nu23,
         )
+        self.theta_layers = self._bias_angles(self.R_centers, geom.Rout)
         self.C_total: List[np.ndarray] = []
         self.C0: List[np.ndarray] = []
         self.Ci: List[List[np.ndarray]] = []
         self.vbar: List[Tuple[float, float, float, float]] = []
-        Etotal = _maxwell_E_total(mat.maxwell)
         self.n_maxwell = _maxwell_branch_count(mat.maxwell)
-        for R in self.R_centers:
-            theta_j = np.arctan((R / geom.Rout) * np.tan(self.theta_f))
-            Cbar = rotate_stiffness_bias(C_local_total, theta_j)
-            self.C_total.append(Cbar)
-            self.C0.append((mat.maxwell.E0 / Etotal) * Cbar)
-            self.Ci.append([(Ei / Etotal) * Cbar for Ei in _maxwell_E(mat.maxwell)])
-            self.vbar.append(effective_poissons(Cbar))
+        self._rebuild_section_properties()
 
         shape = (disc.n_layers, disc.n_phi, 6)
+        self.sigma_reference = np.zeros(shape)
         self.sigma0 = np.zeros(shape)
         self.sigma_i = np.zeros((self.n_maxwell,) + shape)
         self.sigma_total = np.zeros(shape)
         self.Fnylon = 0.0
         self.Mnylon = 0.0
         self.Tnylon = 0.0
+        self.axial_stretch = 1.0
         self.history: List[StepResult] = []
 
+    def _validate_inputs(self) -> None:
+        positive = {
+            "E_axial": self.mat.E_axial,
+            "E_radius": self.mat.E_radius,
+            "G12": self.mat.G12,
+            "E_nylon": self.mat.E_nylon,
+            "G_nylon": self.mat.G_nylon,
+            "Rin": self.geom.Rin,
+            "Rout": self.geom.Rout,
+            "rho0": self.geom.rho0,
+            "initial_length": self.geom.initial_length,
+        }
+        for name, value in positive.items():
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and strictly positive.")
+        if self.geom.Rin >= self.geom.Rout:
+            raise ValueError("Rin must be smaller than Rout.")
+        if self.geom.rho0 <= self.geom.Rout:
+            raise ValueError("rho0 must be larger than Rout.")
+        if self.geom.r_nylon < 0.0 or self.geom.r_nylon > self.geom.Rin:
+            raise ValueError("The nylon radius must lie between zero and Rin.")
+        if not 0.0 < self.geom.alpha0_deg < 90.0:
+            raise ValueError("alpha0_deg must lie strictly between 0 and 90 degrees.")
+        if not 0.0 <= self.geom.theta_f_deg < 90.0:
+            raise ValueError("theta_f_deg must lie between 0 and 90 degrees.")
+        if int(self.disc.n_layers) < 1 or int(self.disc.n_phi) < 4:
+            raise ValueError("The mesh requires at least one radial layer and four angular divisions.")
+        branch_E = _maxwell_E(self.mat.maxwell)
+        branch_eta = _maxwell_eta(self.mat.maxwell)
+        if self.mat.maxwell.E0 < 0.0 or np.any(branch_E < 0.0):
+            raise ValueError("Maxwell moduli must be non-negative.")
+        if _maxwell_E_total(self.mat.maxwell) <= 0.0:
+            raise ValueError("At least one Maxwell modulus must be strictly positive.")
+        if np.any((branch_E > 0.0) & (branch_eta <= 0.0)):
+            raise ValueError("Each active Maxwell branch requires a strictly positive viscosity.")
+        C_local = ti_stiffness_from_paper(
+            self.mat.E_axial,
+            self.mat.E_radius,
+            self.mat.G12,
+            self.mat.nu12,
+            self.mat.nu23,
+        )
+        eig_min = float(np.linalg.eigvalsh(C_local).min())
+        if not np.isfinite(eig_min) or eig_min <= 1e-10:
+            raise ValueError("The elastic constants produce a non-physical stiffness matrix.")
+
+    def _rebuild_section_properties(self) -> None:
+        Etotal = _maxwell_E_total(self.mat.maxwell)
+        self.C_total = []
+        self.C0 = []
+        self.Ci = []
+        self.vbar = []
+        if self.maxwell_anisotropy_mode == "axial_test_only":
+            axial_projector = np.zeros((6, 6), dtype=float)
+            axial_projector[0, 0] = 1.0
+            Ci_local = [Ei * axial_projector for Ei in _maxwell_E(self.mat.maxwell)]
+            C0_local = self.C_local_total - sum(Ci_local, np.zeros((6, 6), dtype=float))
+            if float(np.linalg.eigvalsh(C0_local).min()) <= 1.0e-10:
+                raise ValueError(
+                    "The axial-only Maxwell decomposition leaves a non-physical permanent stiffness matrix."
+                )
+        else:
+            C0_local = (self.mat.maxwell.E0 / Etotal) * self.C_local_total
+            Ci_local = [(Ei / Etotal) * self.C_local_total for Ei in _maxwell_E(self.mat.maxwell)]
+        for theta_j in self.theta_layers:
+            Cbar = rotate_stiffness_bias(self.C_local_total, float(theta_j))
+            self.C_total.append(Cbar)
+            self.C0.append(rotate_stiffness_bias(C0_local, float(theta_j)))
+            self.Ci.append([rotate_stiffness_bias(Ci, float(theta_j)) for Ci in Ci_local])
+            self.vbar.append(effective_poissons(Cbar))
+
+    def _bias_angles(self, radii: np.ndarray, outer_radius: float) -> np.ndarray:
+        radial_fraction = np.asarray(radii, dtype=float) / float(outer_radius)
+        if self.bias_angle_profile == "paper_linear":
+            return radial_fraction * self.theta_f
+        return np.arctan(radial_fraction * np.tan(self.theta_f))
+
+    def _validate_time_step(self, dt: float) -> None:
+        if dt < 0.0 or not np.isfinite(dt):
+            raise ValueError("dt must be finite and non-negative.")
+        if dt == 0.0 or self.integration != "paper_explicit":
+            return
+        active = _maxwell_E(self.mat.maxwell) > 0.0
+        if not np.any(active):
+            return
+        tau_min = float(np.min(_maxwell_eta(self.mat.maxwell)[active] / _maxwell_E(self.mat.maxwell)[active]))
+        if dt >= 2.0 * tau_min:
+            raise ValueError(
+                f"Explicit Maxwell integration is unstable for dt={dt:g} s; "
+                f"use dt < {2.0 * tau_min:.6g} s or select exponential integration."
+            )
+
     def _nylon_axial_coupling(self, h_target: float) -> float:
+        if self.nylon_condition_mode == "axially_sliding_confined":
+            return 0.0
         if abs(h_target - self.h_blocked) > 1e-10:
             return self.nylon_axial_prestrain_coupling
         return self.nylon_axial_actuation_coupling
 
-    def _pressure_end_force(self, pressure: float, alpha: float) -> float:
+    def _next_nylon_axial_force(self, dw: float, axial_coupling: float) -> float:
+        raw_force = self.Fnylon + axial_coupling * np.pi * self.mat.E_nylon * self.geom.r_nylon**2 * dw
+        if self.nylon_condition_mode == "tension_only":
+            return max(0.0, float(raw_force))
+        if self.nylon_condition_mode == "axially_sliding_confined":
+            return 0.0
+        return float(raw_force)
+
+    def _pressure_end_force(self, pressure: float, alpha: float, Rin: Optional[float] = None) -> float:
         if self.pressure_end_force_mode == "none" or self.pressure_end_force_scale == 0.0:
             return 0.0
-        thrust = self.pressure_end_force_scale * pressure * np.pi * self.geom.Rin**2
+        current_Rin = self.R_edges[0] if Rin is None else float(Rin)
+        thrust = self.pressure_end_force_scale * pressure * np.pi * current_Rin**2
         if self.pressure_end_force_mode == "projected_inner_area":
             return thrust * np.sin(alpha)
         return thrust
@@ -373,8 +535,8 @@ class TCPAMaxwellBlockedModel:
         dkappa = (np.cos(alpha_new) ** 2) / rho_new - (np.cos(alpha_old) ** 2) / rho_old
         return rho_new, alpha_new, dw, dv, dkappa
 
-    def _layer_AB_mu(self, j: int) -> Tuple[float, float, float]:
-        C = self.C_total[j]
+    def _layer_AB_mu(self, j: int, C_layers: Optional[List[np.ndarray]] = None) -> Tuple[float, float, float]:
+        C = self.C_total[j] if C_layers is None else C_layers[j]
         C12, C13 = C[0, 1], C[0, 2]
         C22, C26 = C[1, 1], C[1, 5]
         C33, C36 = C[2, 2], C[2, 5]
@@ -401,8 +563,9 @@ class TCPAMaxwellBlockedModel:
         dv: float,
         dw: float,
         Cvisc_r: float = 0.0,
+        C_layers: Optional[List[np.ndarray]] = None,
     ) -> Tuple[np.ndarray, float]:
-        C = self.C_total[j]
+        C = self.C_total[j] if C_layers is None else C_layers[j]
         cu, ku, cdu, kdu = self._u_base(R, A, B, mu, dv, dw)
         coeff = np.zeros((2, 6), dtype=float)
         known = np.array([dw, ku / R, kdu, 0.0, 0.0, dv * R], dtype=float)
@@ -412,28 +575,38 @@ class TCPAMaxwellBlockedModel:
         sig_known = C @ known
         return coeff[:, 2], sig_known[2] + Cvisc_r
 
-    def _viscous_CS_layer_mean(self, dt: float) -> np.ndarray:
+    def _algorithmic_data(self, dt: float) -> Tuple[List[np.ndarray], np.ndarray]:
+        """Return the consistent tangent and stress-history increment."""
+        if self._building_reference_state:
+            return [C.copy() for C in self.C_total], np.zeros_like(self.sigma_total)
         rates = _maxwell_rates(self.mat.maxwell)
-        CS = np.zeros((self.disc.n_layers, 6), dtype=float)
-        for i in range(self.n_maxwell):
-            CS -= dt * rates[i] * self.sigma_i[i].mean(axis=1)
-        return CS
+        history = np.zeros_like(self.sigma_total)
+        if self.integration == "paper_explicit":
+            for ib in range(self.n_maxwell):
+                history -= dt * rates[ib] * self.sigma_i[ib]
+            return [C.copy() for C in self.C_total], history
 
-    def _viscous_CS_point(self, j: int, k: int, dt: float) -> np.ndarray:
-        rates = _maxwell_rates(self.mat.maxwell)
-        CS = np.zeros(6, dtype=float)
-        for i in range(self.n_maxwell):
-            CS -= dt * rates[i] * self.sigma_i[i, j, k]
-        return CS
+        factors = np.ones(self.n_maxwell, dtype=float)
+        decays = np.ones(self.n_maxwell, dtype=float)
+        for ib, rate in enumerate(rates):
+            if rate > 0.0 and dt > 0.0:
+                decays[ib] = np.exp(-dt * rate)
+                factors[ib] = (1.0 - decays[ib]) / (dt * rate)
+            history += (decays[ib] - 1.0) * self.sigma_i[ib]
+        tangents = [
+            self.C0[j] + sum((factors[ib] * self.Ci[j][ib] for ib in range(self.n_maxwell)), np.zeros((6, 6)))
+            for j in range(self.disc.n_layers)
+        ]
+        return tangents, history
 
     def _update_maxwell_branches(self, j: int, k: int, de: np.ndarray, dt: float) -> np.ndarray:
         rates = _maxwell_rates(self.mat.maxwell)
         sigma_i_point = np.empty_like(self.sigma_i[:, j, k])
         for ib in range(self.n_maxwell):
-            if self.integration in {"paper_explicit", "explicit", "paper_incremental", "paper"}:
+            if self.integration == "paper_explicit":
                 ds = self.Ci[j][ib] @ de - dt * rates[ib] * self.sigma_i[ib, j, k]
                 sigma_i_point[ib] = self.sigma_i[ib, j, k] + ds
-            elif self.integration in {"exponential", "stable"}:
+            elif self.integration == "exponential":
                 if rates[ib] <= 0.0:
                     sigma_i_point[ib] = self.sigma_i[ib, j, k] + self.Ci[j][ib] @ de
                 else:
@@ -443,23 +616,33 @@ class TCPAMaxwellBlockedModel:
                     sigma_i_point[ib] = a * self.sigma_i[ib, j, k] + factor * (self.Ci[j][ib] @ de)
             else:
                 raise ValueError(
-                    "integration must be 'paper_explicit', 'paper_incremental', or 'exponential'."
+                    "integration must be 'paper_explicit' or 'exponential'."
                 )
         return sigma_i_point
 
-    def _solve_radial_constants(self, dw: float, dv: float, dP: float, dt: float) -> np.ndarray:
+    def _solve_radial_constants(
+        self,
+        dw: float,
+        dv: float,
+        dP: float,
+        dt: float,
+        C_algorithmic: List[np.ndarray],
+        history_increment: np.ndarray,
+    ) -> np.ndarray:
         n = self.disc.n_layers
         A_mat = np.zeros((2 * n, 2 * n), dtype=float)
         b_vec = np.zeros(2 * n, dtype=float)
-        CSmean = self._viscous_CS_layer_mean(dt)
+        CSmean = history_increment.mean(axis=1)
 
         def cols(j: int) -> Tuple[int, int]:
             return 2 * j, 2 * j + 1
 
         row = 0
         j = 0
-        Aj, Bj, muj = self._layer_AB_mu(j)
-        c_sig, k_sig = self._radial_stress_axisym_coeff(j, self.R_edges[0], Aj, Bj, muj, dv, dw, CSmean[j, 2])
+        Aj, Bj, muj = self._layer_AB_mu(j, C_algorithmic)
+        c_sig, k_sig = self._radial_stress_axisym_coeff(
+            j, self.R_edges[0], Aj, Bj, muj, dv, dw, CSmean[j, 2], C_algorithmic
+        )
         c0, c1 = cols(j)
         A_mat[row, c0 : c1 + 1] = c_sig
         b_vec[row] = -dP - k_sig
@@ -467,8 +650,8 @@ class TCPAMaxwellBlockedModel:
 
         for j in range(n - 1):
             Rb = self.R_edges[j + 1]
-            Aj, Bj, muj = self._layer_AB_mu(j)
-            Ak, Bk, muk = self._layer_AB_mu(j + 1)
+            Aj, Bj, muj = self._layer_AB_mu(j, C_algorithmic)
+            Ak, Bk, muk = self._layer_AB_mu(j + 1, C_algorithmic)
             cu_j, ku_j, _, _ = self._u_base(Rb, Aj, Bj, muj, dv, dw)
             cu_k, ku_k, _, _ = self._u_base(Rb, Ak, Bk, muk, dv, dw)
             j0, j1 = cols(j)
@@ -478,31 +661,95 @@ class TCPAMaxwellBlockedModel:
             b_vec[row] = ku_k - ku_j
             row += 1
 
-            cs_j, ks_j = self._radial_stress_axisym_coeff(j, Rb, Aj, Bj, muj, dv, dw, CSmean[j, 2])
-            cs_k, ks_k = self._radial_stress_axisym_coeff(j + 1, Rb, Ak, Bk, muk, dv, dw, CSmean[j + 1, 2])
+            cs_j, ks_j = self._radial_stress_axisym_coeff(
+                j, Rb, Aj, Bj, muj, dv, dw, CSmean[j, 2], C_algorithmic
+            )
+            cs_k, ks_k = self._radial_stress_axisym_coeff(
+                j + 1, Rb, Ak, Bk, muk, dv, dw, CSmean[j + 1, 2], C_algorithmic
+            )
             A_mat[row, j0 : j1 + 1] = cs_j
             A_mat[row, k0 : k1 + 1] = -cs_k
             b_vec[row] = ks_k - ks_j
             row += 1
 
         j = n - 1
-        Aj, Bj, muj = self._layer_AB_mu(j)
-        c_sig, k_sig = self._radial_stress_axisym_coeff(j, self.R_edges[-1], Aj, Bj, muj, dv, dw, CSmean[j, 2])
+        Aj, Bj, muj = self._layer_AB_mu(j, C_algorithmic)
+        c_sig, k_sig = self._radial_stress_axisym_coeff(
+            j, self.R_edges[-1], Aj, Bj, muj, dv, dw, CSmean[j, 2], C_algorithmic
+        )
         c0, c1 = cols(j)
         A_mat[row, c0 : c1 + 1] = c_sig
         b_vec[row] = -k_sig
         return np.linalg.solve(A_mat, b_vec).reshape(n, 2)
 
-    def _u_du_layer(self, j: int, R: float, coeffs: np.ndarray, dv: float, dw: float) -> Tuple[float, float]:
-        A, B, mu = self._layer_AB_mu(j)
+    def _u_du_layer(
+        self,
+        j: int,
+        R: float,
+        coeffs: np.ndarray,
+        dv: float,
+        dw: float,
+        C_layers: Optional[List[np.ndarray]] = None,
+    ) -> Tuple[float, float]:
+        A, B, mu = self._layer_AB_mu(j, C_layers)
         C1, C2 = coeffs[j]
         u = C1 * R**mu + C2 * R ** (-mu) + A * dv * R * R + B * dw * R
         du = C1 * mu * R ** (mu - 1.0) - C2 * mu * R ** (-mu - 1.0) + 2.0 * A * dv * R + B * dw
         return u, du
 
+    def _trial_section_geometry(
+        self,
+        coeffs: np.ndarray,
+        dv: float,
+        dw: float,
+        C_algorithmic: List[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if self.section_update_mode == "fixed":
+            return (
+                self.R_edges.copy(),
+                self.R_centers.copy(),
+                self.dR.copy(),
+                self.theta_layers.copy(),
+            )
+        u_edges = np.empty_like(self.R_edges)
+        for edge in range(len(self.R_edges)):
+            layers = [0] if edge == 0 else [self.disc.n_layers - 1] if edge == self.disc.n_layers else [edge - 1, edge]
+            values = [
+                self._u_du_layer(j, self.R_edges[edge], coeffs, dv, dw, C_algorithmic)[0]
+                for j in layers
+            ]
+            u_edges[edge] = float(np.mean(values))
+        edges_new = self.R_edges + u_edges
+        if not np.all(np.isfinite(edges_new)) or edges_new[0] <= 0.0 or np.any(np.diff(edges_new) <= 1e-9):
+            raise ValueError("The radial update produced an inadmissible tube cross-section.")
+        centers_new = 0.5 * (edges_new[:-1] + edges_new[1:])
+        dR_new = np.diff(edges_new)
+
+        if self.bias_angle_profile == "paper_linear":
+            theta_new = self._bias_angles(centers_new, edges_new[-1])
+            return edges_new, centers_new, dR_new, theta_new
+
+        theta_new = np.empty_like(self.theta_layers)
+        for j, R in enumerate(self.R_centers):
+            u, _ = self._u_du_layer(j, R, coeffs, dv, dw, C_algorithmic)
+            theta = self.theta_layers[j]
+            axial_component = (1.0 + dw) * np.cos(theta)
+            hoop_component = dv * R * np.cos(theta) + (1.0 + u / R) * np.sin(theta)
+            theta_new[j] = np.arctan2(hoop_component, axial_component)
+        if np.any(np.abs(theta_new) >= np.deg2rad(89.9)):
+            raise ValueError("The material bias angle left the admissible range.")
+        return edges_new, centers_new, dR_new, theta_new
+
     def _trial_state(self, dw: float, dP: float, dt: float, h_target: float) -> Dict[str, object]:
         rho_new, alpha_new, dw, dv, dkappa = self._kinematic_increments(dw, h_target)
-        coeffs = self._solve_radial_constants(dw, dv, dP, dt)
+        C_algorithmic, history_increment = self._algorithmic_data(dt)
+        coeffs = self._solve_radial_constants(dw, dv, dP, dt, C_algorithmic, history_increment)
+        R_edges_new, R_centers_new, dR_new, theta_layers_new = self._trial_section_geometry(
+            coeffs, dv, dw, C_algorithmic
+        )
+        if R_edges_new[-1] >= rho_new:
+            raise ValueError("The deformed tube cross-section intersects the helix axis.")
+        sigma_reference_new = np.empty_like(self.sigma_reference)
         sigma0_new = np.empty_like(self.sigma0)
         sigma_i_new = np.empty_like(self.sigma_i)
         sigma_total_new = np.empty_like(self.sigma_total)
@@ -511,7 +758,7 @@ class TCPAMaxwellBlockedModel:
         for j, R in enumerate(self.R_centers):
             C0 = self.C0[j]
             _, v12b, v13b, v14b = self.vbar[j]
-            u, du = self._u_du_layer(j, R, coeffs, dv, dw)
+            u, du = self._u_du_layer(j, R, coeffs, dv, dw, C_algorithmic)
             for k, Phi in enumerate(self.phi):
                 denom = 1.0 + K_old * R * np.cos(Phi)
                 curv = (dkappa * R * np.cos(Phi) + u * K_old * np.cos(Phi)) / denom
@@ -520,31 +767,32 @@ class TCPAMaxwellBlockedModel:
                 eps_s = dw + curv
                 gamma_sphi = dv * R / denom - v14b * curv
                 de = np.array([eps_s, eps_phi, eps_r, 0.0, 0.0, gamma_sphi], dtype=float)
-                sigma0_new[j, k] = self.sigma0[j, k] + C0 @ de
-                sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt)
-                if self.integration in {"paper_incremental", "paper"}:
-                    # Appendix A form: Delta sigma = C^E Delta epsilon + C^S,
-                    # with C^S = -dt * sum_i (E_i/eta_i) sigma_i(t).
-                    sigma_total_new[j, k] = self.sigma_total[j, k] + self.C_total[j] @ de + self._viscous_CS_point(
-                        j, k, dt
-                    )
+                if self._building_reference_state:
+                    sigma_reference_new[j, k] = self.sigma_reference[j, k] + self.C_total[j] @ de
+                    sigma0_new[j, k] = self.sigma0[j, k]
+                    sigma_i_new[:, j, k] = self.sigma_i[:, j, k]
                 else:
-                    sigma_total_new[j, k] = sigma0_new[j, k] + sigma_i_new[:, j, k].sum(axis=0)
+                    sigma_reference_new[j, k] = self.sigma_reference[j, k]
+                    sigma0_new[j, k] = self.sigma0[j, k] + C0 @ de
+                    sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt)
+                sigma_total_new[j, k] = (
+                    sigma_reference_new[j, k] + sigma0_new[j, k] + sigma_i_new[:, j, k].sum(axis=0)
+                )
 
         Ftube = 0.0
         Mtube = 0.0
         Ttube = 0.0
-        for j, R in enumerate(self.R_centers):
-            weight_R = R * self.dR[j] * self.dphi
+        for j, R in enumerate(R_centers_new):
+            weight_R = R * dR_new[j] * self.dphi
             for k, Phi in enumerate(self.phi):
                 sig = sigma_total_new[j, k]
                 Ftube += sig[0] * weight_R
                 Mtube += sig[0] * (R * np.cos(Phi)) * weight_R
                 Ttube += sig[5] * R * weight_R
 
-        rn = self.geom.r_nylon
         axial_coupling = self._nylon_axial_coupling(h_target)
-        Fny = self.Fnylon + axial_coupling * np.pi * self.mat.E_nylon * rn**2 * dw
+        rn = self.geom.r_nylon
+        Fny = self._next_nylon_axial_force(dw, axial_coupling)
         Mny = self.Mnylon + 0.25 * np.pi * self.mat.E_nylon * rn**4 * dkappa
         Tny = self.Tnylon + 0.5 * np.pi * self.mat.G_nylon * rn**4 * dv
 
@@ -561,7 +809,7 @@ class TCPAMaxwellBlockedModel:
             Ft_structural = Ares / sin_a
             Tt = (Bres + Ft_structural * rho_new * sin_a) / cos_a
             residual = (Tt * sin_a + Ft_structural * rho_new * cos_a) - Cres
-            Fpressure = self._pressure_end_force(self.helix.pressure + dP, alpha_new)
+            Fpressure = self._pressure_end_force(self.helix.pressure + dP, alpha_new, R_edges_new[0])
             Ft = Ft_structural + Fpressure
 
         return {
@@ -570,6 +818,7 @@ class TCPAMaxwellBlockedModel:
             "dw": dw,
             "dv": dv,
             "dkappa": dkappa,
+            "sigma_reference_new": sigma_reference_new,
             "sigma0_new": sigma0_new,
             "sigma_i_new": sigma_i_new,
             "sigma_total_new": sigma_total_new,
@@ -583,6 +832,11 @@ class TCPAMaxwellBlockedModel:
             "Tt": Tt,
             "residual": residual,
             "Fpressure": Fpressure,
+            "R_edges_new": R_edges_new,
+            "R_centers_new": R_centers_new,
+            "dR_new": dR_new,
+            "theta_layers_new": theta_layers_new,
+            "axial_stretch_new": self.axial_stretch * (1.0 + dw),
         }
 
     def _trial_state_from_geometry(
@@ -594,7 +848,7 @@ class TCPAMaxwellBlockedModel:
         alpha_new: float,
         axial_coupling: float = 1.0,
     ) -> Dict[str, object]:
-        if rho_new <= self.geom.Rout:
+        if rho_new <= self.R_edges[-1]:
             raise ValueError("Inadmissible geometry: helix radius <= tube outer radius.")
         if not 0.0 < alpha_new < 0.5 * np.pi:
             raise ValueError("Inadmissible geometry: helix angle outside (0, 90 deg).")
@@ -603,7 +857,14 @@ class TCPAMaxwellBlockedModel:
         dv = np.sin(2.0 * alpha_new) / (2.0 * rho_new) - np.sin(2.0 * alpha_old) / (2.0 * rho_old)
         dkappa = (np.cos(alpha_new) ** 2) / rho_new - (np.cos(alpha_old) ** 2) / rho_old
 
-        coeffs = self._solve_radial_constants(dw, dv, dP, dt)
+        C_algorithmic, history_increment = self._algorithmic_data(dt)
+        coeffs = self._solve_radial_constants(dw, dv, dP, dt, C_algorithmic, history_increment)
+        R_edges_new, R_centers_new, dR_new, theta_layers_new = self._trial_section_geometry(
+            coeffs, dv, dw, C_algorithmic
+        )
+        if R_edges_new[-1] >= rho_new:
+            raise ValueError("The deformed tube cross-section intersects the helix axis.")
+        sigma_reference_new = np.empty_like(self.sigma_reference)
         sigma0_new = np.empty_like(self.sigma0)
         sigma_i_new = np.empty_like(self.sigma_i)
         sigma_total_new = np.empty_like(self.sigma_total)
@@ -612,7 +873,7 @@ class TCPAMaxwellBlockedModel:
         for j, R in enumerate(self.R_centers):
             C0 = self.C0[j]
             _, v12b, v13b, v14b = self.vbar[j]
-            u, du = self._u_du_layer(j, R, coeffs, dv, dw)
+            u, du = self._u_du_layer(j, R, coeffs, dv, dw, C_algorithmic)
             for k, Phi in enumerate(self.phi):
                 denom = 1.0 + K_old * R * np.cos(Phi)
                 curv = (dkappa * R * np.cos(Phi) + u * K_old * np.cos(Phi)) / denom
@@ -621,20 +882,23 @@ class TCPAMaxwellBlockedModel:
                 eps_s = dw + curv
                 gamma_sphi = dv * R / denom - v14b * curv
                 de = np.array([eps_s, eps_phi, eps_r, 0.0, 0.0, gamma_sphi], dtype=float)
-                sigma0_new[j, k] = self.sigma0[j, k] + C0 @ de
-                sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt)
-                if self.integration in {"paper_incremental", "paper"}:
-                    sigma_total_new[j, k] = self.sigma_total[j, k] + self.C_total[j] @ de + self._viscous_CS_point(
-                        j, k, dt
-                    )
+                if self._building_reference_state:
+                    sigma_reference_new[j, k] = self.sigma_reference[j, k] + self.C_total[j] @ de
+                    sigma0_new[j, k] = self.sigma0[j, k]
+                    sigma_i_new[:, j, k] = self.sigma_i[:, j, k]
                 else:
-                    sigma_total_new[j, k] = sigma0_new[j, k] + sigma_i_new[:, j, k].sum(axis=0)
+                    sigma_reference_new[j, k] = self.sigma_reference[j, k]
+                    sigma0_new[j, k] = self.sigma0[j, k] + C0 @ de
+                    sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt)
+                sigma_total_new[j, k] = (
+                    sigma_reference_new[j, k] + sigma0_new[j, k] + sigma_i_new[:, j, k].sum(axis=0)
+                )
 
         Ftube = 0.0
         Mtube = 0.0
         Ttube = 0.0
-        for j, R in enumerate(self.R_centers):
-            weight_R = R * self.dR[j] * self.dphi
+        for j, R in enumerate(R_centers_new):
+            weight_R = R * dR_new[j] * self.dphi
             for k, Phi in enumerate(self.phi):
                 sig = sigma_total_new[j, k]
                 Ftube += sig[0] * weight_R
@@ -642,10 +906,10 @@ class TCPAMaxwellBlockedModel:
                 Ttube += sig[5] * R * weight_R
 
         rn = self.geom.r_nylon
-        Fny = self.Fnylon + axial_coupling * np.pi * self.mat.E_nylon * rn**2 * dw
+        Fny = self._next_nylon_axial_force(dw, axial_coupling)
         Mny = self.Mnylon + 0.25 * np.pi * self.mat.E_nylon * rn**4 * dkappa
         Tny = self.Tnylon + 0.5 * np.pi * self.mat.G_nylon * rn**4 * dv
-        Fpressure = self._pressure_end_force(self.helix.pressure + dP, alpha_new)
+        Fpressure = self._pressure_end_force(self.helix.pressure + dP, alpha_new, R_edges_new[0])
 
         return {
             "rho_new": rho_new,
@@ -653,6 +917,7 @@ class TCPAMaxwellBlockedModel:
             "dw": dw,
             "dv": dv,
             "dkappa": dkappa,
+            "sigma_reference_new": sigma_reference_new,
             "sigma0_new": sigma0_new,
             "sigma_i_new": sigma_i_new,
             "sigma_total_new": sigma_total_new,
@@ -666,6 +931,11 @@ class TCPAMaxwellBlockedModel:
             "Tt": np.nan,
             "residual": np.nan,
             "Fpressure": Fpressure,
+            "R_edges_new": R_edges_new,
+            "R_centers_new": R_centers_new,
+            "dR_new": dR_new,
+            "theta_layers_new": theta_layers_new,
+            "axial_stretch_new": self.axial_stretch * (1.0 + dw),
         }
 
     def _find_dw(self, dP: float, dt: float, h_target: float) -> float:
@@ -679,32 +949,56 @@ class TCPAMaxwellBlockedModel:
 
         grid = np.linspace(lo, hi, 65)
         vals = np.array([f(x) for x in grid])
+        roots = []
+        for x, value in zip(grid, vals):
+            if np.isfinite(value) and abs(value) <= 1e-10:
+                roots.append(float(x))
         for a, b, fa, fb in zip(grid[:-1], grid[1:], vals[:-1], vals[1:]):
             if np.isfinite(fa) and np.isfinite(fb) and fa * fb <= 0:
-                return float(brentq(lambda z: f(z), a, b, xtol=1e-9, rtol=1e-8, maxiter=80))
+                roots.append(float(brentq(lambda z: f(z), a, b, xtol=1e-10, rtol=1e-9, maxiter=100)))
+        if roots:
+            return min(roots, key=abs)
 
         def obj(x: float) -> float:
             y = f(x)
             return 1e100 if not np.isfinite(y) else y * y
 
         res = minimize_scalar(obj, bounds=(lo, hi), method="bounded", options={"xatol": 1e-8})
-        if not res.success:
-            raise RuntimeError("Could not solve for dw.")
+        residual = abs(f(float(res.x))) if res.success else np.inf
+        span = hi - lo
+        at_bound = min(float(res.x) - lo, hi - float(res.x)) <= 1e-5 * span
+        if not res.success or not np.isfinite(residual) or residual > 1e-6 or at_bound:
+            raise RuntimeError(
+                f"Could not solve blocked equilibrium: residual={residual:.3e} N mm, dw={float(res.x):.6g}."
+            )
         return float(res.x)
 
-    def step(self, pressure_new: float, dt: float, h_target: Optional[float] = None) -> StepResult:
-        if h_target is None:
-            h_target = self.h_blocked
-        dP = pressure_new - self.helix.pressure
-        dw = self._find_dw(dP, dt, h_target)
-        trial = self._trial_state(dw, dP, dt, h_target)
-
+    def _commit_trial(self, trial: Dict[str, object]) -> None:
+        self.sigma_reference = trial["sigma_reference_new"]
         self.sigma0 = trial["sigma0_new"]
         self.sigma_i = trial["sigma_i_new"]
         self.sigma_total = trial["sigma_total_new"]
         self.Fnylon = float(trial["Fny"])
         self.Mnylon = float(trial["Mny"])
         self.Tnylon = float(trial["Tny"])
+        self.axial_stretch = float(trial["axial_stretch_new"])
+        self.R_edges = np.asarray(trial["R_edges_new"], dtype=float)
+        self.R_centers = np.asarray(trial["R_centers_new"], dtype=float)
+        self.dR = np.asarray(trial["dR_new"], dtype=float)
+        self.theta_layers = np.asarray(trial["theta_layers_new"], dtype=float)
+        self._rebuild_section_properties()
+
+    def step(self, pressure_new: float, dt: float, h_target: Optional[float] = None) -> StepResult:
+        self._validate_time_step(dt)
+        if not np.isfinite(pressure_new) or pressure_new < 0.0:
+            raise ValueError("pressure must be finite and non-negative.")
+        if h_target is None:
+            h_target = self.h_blocked
+        dP = pressure_new - self.helix.pressure
+        dw = self._find_dw(dP, dt, h_target)
+        trial = self._trial_state(dw, dP, dt, h_target)
+
+        self._commit_trial(trial)
         self.helix = HelixState(
             rho=float(trial["rho_new"]),
             alpha=float(trial["alpha_new"]),
@@ -731,6 +1025,9 @@ class TCPAMaxwellBlockedModel:
             Mnylon=float(trial["Mny"]),
             Tnylon=float(trial["Tny"]),
             Fpressure=float(trial["Fpressure"]),
+            axial_stretch=self.axial_stretch,
+            Rin=float(self.R_edges[0]),
+            Rout=float(self.R_edges[-1]),
         )
         self.history.append(out)
         return out
@@ -740,13 +1037,14 @@ class TCPAMaxwellBlockedModel:
         alpha = float(trial["alpha_new"])
         sin_a = np.sin(alpha)
         cos_a = np.cos(alpha)
-        force_scale = max(abs(load_N), 0.05)
-        moment_scale = max(abs(load_N * rho), 0.05)
+        effective_load = load_N - float(trial.get("Fpressure", 0.0))
+        force_scale = max(abs(load_N), abs(effective_load), 0.05)
+        moment_scale = max(abs(load_N * rho), abs(effective_load * rho), 0.05)
         return np.array(
             [
-                (float(trial["Ftube"]) + float(trial["Fny"]) - load_N * sin_a) / force_scale,
-                (float(trial["Mtube"]) + float(trial["Mny"]) + load_N * rho * sin_a) / moment_scale,
-                (float(trial["Ttube"]) + float(trial["Tny"]) - load_N * rho * cos_a) / moment_scale,
+                (float(trial["Ftube"]) + float(trial["Fny"]) - effective_load * sin_a) / force_scale,
+                (float(trial["Mtube"]) + float(trial["Mny"]) + effective_load * rho * sin_a) / moment_scale,
+                (float(trial["Ttube"]) + float(trial["Tny"]) - effective_load * rho * cos_a) / moment_scale,
             ],
             dtype=float,
         )
@@ -754,8 +1052,8 @@ class TCPAMaxwellBlockedModel:
     def _find_suspended_state(self, dP: float, dt: float, load_N: float) -> Dict[str, object]:
         rho0 = float(self.helix.rho)
         alpha0 = float(self.helix.alpha)
-        lower = np.array([-0.25, max(1.001 * self.geom.Rout, 1e-6), np.deg2rad(0.5)], dtype=float)
-        upper = np.array([0.25, max(3.0 * rho0, 2.0 * self.geom.Rout), np.deg2rad(85.0)], dtype=float)
+        lower = np.array([-0.25, max(1.001 * self.R_edges[-1], 1e-6), np.deg2rad(0.5)], dtype=float)
+        upper = np.array([0.25, max(3.0 * rho0, 2.0 * self.R_edges[-1]), np.deg2rad(85.0)], dtype=float)
 
         guesses = [
             np.array([0.0, rho0, alpha0], dtype=float),
@@ -815,25 +1113,35 @@ class TCPAMaxwellBlockedModel:
                 best_cost = cost
                 best_trial = trial
 
-        if best is None or best_trial is None or not np.isfinite(best_cost):
-            raise RuntimeError("Could not solve suspended-mass equilibrium.")
-        best_trial["residual"] = float(np.sqrt(best_cost))
+        normalized_residual = float(np.sqrt(best_cost))
+        bound_margin = np.minimum(best.x - lower, upper - best.x) if best is not None else np.zeros(3)
+        scaled_span = np.maximum(upper - lower, 1e-12)
+        at_bound = bool(np.any(bound_margin <= 1e-5 * scaled_span))
+        if (
+            best is None
+            or best_trial is None
+            or not best.success
+            or not np.isfinite(normalized_residual)
+            or normalized_residual > 1e-4
+            or at_bound
+        ):
+            message = "no finite solution" if best is None else f"residual={normalized_residual:.3e}, x={best.x}"
+            raise RuntimeError(f"Could not solve suspended-mass equilibrium: {message}.")
+        best_trial["residual"] = normalized_residual
         best_trial["Ft"] = float(load_N)
         best_trial["Tt"] = float(load_N * float(best_trial["rho_new"]) * np.cos(float(best_trial["alpha_new"])))
         return best_trial
 
     def step_suspended(self, pressure_new: float, dt: float, load_N: float) -> StepResult:
-        if load_N < 0.0:
-            raise ValueError("load_N must be non-negative.")
+        self._validate_time_step(dt)
+        if load_N <= 0.0:
+            raise ValueError("load_N must be strictly positive for suspended-mass equilibrium.")
+        if not np.isfinite(pressure_new) or pressure_new < 0.0:
+            raise ValueError("pressure must be finite and non-negative.")
         dP = pressure_new - self.helix.pressure
         trial = self._find_suspended_state(dP, dt, load_N)
 
-        self.sigma0 = trial["sigma0_new"]
-        self.sigma_i = trial["sigma_i_new"]
-        self.sigma_total = trial["sigma_total_new"]
-        self.Fnylon = float(trial["Fny"])
-        self.Mnylon = float(trial["Mny"])
-        self.Tnylon = float(trial["Tny"])
+        self._commit_trial(trial)
         rho_new = float(trial["rho_new"])
         alpha_new = float(trial["alpha_new"])
         h_new = rho_new * np.tan(alpha_new)
@@ -863,17 +1171,31 @@ class TCPAMaxwellBlockedModel:
             Mnylon=float(trial["Mny"]),
             Tnylon=float(trial["Tny"]),
             Fpressure=float(trial["Fpressure"]),
+            axial_stretch=self.axial_stretch,
+            Rin=float(self.R_edges[0]),
+            Rout=float(self.R_edges[-1]),
         )
         self.history.append(out)
         return out
 
     def prestretch_to(self, eps_tk: float, strain_rate_mm_min: float = 20.0) -> None:
+        if eps_tk < 0.0 or not np.isfinite(eps_tk):
+            raise ValueError("eps_tk must be finite and non-negative.")
+        if strain_rate_mm_min <= 0.0:
+            raise ValueError("strain_rate_mm_min must be strictly positive.")
         h_end = (1.0 + eps_tk) * self.h0
+        if eps_tk == 0.0:
+            self.h_blocked = h_end
+            return
         L0 = 2.0 * np.pi * self.turns * self.h0
         total_time = 60.0 * eps_tk * L0 / strain_rate_mm_min
         dt = total_time / self.disc.pre_steps if self.disc.pre_steps > 0 else 1.0
-        for h in np.linspace(self.h0, h_end, self.disc.pre_steps + 1)[1:]:
-            self.step(0.0, dt, h_target=h)
+        self._building_reference_state = self.prestrain_reference_mode == "elastic_tk_reference"
+        try:
+            for h in np.linspace(self.h0, h_end, self.disc.pre_steps + 1)[1:]:
+                self.step(0.0, dt, h_target=h)
+        finally:
+            self._building_reference_state = False
         self.h_blocked = h_end
 
     def run_pressure_history(self, time: np.ndarray, pressure: np.ndarray) -> List[StepResult]:
@@ -912,17 +1234,23 @@ class TCPAMaxwellBlockedModel:
             "torque_Nmm": np.array([x.Tt for x in h], dtype=float),
             "torque_microNm": 1000.0 * np.array([x.Tt for x in h], dtype=float),
             "residual": np.array([x.residual for x in h], dtype=float),
+            "axial_stretch": np.array([x.axial_stretch for x in h], dtype=float),
+            "Rin_mm": np.array([x.Rin for x in h], dtype=float),
+            "Rout_mm": np.array([x.Rout for x in h], dtype=float),
         }
 
         alpha = np.array([x.alpha for x in h], dtype=float)
         rho = np.array([x.rho for x in h], dtype=float)
         h_per_rad = rho * np.tan(alpha)
-        axial_length = 2.0 * np.pi * self.turns * h_per_rad
-        centerline_length = 2.0 * np.pi * self.turns * rho / np.cos(alpha)
+        axial_length_geometry = 2.0 * np.pi * self.turns * h_per_rad
+        axial_stretch = np.asarray(arr["axial_stretch"], dtype=float)
+        axial_length = self.geom.initial_length * axial_stretch * np.sin(alpha) / np.sin(self.alpha0)
+        centerline_length = self.geom.initial_length * axial_stretch / np.sin(self.alpha0)
         arr.update(
             {
                 "h_mm_per_rad": h_per_rad,
                 "axial_length_mm": axial_length,
+                "axial_length_geometry_mm": axial_length_geometry,
                 "centerline_length_mm": centerline_length,
             }
         )
@@ -985,9 +1313,15 @@ def cyclic_pressure_history(
     gamma_load: float = 3.5,
     gamma_unload: float = 2.8,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    if int(n_cycles) < 1 or flow_rate_mL_min <= 0.0 or volume_mL <= 0.0 or dt <= 0.0:
+        raise ValueError("n_cycles, flow_rate_mL_min, volume_mL, and dt must be positive.")
+    if Pmax < 0.0 or not np.isfinite(Pmax):
+        raise ValueError("Pmax must be finite and non-negative.")
     half_period = 60.0 * volume_mL / flow_rate_mL_min
     period = 2.0 * half_period
-    t = np.arange(0.0, n_cycles * period + dt, dt)
+    total_time = int(n_cycles) * period
+    transitions = np.arange(0.0, total_time + 0.5 * half_period, half_period)
+    t = _time_grid_with_events(total_time, dt, transitions)
     phase = (t % period) / period
     loading = phase < 0.5
     P = np.zeros_like(t)
@@ -1001,7 +1335,8 @@ def cyclic_pressure_history(
         y = (phase[~loading] - 0.5) / 0.5
         P[loading] = Pmax * x
         P[~loading] = Pmax * (1.0 - y)
-    return t, P
+    P[np.isclose(t, total_time, rtol=0.0, atol=1e-12)] = 0.0
+    return t, np.clip(P, 0.0, Pmax)
 
 
 def ramp_hold_pressure_history(
@@ -1020,8 +1355,13 @@ def ramp_hold_pressure_history(
         raise ValueError("hold_time must be non-negative.")
     if unload_time is None:
         unload_time = ramp_time
+    if P_hold < 0.0 or not np.isfinite(P_hold):
+        raise ValueError("P_hold must be finite and non-negative.")
+    if unload and unload_time <= 0.0:
+        raise ValueError("unload_time must be positive when unloading is enabled.")
     total_time = ramp_time + hold_time + (unload_time if unload else 0.0)
-    t = np.arange(0.0, total_time + dt, dt)
+    events = [ramp_time, ramp_time + hold_time, total_time]
+    t = _time_grid_with_events(total_time, dt, events)
     P = np.zeros_like(t)
     ramp_mask = t <= ramp_time
     x = np.clip(t[ramp_mask] / ramp_time, 0.0, 1.0)
@@ -1032,6 +1372,8 @@ def ramp_hold_pressure_history(
         unload_mask = t > ramp_time + hold_time
         y = np.clip((t[unload_mask] - ramp_time - hold_time) / unload_time, 0.0, 1.0)
         P[unload_mask] = P_hold * (1.0 - y)
+    else:
+        P[t > ramp_time + hold_time] = P_hold
     return t, P
 
 
@@ -1081,6 +1423,8 @@ def _prepare_actuation_history(
         raise ValueError("pressure_time and pressure_MPa must be 1D arrays with equal length.")
     if len(t) < 2 or not np.all(np.diff(t) > 0.0):
         raise ValueError("pressure history must contain at least two strictly increasing samples.")
+    if not np.all(np.isfinite(p)) or np.any(p < 0.0):
+        raise ValueError("pressure history must contain finite, non-negative pressures.")
     return t, p
 
 
@@ -1119,9 +1463,14 @@ def run_blocked_actuation(
         pre_steps=cfg.pre_steps,
         dw_bracket=(-0.05, 0.05),
     )
-    model = TCPAMaxwellBlockedModel(mat=cfg.mat, geom=cfg.geom, disc=disc, integration=cfg.integration)
+    model = TCPAMaxwellBlockedModel(
+        mat=cfg.mat,
+        geom=cfg.geom,
+        disc=disc,
+        integration=cfg.integration,
+        prestrain_reference_mode=getattr(cfg, "prestrain_reference_mode", "elastic_tk_reference"),
+    )
     model.prestretch_to(cfg.eps)
-    i_act0 = len(model.history)
     t_start = model.helix.time
     t_local, pressure = _prepare_actuation_history(
         cfg.n_cycles,
@@ -1133,6 +1482,8 @@ def run_blocked_actuation(
         cfg.volume_mL,
         cfg.nonlinear_pressure,
     )
+    model.step(float(pressure[0]), 0.0, h_target=model.h_blocked)
+    i_act0 = len(model.history) - 1
     model.run_pressure_history(t_start + t_local, pressure)
     full = model.history_arrays()
     arr = {key: value[i_act0:].copy() for key, value in full.items()}
@@ -1164,9 +1515,14 @@ def run_suspended_actuation(
         pre_steps=cfg.pre_steps,
         dw_bracket=(-0.05, 0.05),
     )
-    model = TCPAMaxwellBlockedModel(mat=cfg.mat, geom=cfg.geom, disc=disc, integration=cfg.integration)
+    model = TCPAMaxwellBlockedModel(
+        mat=cfg.mat,
+        geom=cfg.geom,
+        disc=disc,
+        integration=cfg.integration,
+        prestrain_reference_mode=getattr(cfg, "prestrain_reference_mode", "elastic_tk_reference"),
+    )
     model.prestretch_to(cfg.eps)
-    i_act0 = len(model.history)
     t_start = model.helix.time
     t_local, pressure = _prepare_actuation_history(
         cfg.n_cycles,
@@ -1178,6 +1534,14 @@ def run_suspended_actuation(
         cfg.volume_mL,
         cfg.nonlinear_pressure,
     )
+    model.step_suspended(float(pressure[0]), 0.0, float(load_N))
+    i_act0 = len(model.history) - 1
+    reference_length = (
+        cfg.geom.initial_length
+        * model.axial_stretch
+        * np.sin(model.helix.alpha)
+        / np.sin(model.alpha0)
+    )
     model.run_pressure_history_suspended(t_start + t_local, pressure, float(load_N))
     full = model.history_arrays()
     arr = {key: value[i_act0:].copy() for key, value in full.items()}
@@ -1187,11 +1551,12 @@ def run_suspended_actuation(
     arr["load_mN"] = 1000.0 * arr["load_N"]
     if len(arr.get("axial_length_mm", [])) > 0:
         axial = np.asarray(arr["axial_length_mm"], dtype=float)
-        contraction = axial[0] - axial
-        arr["free_displacement_mm"] = axial - axial[0]
+        contraction = reference_length - axial
+        arr["free_displacement_mm"] = axial - reference_length
         arr["free_contraction_mm"] = contraction
-        arr["free_actuation_strain"] = contraction / max(float(cfg.geom.initial_length), 1e-12)
+        arr["free_actuation_strain"] = contraction / max(float(reference_length), 1e-12)
         arr["free_actuation_percent"] = 100.0 * arr["free_actuation_strain"]
+        arr["reference_axial_length_mm"] = np.full_like(axial, float(reference_length))
     arr["mode"] = np.array(["suspended_mass"] * len(arr["time"]), dtype=object)
     return model, arr
 
@@ -1205,19 +1570,19 @@ def run_hold_relaxation(
     n_layers: int = 4,
     n_phi: int = 24,
     pre_steps: int = 24,
-    integration: str = "paper_incremental",
+    integration: str = "exponential",
 ):
-    disc = default_discretization(n_layers=n_layers, n_phi=n_phi, pre_steps=pre_steps, dw_bracket=(-0.05, 0.05))
-    model = TCPAMaxwellBlockedModel(disc=disc, integration=integration)
-    model.prestretch_to(eps)
-    i_act0 = len(model.history)
-    t_start = model.helix.time
     t, p = ramp_hold_pressure_history(P_hold=P_hold, ramp_time=ramp_time, hold_time=hold_time, dt=dt)
-    model.run_pressure_history(t_start + t, p)
-    full = model.history_arrays()
-    arr = {key: value[i_act0:].copy() for key, value in full.items()}
-    arr["time"] = arr["time"] - t_start
-    add_corrected_output_conventions(arr)
+    config = default_simulation_config(
+        eps=eps,
+        Pmax=P_hold,
+        dt=dt,
+        n_layers=n_layers,
+        n_phi=n_phi,
+        pre_steps=pre_steps,
+        integration=integration,
+    )
+    model, arr = run_blocked_actuation(config, pressure_time=t, pressure_MPa=p)
     i0 = int(np.searchsorted(arr["time"], ramp_time, side="left"))
     arr["ramp_time"] = float(ramp_time)
     arr["hold_time"] = float(hold_time)
@@ -1409,7 +1774,7 @@ def quick_validation() -> Dict[str, float]:
         n_layers=2,
         n_phi=8,
         pre_steps=3,
-        integration="paper_incremental",
+        integration="exponential",
     )
     return {
         "isotropic_rotation_error": report.isotropic_rotation_error,
