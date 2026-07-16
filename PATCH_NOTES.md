@@ -1,5 +1,15 @@
 # Notes de version
 
+## v2.0.0-beta.2 - 16 juillet 2026
+
+- Export CSV disponible dans chacun des six onglets de simulation.
+- Fichiers UTF-8 avec séparateur `;`, adaptés aux tableurs en environnement
+  français.
+- Export d'hystérèse au format long avec identification du cas, du cycle et du
+  temps relatif dans le cycle.
+- Boutons désactivés tant qu'aucun résultat compatible n'est disponible.
+- Test automatisé du contenu des exports temporels et d'hystérèse.
+
 ## v2.0.0-beta.1 - 16 juillet 2026
 
 Cette version Beta transforme le livrable initial en une application autonome,
@@ -15,8 +25,6 @@ modulaire et portable pour l'étude des actionneurs Cavatappi.
 - Bouton de réinitialisation des paramètres par défaut.
 - Barre de progression et estimation adaptative du temps de calcul.
 - Sélection automatique d'un port local libre au lancement.
-- Export CSV disponible dans chacun des six onglets de simulation.
-- Export d'hystérèse au format long avec identification du cas et du cycle.
 
 ### Études disponibles
 
