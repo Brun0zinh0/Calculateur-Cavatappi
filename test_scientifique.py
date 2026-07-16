@@ -5,6 +5,8 @@ Exécution : python test_scientifique.py
 
 from __future__ import annotations
 
+import csv
+from io import StringIO
 import sys
 from pathlib import Path
 
@@ -16,6 +18,7 @@ if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 import Base
+import affichage
 import parametres
 import pression
 
@@ -171,6 +174,31 @@ def test_measured_pressure_csv() -> None:
     assert pression.estimate_measured_period(time, pressure_values) == 3.0
 
 
+def test_result_csv_exports() -> None:
+    data = {
+        "time": np.array([0.0, 1.0, 2.0]),
+        "pressure_MPa": np.array([0.0, 0.5, 1.0]),
+        "force_total_mN": np.array([100.0, 120.0, 140.0]),
+        "hold_start_index": 1,
+    }
+    csv_payload = affichage.mapping_to_csv_bytes(data)
+    rows = list(csv.DictReader(StringIO(csv_payload.decode("utf-8-sig")), delimiter=";"))
+    assert len(rows) == 3
+    assert rows[1]["time"] == "1.0"
+    assert rows[1]["force_total_mN"] == "120.0"
+    assert rows[1]["hold_start_index"] == "1"
+
+    cases = [{"label": "cas test", "data": data, "period": 2.0, "value": 0.8}]
+    hysteresis_payload = affichage.hysteresis_to_csv_bytes(cases, [1], "prestrain")
+    hysteresis_rows = list(
+        csv.DictReader(StringIO(hysteresis_payload.decode("utf-8-sig")), delimiter=";")
+    )
+    assert len(hysteresis_rows) == 3
+    assert hysteresis_rows[0]["case_label"] == "cas test"
+    assert hysteresis_rows[0]["cycle"] == "1"
+    assert np.isclose(float(hysteresis_rows[-1]["pressure_psi"]), 1.0 / parametres.PSI_TO_MPA)
+
+
 def main() -> None:
     tests = (
         test_pressure_histories,
@@ -181,6 +209,7 @@ def main() -> None:
         test_tk_reference_state,
         test_nylon_physical_modes,
         test_measured_pressure_csv,
+        test_result_csv_exports,
     )
     for test in tests:
         test()

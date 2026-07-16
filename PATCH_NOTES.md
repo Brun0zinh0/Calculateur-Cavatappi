@@ -15,6 +15,8 @@ modulaire et portable pour l'étude des actionneurs Cavatappi.
 - Bouton de réinitialisation des paramètres par défaut.
 - Barre de progression et estimation adaptative du temps de calcul.
 - Sélection automatique d'un port local libre au lancement.
+- Export CSV disponible dans chacun des six onglets de simulation.
+- Export d'hystérèse au format long avec identification du cas et du cycle.
 
 ### Études disponibles
 

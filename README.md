@@ -48,6 +48,13 @@ Pour les vitesses de pression injectée, l'historique de pression utilisé pour
 la comparaison est triangulaire et linéaire afin que la pente corresponde à la
 valeur demandée.
 
+## Export des résultats
+
+Chaque onglet de simulation propose un bouton `Exporter les résultats en CSV`.
+Le fichier utilise l'encodage UTF-8 et le séparateur `;` pour faciliter son
+ouverture dans un tableur en environnement français. L'export d'hystérèse
+indique le cas comparé, le numéro du cycle et le temps relatif dans le cycle.
+
 
 ## Dependances Python
 

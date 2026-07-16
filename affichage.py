@@ -1,10 +1,141 @@
 from __future__ import annotations
 
+import csv
+from io import StringIO
+from typing import Any
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Circle
 
 from parametres import PSI_TO_MPA, SettingValue, VISUAL_STATE_LABELS, derived_geometry
+
+
+def _csv_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return ""
+    return value
+
+
+def _csv_columns(data: dict[str, Any]) -> tuple[dict[str, np.ndarray], dict[str, Any], int]:
+    arrays: dict[str, np.ndarray] = {}
+    scalars: dict[str, Any] = {}
+    lengths: list[int] = []
+
+    for key, value in data.items():
+        try:
+            array = np.asarray(value)
+        except (TypeError, ValueError):
+            continue
+        if array.ndim == 1 and array.size > 0:
+            lengths.append(int(array.size))
+        elif array.ndim == 0:
+            scalar = array.item()
+            if isinstance(scalar, (str, int, float, bool, np.number, np.bool_)):
+                scalars[str(key)] = _csv_value(scalar)
+
+    if not lengths:
+        raise ValueError("Aucune série monodimensionnelle à exporter.")
+    row_count = max(lengths)
+
+    for key, value in data.items():
+        try:
+            array = np.asarray(value)
+        except (TypeError, ValueError):
+            continue
+        if array.ndim == 1 and array.size == row_count:
+            arrays[str(key)] = array
+
+    if not arrays:
+        raise ValueError("Aucune série de résultats cohérente à exporter.")
+    return arrays, scalars, row_count
+
+
+def _csv_bytes(rows: list[dict[str, Any]], fieldnames: list[str]) -> bytes:
+    stream = StringIO(newline="")
+    writer = csv.DictWriter(
+        stream,
+        fieldnames=fieldnames,
+        delimiter=";",
+        lineterminator="\n",
+        extrasaction="ignore",
+    )
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: _csv_value(value) for key, value in row.items()})
+    return ("\ufeff" + stream.getvalue()).encode("utf-8")
+
+
+def mapping_to_csv_bytes(data: dict[str, Any]) -> bytes:
+    """Exporte les séries de même longueur et répète les métadonnées scalaires."""
+    arrays, scalars, row_count = _csv_columns(data)
+    preferred = [key for key in ("time", "eps", "pressure_MPa") if key in arrays]
+    array_names = preferred + [key for key in arrays if key not in preferred]
+    fieldnames = array_names + [key for key in scalars if key not in array_names]
+    rows: list[dict[str, Any]] = []
+    for index in range(row_count):
+        row = {key: array[index] for key, array in arrays.items()}
+        row.update(scalars)
+        rows.append(row)
+    return _csv_bytes(rows, fieldnames)
+
+
+def hysteresis_to_csv_bytes(cases: list[dict[str, Any]], cycles: list[int], mode: str) -> bytes:
+    """Exporte les cycles affichés sous forme longue, y compris les comparaisons."""
+    rows: list[dict[str, Any]] = []
+    result_names: list[str] = []
+
+    for case in cases:
+        arrays, scalars, _ = _csv_columns(case["data"])
+        if "time" not in arrays:
+            continue
+        for key in arrays:
+            if key not in result_names:
+                result_names.append(key)
+        for key in scalars:
+            if key not in result_names:
+                result_names.append(key)
+
+        time_values = np.asarray(arrays["time"], dtype=float)
+        period = float(case["period"])
+        for cycle in cycles:
+            if cycle < 1:
+                continue
+            start_time = (cycle - 1) * period
+            mask = (time_values >= start_time) & (time_values <= cycle * period)
+            indices = np.flatnonzero(mask)
+            if indices.size < 3:
+                continue
+            for index in indices:
+                row: dict[str, Any] = {
+                    "case_label": str(case.get("label", "cas")),
+                    "comparison_mode": str(mode),
+                    "comparison_value": case.get("value", ""),
+                    "cycle": int(cycle),
+                    "time_in_cycle_s": float(time_values[index] - start_time),
+                }
+                row.update({key: array[index] for key, array in arrays.items()})
+                row.update(scalars)
+                if "pressure_MPa" in arrays:
+                    row["pressure_psi"] = float(arrays["pressure_MPa"][index]) / PSI_TO_MPA
+                rows.append(row)
+
+    if not rows:
+        raise ValueError("Les cycles sélectionnés ne contiennent aucune donnée exportable.")
+    if "pressure_MPa" in result_names and "pressure_psi" not in result_names:
+        pressure_index = result_names.index("pressure_MPa") + 1
+        result_names.insert(pressure_index, "pressure_psi")
+    fieldnames = [
+        "case_label",
+        "comparison_mode",
+        "comparison_value",
+        "cycle",
+        "time_in_cycle_s",
+        *result_names,
+    ]
+    return _csv_bytes(rows, fieldnames)
 
 
 def format_seconds(seconds: float) -> str:

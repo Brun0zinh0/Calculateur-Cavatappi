@@ -28,11 +28,14 @@ import parametres as parametres_module
 # garantit que les libellés, valeurs par défaut et validations restent synchronisés.
 importlib.invalidate_caches()
 parametres_module = importlib.reload(parametres_module)
+affichage_module = importlib.reload(affichage_module)
 
 from affichage import (
     format_seconds,
+    hysteresis_to_csv_bytes,
     make_cavatappi_figure,
     make_cross_section_figure,
+    mapping_to_csv_bytes,
     plot_hysteresis_overlay,
     plot_prestrain_study,
     plot_relaxation_response,
@@ -111,6 +114,19 @@ HYSTERESIS_COMPARE_LABELS = {
     "prestrain": "Plusieurs précontraintes initiales",
     "pressure_rate": "Plusieurs vitesses de pression injectée",
 }
+
+
+def render_csv_download(payload: bytes | None, filename: str, key: str) -> None:
+    st.download_button(
+        "Exporter les résultats en CSV",
+        data=payload if payload is not None else b"",
+        file_name=filename,
+        mime="text/csv; charset=utf-8",
+        key=key,
+        on_click="ignore",
+        icon=":material/download:",
+        disabled=payload is None,
+    )
 
 BLOCKED_RESULT_IGNORE_KEYS = {
     "eps_study_min",
@@ -1326,6 +1342,7 @@ prestrain_range_error = float(eps_study_max) <= float(eps_study_min)
 prestrain_study_run_disabled = error is not None or prestrain_range_error or estimated_prestrain_cost > 750_000
 
 with tabs[0]:
+    blocked_csv_payload = None
     st.caption(f"Temps de calcul estimé : ~{format_seconds(estimated_compute_s)}.")
     if estimated_cost > 120_000 and not run_disabled:
         st.warning("Cette simulation peut être lente. Augmentez le pas de temps ou réduisez le maillage pour l'interaction.")
@@ -1381,8 +1398,16 @@ with tabs[0]:
             f"calcul : {format_seconds(result.get('elapsed_s', 0.0))} "
             f"(estimé {format_seconds(result.get('estimated_s', 0.0))})"
         )
+        blocked_csv_payload = mapping_to_csv_bytes(data)
+
+    render_csv_download(
+        blocked_csv_payload,
+        "resultats_actionnement_bloque.csv",
+        "download_blocked_csv",
+    )
 
 with tabs[1]:
+    temporal_csv_payload = None
     stored_result = st.session_state["calculator_result"]
     result = stored_result if result_matches_settings(stored_result, blocked_result_signature, BLOCKED_RESULT_IGNORE_KEYS) else None
     if result is None:
@@ -1394,8 +1419,17 @@ with tabs[1]:
         fig_response = plot_time_response_fr(result["data"])
         st.pyplot(fig_response)
         plt.close(fig_response)
+        temporal_csv_payload = mapping_to_csv_bytes(result["data"])
+
+    render_csv_download(
+        temporal_csv_payload,
+        "courbes_temporelles_actionnement_bloque.csv",
+        "download_temporal_csv",
+    )
 
 with tabs[2]:
+    hysteresis_export_cases: list[dict] = []
+    hysteresis_csv_payload = None
     st.caption(f"Cycles sélectionnés : {', '.join(str(cycle) for cycle in selected_hysteresis_cycles)}.")
     if hysteresis_compare_mode == "current":
         stored_result = st.session_state["calculator_result"]
@@ -1416,6 +1450,7 @@ with tabs[2]:
                         "period": result_cycle_period(config),
                     }
                 ]
+                hysteresis_export_cases = cases
                 fig_hyst = plot_hysteresis_overlay(cases, cycles_to_plot, show=False)
                 st.pyplot(fig_hyst)
                 plt.close(fig_hyst)
@@ -1474,6 +1509,7 @@ with tabs[2]:
                 )
                 st.pyplot(fig_hyst)
                 plt.close(fig_hyst)
+                hysteresis_export_cases = comparison_result["cases"]
                 st.caption(
                     f"Calcul : {format_seconds(comparison_result.get('elapsed_s', 0.0))} "
                     f"(estimé {format_seconds(comparison_result.get('estimated_s', 0.0))})"
@@ -1481,7 +1517,23 @@ with tabs[2]:
             except Exception as exc:
                 st.error(f"Impossible de tracer la comparaison d'hystérèse : {exc}")
 
+    if hysteresis_export_cases:
+        try:
+            hysteresis_csv_payload = hysteresis_to_csv_bytes(
+                hysteresis_export_cases,
+                selected_hysteresis_cycles,
+                str(hysteresis_compare_mode),
+            )
+        except ValueError:
+            hysteresis_csv_payload = None
+    render_csv_download(
+        hysteresis_csv_payload,
+        "resultats_hysterese.csv",
+        "download_hysteresis_csv",
+    )
+
 with tabs[3]:
+    relaxation_csv_payload = None
     st.caption(f"Temps de calcul estimé : ~{format_seconds(estimated_relaxation_compute_s)}.")
     if estimated_relaxation_cost > 120_000 and not relaxation_run_disabled:
         st.warning("La relaxation peut être lente. Augmentez le pas de temps, réduisez le maintien ou réduisez le maillage.")
@@ -1539,8 +1591,16 @@ with tabs[3]:
         fig_relax = plot_relaxation_response(relaxation_data)
         st.pyplot(fig_relax)
         plt.close(fig_relax)
+        relaxation_csv_payload = mapping_to_csv_bytes(relaxation_data)
+
+    render_csv_download(
+        relaxation_csv_payload,
+        "resultats_relaxation.csv",
+        "download_relaxation_csv",
+    )
 
 with tabs[4]:
+    prestrain_csv_payload = None
     st.caption(f"Temps de calcul estimé : ~{format_seconds(estimated_prestrain_compute_s)}.")
     if estimated_prestrain_cost > 120_000 and not prestrain_study_run_disabled:
         st.warning(
@@ -1602,8 +1662,16 @@ with tabs[4]:
         fig_study = plot_prestrain_study(study_data)
         st.pyplot(fig_study)
         plt.close(fig_study)
+        prestrain_csv_payload = mapping_to_csv_bytes(study_data)
+
+    render_csv_download(
+        prestrain_csv_payload,
+        "resultats_etude_precontrainte.csv",
+        "download_prestrain_csv",
+    )
 
 with tabs[5]:
+    suspended_csv_payload = None
     load_N = float(suspended_mass_g) * 1.0e-3 * 9.80665
     suspended_ramp_time_s = float(p_max_mpa) / max(float(suspended_pressure_rate_mpa_s), 1e-12)
     suspended_profile_label = (
@@ -1698,3 +1766,10 @@ with tabs[5]:
         )
         st.pyplot(fig_suspended)
         plt.close(fig_suspended)
+        suspended_csv_payload = mapping_to_csv_bytes(suspended_data)
+
+    render_csv_download(
+        suspended_csv_payload,
+        "resultats_masse_suspendue.csv",
+        "download_suspended_csv",
+    )
