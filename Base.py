@@ -25,7 +25,7 @@ import numpy as np
 from scipy.optimize import brentq, least_squares, minimize_scalar
 
 
-MODEL_VERSION = "2026.07.16-tk-reference-anisotropy-3"
+MODEL_VERSION = "2026.07.16-no-pressure-end-force-4"
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +77,6 @@ def default_geometry_params(**overrides):
         "initial_length": 32.45,
         "bias_angle_profile": "paper_linear",
         "section_update_mode": "fixed",
-        "pressure_end_force_mode": "none",
-        "pressure_end_force_scale": 0.0,
     }
     values.update({k: v for k, v in overrides.items() if v is not None})
     return SimpleNamespace(**values)
@@ -169,7 +167,6 @@ class StepResult:
     Fnylon: float
     Mnylon: float
     Tnylon: float
-    Fpressure: float
     axial_stretch: float
     Rin: float
     Rout: float
@@ -331,8 +328,6 @@ class TCPAMaxwellBlockedModel:
         self._building_reference_state = False
         self.nylon_axial_prestrain_coupling = float(getattr(mat, "nylon_axial_prestrain_coupling", 1.0))
         self.nylon_axial_actuation_coupling = float(getattr(mat, "nylon_axial_actuation_coupling", 1.0))
-        self.pressure_end_force_mode = str(getattr(geom, "pressure_end_force_mode", "none"))
-        self.pressure_end_force_scale = float(getattr(geom, "pressure_end_force_scale", 0.0))
         self.section_update_mode = str(getattr(geom, "section_update_mode", "fixed"))
         self.bias_angle_profile = str(getattr(geom, "bias_angle_profile", "paper_linear"))
         for name, value in (
@@ -341,14 +336,6 @@ class TCPAMaxwellBlockedModel:
         ):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be between 0 and 1.")
-        if self.pressure_end_force_mode not in {"none", "projected_inner_area", "axial_inner_area"}:
-            raise ValueError("pressure_end_force_mode must be 'none', 'projected_inner_area', or 'axial_inner_area'.")
-        expected_end_scale = 0.0 if self.pressure_end_force_mode == "none" else 1.0
-        if not np.isclose(self.pressure_end_force_scale, expected_end_scale, rtol=0.0, atol=1e-12):
-            raise ValueError(
-                "pressure_end_force_scale is not a calibration parameter: use 0 with mode 'none' "
-                "and 1 with an active pressure-end mode."
-            )
         if self.section_update_mode not in {"fixed", "updated"}:
             raise ValueError("section_update_mode must be 'fixed' or 'updated'.")
         if self.bias_angle_profile not in {"paper_linear", "uniform_twist"}:
@@ -509,15 +496,6 @@ class TCPAMaxwellBlockedModel:
         if self.nylon_condition_mode == "axially_sliding_confined":
             return 0.0
         return float(raw_force)
-
-    def _pressure_end_force(self, pressure: float, alpha: float, Rin: Optional[float] = None) -> float:
-        if self.pressure_end_force_mode == "none" or self.pressure_end_force_scale == 0.0:
-            return 0.0
-        current_Rin = self.R_edges[0] if Rin is None else float(Rin)
-        thrust = self.pressure_end_force_scale * pressure * np.pi * current_Rin**2
-        if self.pressure_end_force_mode == "projected_inner_area":
-            return thrust * np.sin(alpha)
-        return thrust
 
     def _new_geometry_from_dw_and_h(self, dw: float, h_target: float) -> Tuple[float, float]:
         l_old = self.helix.rho / np.cos(self.helix.alpha)
@@ -804,13 +782,10 @@ class TCPAMaxwellBlockedModel:
             Ft = np.nan
             Tt = np.nan
             residual = np.inf
-            Fpressure = np.nan
         else:
-            Ft_structural = Ares / sin_a
-            Tt = (Bres + Ft_structural * rho_new * sin_a) / cos_a
-            residual = (Tt * sin_a + Ft_structural * rho_new * cos_a) - Cres
-            Fpressure = self._pressure_end_force(self.helix.pressure + dP, alpha_new, R_edges_new[0])
-            Ft = Ft_structural + Fpressure
+            Ft = Ares / sin_a
+            Tt = (Bres + Ft * rho_new * sin_a) / cos_a
+            residual = (Tt * sin_a + Ft * rho_new * cos_a) - Cres
 
         return {
             "rho_new": rho_new,
@@ -831,7 +806,6 @@ class TCPAMaxwellBlockedModel:
             "Ft": Ft,
             "Tt": Tt,
             "residual": residual,
-            "Fpressure": Fpressure,
             "R_edges_new": R_edges_new,
             "R_centers_new": R_centers_new,
             "dR_new": dR_new,
@@ -909,7 +883,6 @@ class TCPAMaxwellBlockedModel:
         Fny = self._next_nylon_axial_force(dw, axial_coupling)
         Mny = self.Mnylon + 0.25 * np.pi * self.mat.E_nylon * rn**4 * dkappa
         Tny = self.Tnylon + 0.5 * np.pi * self.mat.G_nylon * rn**4 * dv
-        Fpressure = self._pressure_end_force(self.helix.pressure + dP, alpha_new, R_edges_new[0])
 
         return {
             "rho_new": rho_new,
@@ -930,7 +903,6 @@ class TCPAMaxwellBlockedModel:
             "Ft": np.nan,
             "Tt": np.nan,
             "residual": np.nan,
-            "Fpressure": Fpressure,
             "R_edges_new": R_edges_new,
             "R_centers_new": R_centers_new,
             "dR_new": dR_new,
@@ -1024,7 +996,6 @@ class TCPAMaxwellBlockedModel:
             Fnylon=float(trial["Fny"]),
             Mnylon=float(trial["Mny"]),
             Tnylon=float(trial["Tny"]),
-            Fpressure=float(trial["Fpressure"]),
             axial_stretch=self.axial_stretch,
             Rin=float(self.R_edges[0]),
             Rout=float(self.R_edges[-1]),
@@ -1037,14 +1008,13 @@ class TCPAMaxwellBlockedModel:
         alpha = float(trial["alpha_new"])
         sin_a = np.sin(alpha)
         cos_a = np.cos(alpha)
-        effective_load = load_N - float(trial.get("Fpressure", 0.0))
-        force_scale = max(abs(load_N), abs(effective_load), 0.05)
-        moment_scale = max(abs(load_N * rho), abs(effective_load * rho), 0.05)
+        force_scale = max(abs(load_N), 0.05)
+        moment_scale = max(abs(load_N * rho), 0.05)
         return np.array(
             [
-                (float(trial["Ftube"]) + float(trial["Fny"]) - effective_load * sin_a) / force_scale,
-                (float(trial["Mtube"]) + float(trial["Mny"]) + effective_load * rho * sin_a) / moment_scale,
-                (float(trial["Ttube"]) + float(trial["Tny"]) - effective_load * rho * cos_a) / moment_scale,
+                (float(trial["Ftube"]) + float(trial["Fny"]) - load_N * sin_a) / force_scale,
+                (float(trial["Mtube"]) + float(trial["Mny"]) + load_N * rho * sin_a) / moment_scale,
+                (float(trial["Ttube"]) + float(trial["Tny"]) - load_N * rho * cos_a) / moment_scale,
             ],
             dtype=float,
         )
@@ -1170,7 +1140,6 @@ class TCPAMaxwellBlockedModel:
             Fnylon=float(trial["Fny"]),
             Mnylon=float(trial["Mny"]),
             Tnylon=float(trial["Tny"]),
-            Fpressure=float(trial["Fpressure"]),
             axial_stretch=self.axial_stretch,
             Rin=float(self.R_edges[0]),
             Rout=float(self.R_edges[-1]),
@@ -1258,7 +1227,6 @@ class TCPAMaxwellBlockedModel:
         cos_a = np.cos(alpha)
         Ftube = np.array([x.Ftube for x in h], dtype=float)
         Fny = np.array([x.Fnylon for x in h], dtype=float)
-        Fpressure = np.array([x.Fpressure for x in h], dtype=float)
         Mtube = np.array([x.Mtube for x in h], dtype=float)
         Mny = np.array([x.Mnylon for x in h], dtype=float)
         Ttube = np.array([x.Ttube for x in h], dtype=float)
@@ -1287,8 +1255,6 @@ class TCPAMaxwellBlockedModel:
                 "Tnylon_axis_Nmm": Tny,
                 "force_tube_mN": 1000.0 * force_tube,
                 "force_nylon_mN": 1000.0 * force_nylon,
-                "force_pressure_end_mN": 1000.0 * Fpressure,
-                "force_structural_mN": 1000.0 * (np.asarray([x.Ft for x in h], dtype=float) - Fpressure),
                 "torque_tube_microNm": 1000.0 * torque_tube,
                 "torque_nylon_microNm": 1000.0 * torque_nylon,
                 "torque_axis_tube_microNm": 1000.0 * Ttube,
@@ -1392,8 +1358,6 @@ def add_corrected_output_conventions(arr: Dict[str, np.ndarray]) -> Dict[str, np
     for key in (
         "force_tube_mN",
         "force_nylon_mN",
-        "force_pressure_end_mN",
-        "force_structural_mN",
         "torque_tube_microNm",
         "torque_nylon_microNm",
     ):
@@ -1654,7 +1618,6 @@ def plot_decomposition(
     f_total = "force_total_mN" if force_mode == "total" else "force_act_mN"
     f_tube = "force_tube_mN" if force_mode == "total" else "force_tube_act_mN"
     f_nylon = "force_nylon_mN" if force_mode == "total" else "force_nylon_act_mN"
-    f_pressure = "force_pressure_end_mN" if force_mode == "total" else "force_pressure_end_act_mN"
     tq_total = "torque_total_signed_microNm" if torque_mode == "total" else "torque_act_microNm"
     tq_tube = "torque_tube_microNm" if torque_mode == "total" else "torque_tube_act_microNm"
     tq_nylon = "torque_nylon_microNm" if torque_mode == "total" else "torque_nylon_act_microNm"
@@ -1662,8 +1625,6 @@ def plot_decomposition(
     axes[0].plot(t, arr[f_total], lw=1.6, label="total")
     axes[0].plot(t, arr[f_tube], lw=1.2, label="tube")
     axes[0].plot(t, arr[f_nylon], lw=1.2, label="nylon")
-    if f_pressure in arr and np.nanmax(np.abs(arr[f_pressure])) > 1e-9:
-        axes[0].plot(t, arr[f_pressure], lw=1.2, label="pressure end")
     axes[0].set_ylabel("Force (mN)")
     axes[0].set_title(title)
     axes[0].legend(loc="best")
@@ -1790,7 +1751,6 @@ def quick_validation() -> Dict[str, float]:
                     arr["force_total_mN"]
                     - arr["force_tube_mN"]
                     - arr["force_nylon_mN"]
-                    - arr.get("force_pressure_end_mN", 0.0)
                 )
             )
         ),

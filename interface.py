@@ -62,8 +62,6 @@ from parametres import (
     PRESTRAIN_REFERENCE_OPTIONS,
     PRESSURE_INPUT_LABELS,
     PRESSURE_INPUT_OPTIONS,
-    PRESSURE_END_FORCE_LABELS,
-    PRESSURE_END_FORCE_OPTIONS,
     PRESTRAIN_RESULT_PATH,
     RELAXATION_RESULT_PATH,
     SECTION_UPDATE_LABELS,
@@ -1035,25 +1033,6 @@ with st.sidebar.expander("Nylon"):
     nylon_axial_actuation_coupling = nylon_axial_prestrain_coupling
     st.caption("Les multiplicateurs continus du nylon sont verrouillés à leur valeur physique, sans calibration.")
 
-with st.sidebar.expander("Force de fond pression"):
-    sidebar_help(
-        [
-            "Ce volet ajoute éventuellement une force axiale directe due à la pression sur une surface de fond.",
-            "Le mode choisi définit la surface utilisée pour cette force.",
-            "La contribution vaut strictement pression multipliée par aire, sans facteur ajustable.",
-            "Par défaut, cette contribution est nulle pour rester proche du modèle mécanique principal.",
-            "Une valeur non nulle ajoute la poussée directe exercée par la pression sur un fond fermé.",
-        ]
-    )
-    pressure_end_force_mode = st.selectbox(
-        "Mode de force de fond",
-        PRESSURE_END_FORCE_OPTIONS,
-        index=option_index(PRESSURE_END_FORCE_OPTIONS, settings["pressure_end_force_mode"]),
-        format_func=lambda value: PRESSURE_END_FORCE_LABELS.get(value, value),
-    )
-    pressure_end_force_scale = 0.0 if pressure_end_force_mode == "none" else 1.0
-    st.caption(f"Facteur physique appliqué : {pressure_end_force_scale:.0f}")
-
 with st.sidebar.expander("Solveur"):
     sidebar_help(
         [
@@ -1108,8 +1087,6 @@ current_settings = {
     "bias_angle_profile": str(bias_angle_profile),
     "initial_length_mm": float(initial_length_mm),
     "section_update_mode": str(section_update_mode),
-    "pressure_end_force_mode": str(pressure_end_force_mode),
-    "pressure_end_force_scale": float(pressure_end_force_scale),
     "n_cycles": int(n_cycles),
     "hysteresis_cycle": parse_cycle_list(hysteresis_cycles, int(n_cycles))[0],
     "hysteresis_cycles": str(hysteresis_cycles),

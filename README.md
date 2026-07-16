@@ -114,21 +114,11 @@ défaut.
 Dans l'interface, le bouton `Paramètres par défaut` réinitialise les paramètres
 de simulation et efface les derniers résultats mis en cache.
 
-## option complexe
+## Transmission de la pression
 
-Dans le modèle principal, la pression ne donne pas directement une force axiale comme un vérin. Elle déforme le tube : le tube gonfle, ses directions matérielles anisotropes se réorientent, l’hélice cherche à changer de géométrie, et comme l’actionneur est bloqué, cette tendance au mouvement devient une force mesurée.
-
-Donc le chemin principal est :
-pression -> déformation du tube -> changement de géométrie hélicoïdale empêché -> force bloquée
-
-La force de fond pression, elle, représente un autre chemin possible :
-pression -> poussée directe sur une surface fermée -> force axiale
-
-C’est le même principe qu’un vérin pneumatique : si vous avez une pression interne P qui pousse sur une surface A, vous obtenez une force directe :
-F = P*A
-
-Dans l'interface, cette contribution utilise uniquement un facteur physique de
-zéro (désactivée) ou un (activée). Aucun multiplicateur ajustable n'est utilisé.
+La pression déforme le tube, réoriente ses directions matérielles anisotropes
+et modifie la géométrie de l'hélice. Lorsque l'actionneur est bloqué, cette
+tendance au mouvement produit la force calculée par le modèle.
 
 ## Comparaison avec la figure 7
 

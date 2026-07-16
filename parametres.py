@@ -33,9 +33,8 @@ RESULT_CACHE_PATHS = (
     SUSPENDED_RESULT_PATH,
     HYSTERESIS_RESULT_PATH,
 )
-SETTINGS_SCHEMA_VERSION = 11
+SETTINGS_SCHEMA_VERSION = 12
 
-PRESSURE_END_FORCE_OPTIONS = ["none", "projected_inner_area", "axial_inner_area"]
 INTEGRATION_OPTIONS = ["exponential", "paper_explicit"]
 VISUAL_STATE_OPTIONS = ["fabricated", "prestrained"]
 SECTION_UPDATE_OPTIONS = ["fixed", "updated"]
@@ -47,11 +46,6 @@ MAXWELL_ANISOTROPY_OPTIONS = ["axial_test_only", "paper_equal"]
 NYLON_CONDITION_OPTIONS = ["bonded_linear", "tension_only", "axially_sliding_confined"]
 PRESSURE_INPUT_OPTIONS = ["generated", "measured_csv"]
 
-PRESSURE_END_FORCE_LABELS = {
-    "none": "Aucune",
-    "projected_inner_area": "Poussée projetée sur l'axe",
-    "axial_inner_area": "Poussée axiale complète",
-}
 INTEGRATION_LABELS = {
     "paper_explicit": "Euler explicite",
     "exponential": "Intégration exponentielle stable",
@@ -111,8 +105,6 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "initial_length_mm": 32.45,
     "bias_angle_profile": "paper_linear",
     "section_update_mode": "fixed",
-    "pressure_end_force_mode": "none",
-    "pressure_end_force_scale": 0.0,
     "n_cycles": 11,
     "hysteresis_cycle": 1,
     "hysteresis_cycles": "1",
@@ -220,8 +212,6 @@ class GeometryParams:
     initial_length: float = 32.45
     bias_angle_profile: str = "paper_linear"
     section_update_mode: str = "fixed"
-    pressure_end_force_mode: str = "none"
-    pressure_end_force_scale: float = 0.0
 
 
 @dataclass
@@ -288,9 +278,6 @@ def load_settings() -> dict[str, SettingValue]:
         saved["nylon_axial_prestrain_coupling"] = 1.0
         saved["nylon_axial_actuation_coupling"] = 1.0
         saved.setdefault("pressure_input_mode", DEFAULT_SETTINGS["pressure_input_mode"])
-        saved["pressure_end_force_scale"] = (
-            0.0 if str(saved.get("pressure_end_force_mode", "none")) == "none" else 1.0
-        )
         saved["_settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
     settings = dict(DEFAULT_SETTINGS)
@@ -465,10 +452,6 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
         return "La condition physique du nylon est inconnue."
     if str(settings.get("pressure_input_mode", "generated")) not in PRESSURE_INPUT_OPTIONS:
         return "La source de pression est inconnue."
-    pressure_end_mode = str(settings.get("pressure_end_force_mode", "none"))
-    expected_end_scale = 0.0 if pressure_end_mode == "none" else 1.0
-    if not np.isclose(float(settings.get("pressure_end_force_scale", 0.0)), expected_end_scale):
-        return "La force de fond utilise uniquement le facteur physique 0 (inactive) ou 1 (active)."
     for key in ("nylon_axial_prestrain_coupling", "nylon_axial_actuation_coupling"):
         if not 0.0 <= float(settings[key]) <= 1.0:
             return "Les coefficients de couplage du nylon doivent rester entre 0 et 1."
@@ -605,8 +588,6 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         initial_length=float(settings["initial_length_mm"]),
         bias_angle_profile=str(settings.get("bias_angle_profile", "paper_linear")),
         section_update_mode=str(settings.get("section_update_mode", "fixed")),
-        pressure_end_force_mode=str(settings["pressure_end_force_mode"]),
-        pressure_end_force_scale=float(settings["pressure_end_force_scale"]),
     )
     duration_s = float(settings["duration_s"]) if bool(settings["use_fixed_duration"]) else None
     return with_scaled_nylon(

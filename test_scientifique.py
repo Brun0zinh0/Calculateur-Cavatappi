@@ -48,7 +48,6 @@ def test_blocked_equilibrium() -> None:
             data["force_total_mN"]
             - data["force_tube_mN"]
             - data["force_nylon_mN"]
-            - data["force_pressure_end_mN"]
         )
     )
     torque_error = np.max(
@@ -60,6 +59,9 @@ def test_blocked_equilibrium() -> None:
     )
     assert force_error < 1.0e-8
     assert torque_error < 1.0e-8
+    assert "force_pressure_end_mN" not in data
+    assert "force_structural_mN" not in data
+    assert not any("pressure_end" in key for key in parametres.DEFAULT_SETTINGS)
     assert np.all(data["Rin_mm"] > 0.0)
     assert np.all(data["Rout_mm"] > data["Rin_mm"])
 
