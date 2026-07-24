@@ -24,3 +24,15 @@ Le mode d’actionnement libre avec masse suspendue a également été complét�
 Enfin, la fiabilité numérique a été renforcée par des contrôles sur la géométrie, les propriétés matérielles, le pas de temps et les résidus d’équilibre. Les études comparatives peuvent utiliser plusieurs cœurs du processeur. La version actuelle est accompagnée d’un test d’installation et de neuf tests scientifiques portant notamment sur les profils de pression, l’équilibre bloqué, le mode masse suspendue, les conditions du nylon, l’état de précontrainte, la lecture des mesures CSV et l’export des résultats.
 
 Pour finir la possibilité d'exporter les résultats en fichier CSV pour les traiter en dehors de l'environement du logiciel à était ajouté.
+
+## Mise Ã  jour Beta - interface fiabilisÃ©e (24 juillet 2026)
+
+- Persistance durable des paramÃ¨tres et des rÃ©sultats, avec Ã©critures atomiques et migration des anciens caches.
+- Import et export des paramÃ¨tres en JSON ou CSV depuis la barre latÃ©rale.
+- Les CSV de rÃ©sultats incluent dÃ©sormais les paramÃ¨tres d'entrÃ©e et la version du modÃ¨le.
+- Interface responsive avec action principale accessible immÃ©diatement, mÃ©triques compactes et onglets adaptÃ©s au mobile.
+- Tous les rÃ©glages avancÃ©s sont directement disponibles dans la barre latÃ©rale.
+- Visualiseur 3D et graphiques harmonisÃ©s avec le thÃ¨me sombre.
+- LisibilitÃ© corrigÃ©e dans la coupe du tube, notamment l'annotation du diamÃ¨tre du nylon.
+- Progression, estimation de durÃ©e, rÃ©initialisation et messages d'Ã©tat amÃ©liorÃ©s.
+- Conservation des modes constitutifs fixes de la Beta et renforcement des validations d'entrÃ©e.

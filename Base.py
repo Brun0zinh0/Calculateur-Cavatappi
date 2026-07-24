@@ -25,7 +25,7 @@ import numpy as np
 from scipy.optimize import brentq, least_squares, minimize_scalar
 
 
-MODEL_VERSION = "2026.07.16-no-pressure-end-force-4"
+MODEL_VERSION = "2026.07.24-fixed-maxwell-prestrain-nylon-8"
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +322,15 @@ class TCPAMaxwellBlockedModel:
         self.geom = geom
         self.disc = disc
         self.integration = _normalize_integration_name(integration)
-        self.prestrain_reference_mode = str(prestrain_reference_mode)
+        requested_prestrain_mode = str(prestrain_reference_mode)
+        if requested_prestrain_mode != "elastic_tk_reference":
+            raise ValueError("Beta supports only the conserved elastic prestrain reference.")
+        self.prestrain_reference_mode = "elastic_tk_reference"
         self.maxwell_anisotropy_mode = str(getattr(mat, "maxwell_anisotropy_mode", "paper_equal"))
-        self.nylon_condition_mode = str(getattr(mat, "nylon_condition_mode", "bonded_linear"))
+        requested_nylon_mode = str(getattr(mat, "nylon_condition_mode", "bonded_linear"))
+        if requested_nylon_mode != "bonded_linear":
+            raise ValueError("Beta supports only bonded bilateral linear nylon.")
+        self.nylon_condition_mode = "bonded_linear"
         self._building_reference_state = False
         self.nylon_axial_prestrain_coupling = float(getattr(mat, "nylon_axial_prestrain_coupling", 1.0))
         self.nylon_axial_actuation_coupling = float(getattr(mat, "nylon_axial_actuation_coupling", 1.0))
@@ -334,20 +340,14 @@ class TCPAMaxwellBlockedModel:
             ("nylon_axial_prestrain_coupling", self.nylon_axial_prestrain_coupling),
             ("nylon_axial_actuation_coupling", self.nylon_axial_actuation_coupling),
         ):
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be between 0 and 1.")
+            if not np.isclose(value, 1.0, rtol=0.0, atol=1.0e-12):
+                raise ValueError(f"Beta fixes {name} to 1.0.")
         if self.section_update_mode not in {"fixed", "updated"}:
             raise ValueError("section_update_mode must be 'fixed' or 'updated'.")
         if self.bias_angle_profile not in {"paper_linear", "uniform_twist"}:
             raise ValueError("bias_angle_profile must be 'paper_linear' or 'uniform_twist'.")
-        if self.prestrain_reference_mode not in {"elastic_tk_reference", "viscoelastic_ramp"}:
-            raise ValueError("prestrain_reference_mode must be 'elastic_tk_reference' or 'viscoelastic_ramp'.")
         if self.maxwell_anisotropy_mode not in {"paper_equal", "axial_test_only"}:
             raise ValueError("maxwell_anisotropy_mode must be 'paper_equal' or 'axial_test_only'.")
-        if self.nylon_condition_mode not in {"bonded_linear", "tension_only", "axially_sliding_confined"}:
-            raise ValueError(
-                "nylon_condition_mode must be 'bonded_linear', 'tension_only', or 'axially_sliding_confined'."
-            )
 
         self._validate_inputs()
 
@@ -483,18 +483,12 @@ class TCPAMaxwellBlockedModel:
             )
 
     def _nylon_axial_coupling(self, h_target: float) -> float:
-        if self.nylon_condition_mode == "axially_sliding_confined":
-            return 0.0
         if abs(h_target - self.h_blocked) > 1e-10:
             return self.nylon_axial_prestrain_coupling
         return self.nylon_axial_actuation_coupling
 
     def _next_nylon_axial_force(self, dw: float, axial_coupling: float) -> float:
         raw_force = self.Fnylon + axial_coupling * np.pi * self.mat.E_nylon * self.geom.r_nylon**2 * dw
-        if self.nylon_condition_mode == "tension_only":
-            return max(0.0, float(raw_force))
-        if self.nylon_condition_mode == "axially_sliding_confined":
-            return 0.0
         return float(raw_force)
 
     def _new_geometry_from_dw_and_h(self, dw: float, h_target: float) -> Tuple[float, float]:
@@ -1456,11 +1450,42 @@ def run_blocked_actuation(
     return model, arr
 
 
+def _equilibrate_suspended_load(model: TCPAMaxwellBlockedModel, load_N: float) -> float:
+    """Place the suspended load and relax its Maxwell transients before actuation."""
+    initial_time = float(model.helix.time)
+    model.step_suspended(0.0, 0.0, float(load_N))
+
+    branch_E = _maxwell_E(model.mat.maxwell)
+    branch_eta = _maxwell_eta(model.mat.maxwell)
+    active = (branch_E > 0.0) & (branch_eta > 0.0)
+    equivalent_settling_time = 0.0
+    if np.any(active):
+        relaxation_times = np.sort(branch_eta[active] / branch_E[active])
+        settling_steps = np.unique(
+            np.concatenate((relaxation_times, [5.0 * relaxation_times[-1], 20.0 * relaxation_times[-1]]))
+        )
+        original_integration = model.integration
+        model.integration = "exponential"
+        try:
+            for settling_dt in settling_steps:
+                model.step_suspended(0.0, float(settling_dt), float(load_N))
+                equivalent_settling_time += float(settling_dt)
+        finally:
+            model.integration = original_integration
+
+    # Stabilization defines the initial state; its clock and intermediate
+    # records are not part of the pressure experiment.
+    model.helix.time = initial_time
+    model.history.clear()
+    return equivalent_settling_time
+
+
 def run_suspended_actuation(
     config: Optional[object] = None,
     load_N: float = 1.0,
     pressure_time: Optional[np.ndarray] = None,
     pressure_MPa: Optional[np.ndarray] = None,
+    equilibrate_load_before_pressure: bool = True,
     **overrides,
 ) -> Tuple[TCPAMaxwellBlockedModel, Dict[str, np.ndarray]]:
     """Lancer la simulation en actionnement libre avec une masse suspendue.
@@ -1488,6 +1513,9 @@ def run_suspended_actuation(
     )
     model.prestretch_to(cfg.eps)
     t_start = model.helix.time
+    equivalent_settling_time = 0.0
+    if equilibrate_load_before_pressure:
+        equivalent_settling_time = _equilibrate_suspended_load(model, float(load_N))
     t_local, pressure = _prepare_actuation_history(
         cfg.n_cycles,
         cfg.Pmax,
@@ -1515,12 +1543,14 @@ def run_suspended_actuation(
     arr["load_mN"] = 1000.0 * arr["load_N"]
     if len(arr.get("axial_length_mm", [])) > 0:
         axial = np.asarray(arr["axial_length_mm"], dtype=float)
-        contraction = reference_length - axial
+        contraction_from_initial = reference_length - axial
         arr["free_displacement_mm"] = axial - reference_length
-        arr["free_contraction_mm"] = contraction
-        arr["free_actuation_strain"] = contraction / max(float(reference_length), 1e-12)
+        arr["free_contraction_mm"] = contraction_from_initial
+        arr["free_actuation_strain"] = contraction_from_initial / max(abs(float(reference_length)), 1e-12)
         arr["free_actuation_percent"] = 100.0 * arr["free_actuation_strain"]
         arr["reference_axial_length_mm"] = np.full_like(axial, float(reference_length))
+    arr["suspended_load_equilibrated"] = bool(equilibrate_load_before_pressure)
+    arr["suspended_equivalent_settling_time_s"] = float(equivalent_settling_time)
     arr["mode"] = np.array(["suspended_mass"] * len(arr["time"]), dtype=object)
     return model, arr
 

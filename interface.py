@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import json
 import sys
 import re
 import time
 import os
-import inspect
-import importlib
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from html import escape
+from io import StringIO
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -21,19 +24,11 @@ if str(APP_DIR) in sys.path:
 sys.path.insert(0, str(APP_DIR))
 
 import Base as modele
-import affichage as affichage_module
-import parametres as parametres_module
-
-# Streamlit conserve les modules importés entre deux exécutions. Ce rechargement
-# garantit que les libellés, valeurs par défaut et validations restent synchronisés.
-importlib.invalidate_caches()
-parametres_module = importlib.reload(parametres_module)
-affichage_module = importlib.reload(affichage_module)
 
 from affichage import (
     format_seconds,
     hysteresis_to_csv_bytes,
-    make_cavatappi_figure,
+    make_cavatappi_interactive_html,
     make_cross_section_figure,
     mapping_to_csv_bytes,
     plot_hysteresis_overlay,
@@ -48,18 +43,12 @@ from parametres import (
     AXIAL_MODULUS_OPTIONS,
     BIAS_ANGLE_PROFILE_LABELS,
     BIAS_ANGLE_PROFILE_OPTIONS,
-    CONSTITUTIVE_LABELS,
-    CONSTITUTIVE_OPTIONS,
     DEFAULT_SETTINGS,
     HYSTERESIS_RESULT_PATH,
     INTEGRATION_LABELS,
     INTEGRATION_OPTIONS,
     MAXWELL_ANISOTROPY_LABELS,
     MAXWELL_ANISOTROPY_OPTIONS,
-    NYLON_CONDITION_LABELS,
-    NYLON_CONDITION_OPTIONS,
-    PRESTRAIN_REFERENCE_LABELS,
-    PRESTRAIN_REFERENCE_OPTIONS,
     PRESSURE_INPUT_LABELS,
     PRESSURE_INPUT_OPTIONS,
     PRESTRAIN_RESULT_PATH,
@@ -67,6 +56,7 @@ from parametres import (
     SECTION_UPDATE_LABELS,
     SECTION_UPDATE_OPTIONS,
     SettingValue,
+    SETTINGS_EXPORT_FORMAT,
     SETTINGS_SCHEMA_VERSION,
     SUSPENDED_RESULT_PATH,
     TIMING_PROFILE_PATH,
@@ -79,7 +69,9 @@ from parametres import (
     load_result_cache,
     load_settings,
     make_pressure_history,
+    normalize_settings,
     option_index,
+    parse_settings_export,
     reset_settings_and_cache,
     save_result_cache,
     save_settings,
@@ -115,16 +107,91 @@ HYSTERESIS_COMPARE_LABELS = {
 
 
 def render_csv_download(payload: bytes | None, filename: str, key: str) -> None:
+    if payload is None:
+        st.caption("L’export CSV sera disponible après le calcul.")
+        return
     st.download_button(
         "Exporter les résultats en CSV",
-        data=payload if payload is not None else b"",
+        data=payload,
         file_name=filename,
         mime="text/csv; charset=utf-8",
         key=key,
         on_click="ignore",
         icon=":material/download:",
-        disabled=payload is None,
     )
+
+
+def export_metadata(settings: dict[str, SettingValue], simulation: str) -> dict[str, SettingValue]:
+    return {
+        "export_format": "cavatappi-beta-results",
+        "settings_schema_version": SETTINGS_SCHEMA_VERSION,
+        "model_version": getattr(modele, "MODEL_VERSION", "inconnue"),
+        "simulation": simulation,
+        **settings,
+    }
+
+
+def settings_export_bytes(settings: dict[str, SettingValue]) -> bytes:
+    document = {
+        "format": SETTINGS_EXPORT_FORMAT,
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "model_version": getattr(modele, "MODEL_VERSION", "inconnue"),
+        "exported_at_utc": datetime.now(timezone.utc).isoformat(),
+        "settings": settings,
+    }
+    return json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
+
+
+def settings_export_csv_bytes(settings: dict[str, SettingValue]) -> bytes:
+    stream = StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=list(settings), delimiter=";", lineterminator="\n")
+    writer.writeheader()
+    writer.writerow(settings)
+    return ("\ufeff" + stream.getvalue()).encode("utf-8")
+
+
+def parse_settings_csv(payload: bytes) -> dict[str, SettingValue]:
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Le fichier CSV doit être encodé en UTF-8.") from exc
+    try:
+        delimiter = csv.Sniffer().sniff(text[:4096], delimiters=";,\t").delimiter
+    except csv.Error:
+        delimiter = ";"
+    reader = csv.DictReader(StringIO(text), delimiter=delimiter)
+    row = next(reader, None)
+    if row is None:
+        raise ValueError("Le fichier CSV ne contient aucune ligne de paramètres.")
+
+    imported: dict[str, object] = {}
+    for key, value in row.items():
+        normalized_key = str(key).strip()
+        if normalized_key.startswith("param_"):
+            normalized_key = normalized_key[6:]
+        if normalized_key in DEFAULT_SETTINGS and value not in (None, ""):
+            imported[normalized_key] = value
+    if not imported:
+        raise ValueError("Aucun paramètre Cavatappi reconnu dans ce fichier CSV.")
+    return normalize_settings(imported)
+
+
+def clear_widget_state() -> None:
+    for key in list(st.session_state):
+        del st.session_state[key]
+
+
+def render_metric_grid(items: list[tuple[str, str]]) -> None:
+    blocks = "".join(
+        (
+            '<div class="metric-tile">'
+            f'<span class="metric-label">{escape(label)}</span>'
+            f'<strong class="metric-value">{escape(value)}</strong>'
+            "</div>"
+        )
+        for label, value in items
+    )
+    st.markdown(f'<div class="metric-grid">{blocks}</div>', unsafe_allow_html=True)
 
 BLOCKED_RESULT_IGNORE_KEYS = {
     "eps_study_min",
@@ -141,6 +208,7 @@ BLOCKED_RESULT_IGNORE_KEYS = {
     "suspended_duration_s",
     "suspended_pressure_rate_mpa_s",
     "suspended_hold_pressure",
+    "suspended_equilibrate_before_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -164,6 +232,7 @@ RELAXATION_RESULT_IGNORE_KEYS = {
     "suspended_duration_s",
     "suspended_pressure_rate_mpa_s",
     "suspended_hold_pressure",
+    "suspended_equilibrate_before_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -182,6 +251,7 @@ PRESTRAIN_RESULT_IGNORE_KEYS = {
     "suspended_duration_s",
     "suspended_pressure_rate_mpa_s",
     "suspended_hold_pressure",
+    "suspended_equilibrate_before_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -224,6 +294,7 @@ HYSTERESIS_COMPARE_IGNORE_KEYS = {
     "suspended_duration_s",
     "suspended_pressure_rate_mpa_s",
     "suspended_hold_pressure",
+    "suspended_equilibrate_before_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
     "view_elev_deg",
@@ -330,54 +401,8 @@ def apply_view_query_params(settings: dict[str, SettingValue]) -> dict[str, Sett
     return settings
 
 
-def inject_keyboard_view_controls(settings: dict[str, SettingValue]) -> None:
-    elev = float(settings.get("view_elev_deg", 22.0))
-    azim = float(settings.get("view_azim_deg", -58.0))
-    renderer = st.components.v2.component(
-        "cavatappi_keyboard_view",
-        html="<span aria-hidden='true'></span>",
-        js="""
-        export default function(component) {
-            const state = {
-                elev: Number(component.data.elev),
-                azim: Number(component.data.azim)
-            };
-            const clamp = (value, minValue, maxValue) => Math.min(maxValue, Math.max(minValue, value));
-            const wrapAzim = (value) => {
-                const wrapped = ((value + 180) % 360 + 360) % 360 - 180;
-                return wrapped === -180 ? 180 : wrapped;
-            };
-            const handler = (event) => {
-                const tagName = event.target?.tagName?.toUpperCase() || "";
-                if (["INPUT", "TEXTAREA", "SELECT"].includes(tagName) || event.ctrlKey || event.metaKey || event.altKey) return;
-                let changed = true;
-                if (event.key === "ArrowLeft") state.azim = wrapAzim(state.azim - 5);
-                else if (event.key === "ArrowRight") state.azim = wrapAzim(state.azim + 5);
-                else if (event.key === "ArrowUp") state.elev = clamp(state.elev + 3, 0, 90);
-                else if (event.key === "ArrowDown") state.elev = clamp(state.elev - 3, 0, 90);
-                else changed = false;
-                if (!changed) return;
-                event.preventDefault();
-                const url = new URL(window.location.href);
-                url.searchParams.set("view_elev_deg", state.elev.toFixed(1));
-                url.searchParams.set("view_azim_deg", state.azim.toFixed(1));
-                window.location.href = url.toString();
-            };
-            document.addEventListener("keydown", handler, true);
-            return () => document.removeEventListener("keydown", handler, true);
-        }
-        """,
-        isolate_styles=False,
-    )
-    renderer(key="keyboard_view", data={"elev": elev, "azim": azim}, width=1, height=1)
-
-
 def make_suspended_response_figure(data: dict[str, np.ndarray], show_geometry: bool):
-    fresh_affichage = importlib.reload(affichage_module)
-    signature = inspect.signature(fresh_affichage.plot_suspended_response)
-    if "show_geometry" in signature.parameters:
-        return fresh_affichage.plot_suspended_response(data, show_geometry=show_geometry)
-    return fresh_affichage.plot_suspended_response(data)
+    return plot_suspended_response(data, show_geometry=show_geometry)
 
 
 def run_with_progress(label: str, estimated_seconds: float, function, *args):
@@ -410,8 +435,11 @@ def run_with_progress(label: str, estimated_seconds: float, function, *args):
             st.stop()
 
     elapsed = time.perf_counter() - start
-    progress.progress(100, text=f"{label} : terminé en {format_seconds(elapsed)}")
-    status.caption(f"Estimé : {format_seconds(estimated_seconds)} | réel : {format_seconds(elapsed)}")
+    progress.empty()
+    status.success(
+        f"{label} terminé en {format_seconds(elapsed)} "
+        f"(estimation initiale : {format_seconds(estimated_seconds)})."
+    )
     return result, elapsed
 
 
@@ -496,7 +524,13 @@ def run_suspended_model(settings: dict[str, SettingValue]):
     config = build_config(settings)
     pressure_time, pressure_mpa, hold_start_time = make_suspended_pressure_history(config, settings)
     load_N = float(settings["suspended_mass_g"]) * 1.0e-3 * 9.80665
-    _, data = modele.run_suspended_actuation(config, load_N=load_N, pressure_time=pressure_time, pressure_MPa=pressure_mpa)
+    _, data = modele.run_suspended_actuation(
+        config,
+        load_N=load_N,
+        pressure_time=pressure_time,
+        pressure_MPa=pressure_mpa,
+        equilibrate_load_before_pressure=bool(settings["suspended_equilibrate_before_pressure"]),
+    )
     hold_start_index = int(np.searchsorted(data["time"], hold_start_time, side="left"))
     hold_start_index = min(max(hold_start_index, 0), len(data["time"]) - 1)
     data["suspended_duration_s"] = float(settings["suspended_duration_s"])
@@ -567,8 +601,8 @@ def run_prestrain_study_with_progress(
             rows = run_sequential()
 
     elapsed = time.perf_counter() - start
-    progress.progress(100, text=f"Étude de précontrainte : terminée en {format_seconds(elapsed)}")
-    status.caption(
+    progress.empty()
+    status.success(
         f"Estimé : {format_seconds(estimated_seconds)} | réel : {format_seconds(elapsed)} | "
         f"cœurs utilisés : {worker_count}"
     )
@@ -654,8 +688,8 @@ def run_hysteresis_comparison_with_progress(
                 cases.append(run_one(float(value)))
 
     elapsed = time.perf_counter() - start
-    progress.progress(100, text=f"Comparaison d'hystérèse : terminée en {format_seconds(elapsed)}")
-    status.caption(
+    progress.empty()
+    status.success(
         f"Estimé : {format_seconds(estimated_seconds)} | réel : {format_seconds(elapsed)} | "
         f"cœurs utilisés : {worker_count}"
     )
@@ -688,21 +722,86 @@ settings = apply_view_query_params(settings)
 timing_profile = load_timing_profile(TIMING_PROFILE_PATH)
 
 st.set_page_config(page_title="Calculateur Cavatappi - Beta", layout="wide")
+st.markdown(
+    """
+    <style>
+      [data-testid="stAppViewContainer"] .main .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+        max-width: 1500px;
+      }
+      h1 { letter-spacing: 0 !important; }
+      [data-testid="stTabs"] [role="tablist"] {
+        flex-wrap: wrap;
+        row-gap: .3rem;
+      }
+      [data-testid="stTabs"] button[role="tab"] {
+        min-height: 2.6rem;
+      }
+      .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: .55rem;
+        margin: .3rem 0 1rem;
+      }
+      .metric-tile {
+        min-width: 0;
+        padding: .7rem .75rem;
+        border: 1px solid rgba(130, 145, 170, .28);
+        border-radius: 6px;
+        background: rgba(76, 93, 120, .08);
+      }
+      .metric-label {
+        display: block;
+        min-height: 2.2em;
+        color: rgba(225, 232, 243, .72);
+        font-size: .78rem;
+        line-height: 1.1;
+      }
+      .metric-value {
+        display: block;
+        overflow-wrap: anywhere;
+        color: #f3f6fb;
+        font-size: 1.08rem;
+        line-height: 1.25;
+      }
+      .calculation-bar {
+        padding: .8rem 1rem;
+        margin: .4rem 0 1rem;
+        border-left: 3px solid #42a5f5;
+        border-radius: 0 6px 6px 0;
+        background: rgba(66, 165, 245, .08);
+      }
+      @media (max-width: 900px) {
+        .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      }
+      @media (max-width: 600px) {
+        [data-testid="stAppViewContainer"] .main .block-container {
+          padding-top: .8rem;
+          padding-left: .8rem;
+          padding-right: .8rem;
+        }
+        h1 { font-size: 1.75rem !important; line-height: 1.15 !important; }
+        .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        [data-testid="stTabs"] button[role="tab"] {
+          flex: 1 1 46%;
+          white-space: normal;
+        }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("Calculateur d'actionneur Cavatappi")
 st.caption("Interface de simulation pour la géométrie, l'actionnement et la visualisation du modèle TCPA.")
+if st.session_state.pop("_settings_notice", None):
+    st.success("Les paramètres ont été importés et appliqués.")
 
 st.sidebar.header("Paramètres d'entrée")
-if st.sidebar.button("Paramètres par défaut", type="secondary", use_container_width=True):
-    reset_settings_and_cache()
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    try:
-        st.query_params.clear()
-    except Exception:
-        pass
-    st.rerun()
+settings_actions = st.sidebar.container()
+show_advanced_settings = True
 
-with st.sidebar.expander("Géométrie", expanded=True):
+with st.sidebar.expander("Géométrie", expanded=False):
     sidebar_help(
         [
             "Ces paramètres définissent la forme fabriquée de l'actionneur et la section tube/nylon.",
@@ -866,6 +965,14 @@ with st.sidebar.expander("Masse suspendue"):
         "Maintenir la pression après la rampe",
         bool(settings["suspended_hold_pressure"]),
     )
+    suspended_equilibrate_before_pressure = st.checkbox(
+        "Stabiliser l'actionneur sous la masse avant la pression",
+        bool(settings.get("suspended_equilibrate_before_pressure", True)),
+        help=(
+            "Calcule d'abord l'équilibre viscoélastique à 0 MPa sous la masse suspendue. "
+            "Cette étape évite de confondre la récupération de la précontrainte avec la relaxation due à la pression."
+        ),
+    )
     suspended_show_geometry_plot = st.checkbox(
         "Ajouter le graphe Rh et beta_h",
         bool(settings.get("suspended_show_geometry_plot", INTERFACE_DEFAULT_SUSPENDED_SHOW_GEOMETRY_PLOT)),
@@ -936,140 +1043,149 @@ with st.sidebar.expander("Relaxation"):
         "Temps de maintien à pression constante (s)", 0.0, 5000.0, float(settings["relaxation_hold_time_s"]), 10.0
     )
 
-with st.sidebar.expander("Matériau tube"):
-    sidebar_help(
-        [
-            "Ces paramètres règlent la réponse élastique anisotrope du tube.",
-            "E_axial agit principalement sur la raideur dans la direction de l'actionneur.",
-            "E_radius et G12 influencent la réponse radiale et le couplage pression-torsion.",
-            "Les coefficients de Poisson règlent le couplage entre les déformations transverses.",
-        ]
-    )
-    E_axial_mpa = st.number_input("Module axial du tube E_axial (MPa)", 0.001, 10000.0, float(settings["E_axial_mpa"]), 0.1)
-    axial_modulus_mode = st.selectbox(
-        "Convention du module axial",
-        AXIAL_MODULUS_OPTIONS,
-        index=option_index(AXIAL_MODULUS_OPTIONS, settings.get("axial_modulus_mode", "maxwell_sum")),
-        format_func=lambda value: AXIAL_MODULUS_LABELS.get(value, value),
-    )
-    maxwell_anisotropy_mode = st.selectbox(
-        "Anisotropie de la relaxation",
-        MAXWELL_ANISOTROPY_OPTIONS,
-        index=option_index(
+E_axial_mpa = float(settings["E_axial_mpa"])
+axial_modulus_mode = str(settings["axial_modulus_mode"])
+maxwell_anisotropy_mode = str(settings["maxwell_anisotropy_mode"])
+E_radius_mpa = float(settings["E_radius_mpa"])
+G12_mpa = float(settings["G12_mpa"])
+nu12 = float(settings["nu12"])
+nu23 = float(settings["nu23"])
+constitutive_mode = "generalized_maxwell"
+prestrain_reference_mode = "elastic_tk_reference"
+maxwell_E0_mpa = float(settings["maxwell_E0_mpa"])
+maxwell_E1_mpa = float(settings["maxwell_E1_mpa"])
+maxwell_eta1_mpa_s = float(settings["maxwell_eta1_mpa_s"])
+maxwell_E2_mpa = float(settings["maxwell_E2_mpa"])
+maxwell_eta2_mpa_s = float(settings["maxwell_eta2_mpa_s"])
+maxwell_E3_mpa = float(settings["maxwell_E3_mpa"])
+maxwell_eta3_mpa_s = float(settings["maxwell_eta3_mpa_s"])
+E_nylon_mpa = float(settings["E_nylon_mpa"])
+G_nylon_mpa = float(settings["G_nylon_mpa"])
+nylon_condition_mode = "bonded_linear"
+nylon_scale = 1.0
+nylon_axial_prestrain_coupling = 1.0
+nylon_axial_actuation_coupling = 1.0
+dt = float(settings["dt"])
+n_layers = int(settings["n_layers"])
+n_phi = int(settings["n_phi"])
+pre_steps = int(settings["pre_steps"])
+cpu_count = max(1, os.cpu_count() or 1)
+parallel_workers = max(1, min(int(settings.get("parallel_workers", INTERFACE_DEFAULT_PARALLEL_WORKERS)), cpu_count))
+integration = str(settings["integration"])
+view_elev_deg = float(settings["view_elev_deg"])
+view_azim_deg = float(settings["view_azim_deg"])
+
+if show_advanced_settings:
+    with st.sidebar.expander("Matériau du tube"):
+        sidebar_help(
+            [
+                "Les modules axial, radial et de cisaillement règlent l’anisotropie élastique du tube.",
+                "Les coefficients de Poisson couplent les déformations axiales et transverses.",
+                "La convention du module axial précise si la raideur instantanée vient de la somme des branches de Maxwell.",
+            ]
+        )
+        E_axial_mpa = st.number_input("Module axial du tube E_axial (MPa)", 0.001, 10000.0, E_axial_mpa, 0.1)
+        axial_modulus_mode = st.selectbox(
+            "Convention du module axial",
+            AXIAL_MODULUS_OPTIONS,
+            index=option_index(AXIAL_MODULUS_OPTIONS, axial_modulus_mode),
+            format_func=lambda value: AXIAL_MODULUS_LABELS.get(value, value),
+        )
+        maxwell_anisotropy_mode = st.selectbox(
+            "Anisotropie de la relaxation",
             MAXWELL_ANISOTROPY_OPTIONS,
-            settings.get("maxwell_anisotropy_mode", "paper_equal"),
-        ),
-        format_func=lambda value: MAXWELL_ANISOTROPY_LABELS.get(value, value),
-        help=(
-            "Le mode axial applique la relaxation uniquement à la direction axiale. "
-            "Le mode proportionnel applique les mêmes fractions de relaxation à toutes les directions du matériau."
-        ),
-    )
-    E_radius_mpa = st.number_input("Module radial du tube E_radius (MPa)", 0.001, 10000.0, float(settings["E_radius_mpa"]), 0.1)
-    G12_mpa = st.number_input("Module de cisaillement du tube G12 (MPa)", 0.001, 10000.0, float(settings["G12_mpa"]), 0.1)
-    nu12 = st.number_input("Coefficient de Poisson nu12", -0.49, 0.49, float(np.clip(settings["nu12"], -0.49, 0.49)), 0.005)
-    nu23 = st.number_input("Coefficient de Poisson nu23", -0.49, 0.49, float(np.clip(settings["nu23"], -0.49, 0.49)), 0.005)
+            index=option_index(MAXWELL_ANISOTROPY_OPTIONS, maxwell_anisotropy_mode),
+            format_func=lambda value: MAXWELL_ANISOTROPY_LABELS.get(value, value),
+            help="Choisit les directions matérielles auxquelles les fractions de relaxation sont appliquées.",
+        )
+        E_radius_mpa = st.number_input("Module radial du tube E_radius (MPa)", 0.001, 10000.0, E_radius_mpa, 0.1)
+        G12_mpa = st.number_input("Module de cisaillement du tube G12 (MPa)", 0.001, 10000.0, G12_mpa, 0.1)
+        nu12 = st.number_input("Coefficient de Poisson nu12", -0.49, 0.49, float(np.clip(nu12, -0.49, 0.49)), 0.005)
+        nu23 = st.number_input("Coefficient de Poisson nu23", -0.49, 0.49, float(np.clip(nu23, -0.49, 0.49)), 0.005)
 
-with st.sidebar.expander("Maxwell généralisé"):
-    sidebar_help(
-        [
-            "Ce volet règle la partie viscoélastique du tube.",
-            "E0 est la raideur permanente qui ne relaxe pas.",
-            "Chaque branche Ei, etai ajoute une relaxation avec un temps caractéristique proche de etai / Ei.",
-            "Des viscosités plus grandes ralentissent la relaxation.",
-        ]
-    )
-    constitutive_mode = st.selectbox(
-        "Réponse constitutive",
-        CONSTITUTIVE_OPTIONS,
-        index=option_index(CONSTITUTIVE_OPTIONS, settings.get("constitutive_mode", "generalized_maxwell")),
-        format_func=lambda value: CONSTITUTIVE_LABELS.get(value, value),
-        help="Le mode élastique instantané désactive la relaxation et l'hystérésis sans changer la rigidité instantanée totale.",
-    )
-    prestrain_reference_mode = st.selectbox(
-        "Traitement de la précontrainte",
-        PRESTRAIN_REFERENCE_OPTIONS,
-        index=option_index(
-            PRESTRAIN_REFERENCE_OPTIONS,
-            settings.get("prestrain_reference_mode", "elastic_tk_reference"),
-        ),
-        format_func=lambda value: PRESTRAIN_REFERENCE_LABELS.get(value, value),
-        help=(
-            "Précontrainte élastique conservée : la contrainte créée avant l'actionnement reste une base fixe. "
-            "Précontrainte viscoélastique : la précontrainte est aussi traitée par les branches de Maxwell et peut relaxer."
-        ),
-    )
-    maxwell_E0_mpa = st.number_input("Ressort permanent E0 (MPa)", 0.0, 10000.0, float(settings["maxwell_E0_mpa"]), 0.1)
-    maxwell_E1_mpa = st.number_input("Branche E1 (MPa)", 0.0, 10000.0, float(settings["maxwell_E1_mpa"]), 0.1)
-    maxwell_eta1_mpa_s = st.number_input("Branche eta1 (MPa s)", 1.0e-9, 1.0e9, float(settings["maxwell_eta1_mpa_s"]), 1.0)
-    maxwell_E2_mpa = st.number_input("Branche E2 (MPa)", 0.0, 10000.0, float(settings["maxwell_E2_mpa"]), 0.1)
-    maxwell_eta2_mpa_s = st.number_input("Branche eta2 (MPa s)", 1.0e-9, 1.0e9, float(settings["maxwell_eta2_mpa_s"]), 1.0)
-    maxwell_E3_mpa = st.number_input("Branche E3 (MPa)", 0.0, 10000.0, float(settings["maxwell_E3_mpa"]), 0.1)
-    maxwell_eta3_mpa_s = st.number_input("Branche eta3 (MPa s)", 1.0e-9, 1.0e9, float(settings["maxwell_eta3_mpa_s"]), 1.0)
+    with st.sidebar.expander("Maxwell généralisé"):
+        sidebar_help(
+            [
+                "E0 est la raideur permanente qui ne relaxe pas.",
+                "Chaque paire Ei, eta_i ajoute une branche de relaxation de temps caractéristique tau_i = eta_i / Ei.",
+                "Une viscosité plus élevée ralentit la relaxation de la branche correspondante.",
+                "La précontrainte initiale reste une référence élastique ; Maxwell fait évoluer les variations ultérieures.",
+            ]
+        )
+        st.caption("Réponse imposée : Maxwell généralisé avec référence de précontrainte élastique.")
+        maxwell_E0_mpa = st.number_input("Ressort permanent E0 (MPa)", 0.0, 10000.0, maxwell_E0_mpa, 0.1)
+        maxwell_E1_mpa = st.number_input("Branche E1 (MPa)", 0.0, 10000.0, maxwell_E1_mpa, 0.1)
+        maxwell_eta1_mpa_s = st.number_input("Viscosité eta1 (MPa·s)", 1.0e-9, 1.0e9, maxwell_eta1_mpa_s, 1.0)
+        maxwell_E2_mpa = st.number_input("Branche E2 (MPa)", 0.0, 10000.0, maxwell_E2_mpa, 0.1)
+        maxwell_eta2_mpa_s = st.number_input("Viscosité eta2 (MPa·s)", 1.0e-9, 1.0e9, maxwell_eta2_mpa_s, 1.0)
+        maxwell_E3_mpa = st.number_input("Branche E3 (MPa)", 0.0, 10000.0, maxwell_E3_mpa, 0.1)
+        maxwell_eta3_mpa_s = st.number_input("Viscosité eta3 (MPa·s)", 1.0e-9, 1.0e9, maxwell_eta3_mpa_s, 1.0)
 
-with st.sidebar.expander("Nylon"):
-    sidebar_help(
-        [
-            "Ces paramètres règlent la contribution du filament de nylon.",
-            "E_nylon contrôle la force axiale liée à l'étirement du nylon.",
-            "G_nylon contrôle sa contribution en torsion.",
-            "Les facteurs de couplage indiquent dans quelle mesure le nylon participe à la précontrainte et à l'actionnement.",
-        ]
-    )
-    E_nylon_mpa = st.number_input("Module axial du nylon E_nylon (MPa)", 0.001, 100000.0, float(settings["E_nylon_mpa"]), 10.0)
-    G_nylon_mpa = st.number_input("Module de cisaillement du nylon G_nylon (MPa)", 0.001, 100000.0, float(settings["G_nylon_mpa"]), 10.0)
-    nylon_condition_mode = st.selectbox(
-        "Condition mécanique du nylon",
-        NYLON_CONDITION_OPTIONS,
-        index=option_index(NYLON_CONDITION_OPTIONS, settings.get("nylon_condition_mode", "bonded_linear")),
-        format_func=lambda value: NYLON_CONDITION_LABELS.get(value, value),
-        help=(
-            "Linéaire bilatéral autorise le nylon à travailler en traction et en compression. Traction seulement "
-            "représente un filament qui se détend au lieu de pousser. Glissant annule uniquement sa force axiale."
-        ),
-    )
-    nylon_scale = 1.0
-    nylon_axial_prestrain_coupling = 0.0 if nylon_condition_mode == "axially_sliding_confined" else 1.0
-    nylon_axial_actuation_coupling = nylon_axial_prestrain_coupling
-    st.caption("Les multiplicateurs continus du nylon sont verrouillés à leur valeur physique, sans calibration.")
+    with st.sidebar.expander("Nylon"):
+        sidebar_help(
+            [
+                "Le module axial règle la force de rappel du filament étiré.",
+                "Le module de cisaillement règle sa contribution à la torsion.",
+                "Le filament est lié aux deux extrémités et participe intégralement à la précontrainte et à l’actionnement.",
+            ]
+        )
+        E_nylon_mpa = st.number_input("Module axial du nylon E_nylon (MPa)", 0.001, 100000.0, E_nylon_mpa, 10.0)
+        G_nylon_mpa = st.number_input("Module de cisaillement du nylon G_nylon (MPa)", 0.001, 100000.0, G_nylon_mpa, 10.0)
+        st.caption("Condition fixe : nylon linéaire bilatéral lié aux extrémités.")
 
-with st.sidebar.expander("Solveur"):
-    sidebar_help(
-        [
-            "Ces paramètres contrôlent la précision et le temps de calcul.",
-            "dt est le pas de temps de la simulation.",
-            "Les couches radiales et divisions angulaires définissent le maillage numérique de la section du tube.",
-            "Les étapes de précontrainte divisent l'étirement initial en petits incréments.",
-            "Les cœurs CPU parallèles sont utilisés pour les études avec plusieurs simulations indépendantes.",
-            "Euler explicite : applique directement la loi incrémentale, mais impose dt < 2 fois le plus petit temps de relaxation.",
-            "Exponentielle cohérente : intègre exactement la relaxation sur chaque pas à déformation affine et utilise le même opérateur pour le gonflement radial.",
+    with st.sidebar.expander("Solveur"):
+        sidebar_help(
+            [
+                "Le pas dt fixe la fréquence d’échantillonnage de la pression, de la géométrie et de la mémoire viscoélastique.",
+                "Le maillage radial et angulaire règle la précision de l’intégration sur la section.",
+                "Les étapes de précontrainte divisent la mise en tension initiale en incréments.",
+                "L’intégration exponentielle applique la décroissance exacte de chaque branche pendant un pas et reste stable.",
+                "Euler explicite est une approximation d’ordre 1 : il exige dt < 2 tau_min et devient imprécis bien avant cette limite.",
+                "Les cœurs parallèles accélèrent seulement les études composées de plusieurs simulations indépendantes.",
+            ]
+        )
+        dt = st.number_input("Pas de temps dt (s)", 0.01, 20.0, dt, 0.05)
+        n_layers = st.slider("Couches radiales du tube", 1, 30, n_layers, 1)
+        n_phi = st.slider("Divisions angulaires phi", 4, 120, n_phi, 4)
+        pre_steps = st.slider("Étapes de précontrainte", 1, 240, pre_steps, 1)
+        parallel_workers = st.slider("Cœurs CPU parallèles", 1, cpu_count, parallel_workers, 1)
+        integration = st.selectbox(
+            "Intégration temporelle",
+            INTEGRATION_OPTIONS,
+            index=option_index(INTEGRATION_OPTIONS, integration),
+            format_func=lambda value: INTEGRATION_LABELS.get(value, value),
+            help=(
+                "Met à jour chaque contrainte de branche selon dσ_i/dt = E_i dε/dt - σ_i/τ_i, "
+                "avec τ_i = η_i/E_i."
+            ),
+        )
+        active_tau = [
+            eta / modulus
+            for modulus, eta in (
+                (maxwell_E1_mpa, maxwell_eta1_mpa_s),
+                (maxwell_E2_mpa, maxwell_eta2_mpa_s),
+                (maxwell_E3_mpa, maxwell_eta3_mpa_s),
+            )
+            if modulus > 0.0
         ]
-    )
-    dt = st.number_input("Pas de temps dt (s)", 0.01, 20.0, float(settings["dt"]), 0.05)
-    n_layers = st.slider("Couches radiales du tube", 1, 30, int(settings["n_layers"]), 1)
-    n_phi = st.slider("Divisions angulaires phi", 4, 120, int(settings["n_phi"]), 4)
-    pre_steps = st.slider("Étapes de précontrainte", 1, 240, int(settings["pre_steps"]), 1)
-    cpu_count = max(1, os.cpu_count() or 1)
-    parallel_workers_default = int(settings.get("parallel_workers", INTERFACE_DEFAULT_PARALLEL_WORKERS))
-    parallel_workers_default = max(1, min(parallel_workers_default, cpu_count))
-    parallel_workers = st.slider("Cœurs CPU parallèles", 1, cpu_count, parallel_workers_default, 1)
-    integration = st.selectbox(
-        "Intégration temporelle",
-        INTEGRATION_OPTIONS,
-        index=option_index(INTEGRATION_OPTIONS, settings["integration"]),
-        format_func=lambda value: INTEGRATION_LABELS.get(value, value),
-    )
+        if integration == "paper_explicit" and active_tau:
+            tau_min_ui = min(active_tau)
+            st.caption(
+                f"Euler explicite : dt doit rester inférieur à {2.0 * tau_min_ui:.3g} s. "
+                f"Le plus petit temps de relaxation vaut {tau_min_ui:.3g} s."
+            )
+        elif active_tau:
+            st.caption("Méthode stable par branche ; réduisez dt pour mieux décrire les variations rapides.")
 
-with st.sidebar.expander("Visualiseur"):
-    sidebar_help(
-        [
-            "Ces paramètres ne modifient pas le calcul mécanique.",
-            "Ils changent seulement l'angle de vue du visualiseur Cavatappi.",
-            "Les flèches du clavier peuvent aussi être utilisées pour faire tourner la vue.",
-        ]
-    )
-    view_elev_deg = st.slider("Élévation de vue (deg)", 0.0, 90.0, float(settings["view_elev_deg"]), 1.0)
-    view_azim_deg = st.slider("Azimut de vue (deg)", -180.0, 180.0, float(settings["view_azim_deg"]), 1.0)
+    with st.sidebar.expander("Visualiseur"):
+        sidebar_help(
+            [
+                "Ces angles définissent uniquement la vue initiale.",
+                "Faites glisser pour tourner, utilisez la molette pour zoomer et les flèches du clavier pour orienter la vue.",
+            ]
+        )
+        view_elev_deg = st.slider("Élévation de vue (deg)", 0.0, 90.0, view_elev_deg, 1.0)
+        view_azim_deg = st.slider("Azimut de vue (deg)", -180.0, 180.0, view_azim_deg, 1.0)
 
 current_settings = {
     "_settings_schema_version": SETTINGS_SCHEMA_VERSION,
@@ -1110,6 +1226,7 @@ current_settings = {
     "suspended_duration_s": float(suspended_duration_s),
     "suspended_pressure_rate_mpa_s": float(suspended_pressure_rate_mpa_s),
     "suspended_hold_pressure": bool(suspended_hold_pressure),
+    "suspended_equilibrate_before_pressure": bool(suspended_equilibrate_before_pressure),
     "suspended_show_geometry_plot": bool(suspended_show_geometry_plot),
     "dt": float(dt),
     "pre_steps": int(pre_steps),
@@ -1142,31 +1259,83 @@ current_settings = {
     "view_elev_deg": float(view_elev_deg),
     "view_azim_deg": float(view_azim_deg),
 }
-save_settings(current_settings)
-inject_keyboard_view_controls(current_settings)
+error = settings_error(current_settings)
+if error is None:
+    save_settings(current_settings)
+
+with settings_actions:
+    with st.expander("Importer ou exporter les paramètres", expanded=False):
+        st.download_button(
+            "Exporter les paramètres en JSON",
+            data=settings_export_bytes(current_settings if error is None else settings),
+            file_name="parametres_cavatappi_beta.json",
+            mime="application/json",
+            icon=":material/download:",
+            use_container_width=True,
+        )
+        st.download_button(
+            "Exporter les paramètres en CSV",
+            data=settings_export_csv_bytes(current_settings if error is None else settings),
+            file_name="parametres_cavatappi_beta.csv",
+            mime="text/csv; charset=utf-8",
+            icon=":material/download:",
+            use_container_width=True,
+        )
+        imported_settings_file = st.file_uploader(
+            "Importer un fichier de paramètres",
+            type=["json", "csv"],
+            help=(
+                "Accepte un export de paramètres JSON ou CSV, ainsi qu’un CSV de résultats contenant "
+                "les colonnes param_… L’import remplace les réglages actuels après validation."
+            ),
+        )
+        if imported_settings_file is not None:
+            if st.button(
+                "Appliquer les paramètres importés",
+                icon=":material/upload:",
+                use_container_width=True,
+            ):
+                try:
+                    if imported_settings_file.name.lower().endswith(".csv"):
+                        imported_settings = parse_settings_csv(imported_settings_file.getvalue())
+                    else:
+                        imported_settings = parse_settings_export(imported_settings_file.getvalue())
+                    save_settings(imported_settings)
+                except (OSError, ValueError) as exc:
+                    st.error(f"Import impossible : {exc}")
+                else:
+                    clear_widget_state()
+                    st.session_state["_settings_notice"] = True
+                    st.rerun()
+
+    with st.popover("Réinitialiser les paramètres", use_container_width=True):
+        st.warning("Cette action restaure les paramètres d’origine et efface les résultats enregistrés.")
+        if st.button(
+            "Confirmer la réinitialisation",
+            type="primary",
+            icon=":material/restart_alt:",
+            use_container_width=True,
+        ):
+            reset_settings_and_cache()
+            clear_widget_state()
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            st.rerun()
+
 initialize_cached_results()
 if "hysteresis_comparison_result" not in st.session_state:
     st.session_state["hysteresis_comparison_result"] = None
 
-error = settings_error(current_settings)
 if error:
     st.error(error)
-if nylon_condition_mode != "bonded_linear":
-    st.info(
-        "La condition sélectionnée représente un filament qui peut se détendre ou glisser axialement. "
-        "Aucun coefficient d'ajustement intermédiaire n'est appliqué."
-    )
 maxwell_sum = float(maxwell_E0_mpa + maxwell_E1_mpa + maxwell_E2_mpa + maxwell_E3_mpa)
 effective_axial_modulus = maxwell_sum if axial_modulus_mode == "maxwell_sum" else float(E_axial_mpa)
 if maxwell_sum > 0.0 and abs(effective_axial_modulus - maxwell_sum) / maxwell_sum > 0.05:
     st.info(
         f"Le module axial ({float(E_axial_mpa):.2f} MPa) diffère de la somme des modules de Maxwell "
         f"({maxwell_sum:.2f} MPa). Le modèle conserve E_axial pour l'anisotropie et les modules de Maxwell pour leurs fractions relatives."
-    )
-if constitutive_mode == "instantaneous_elastic":
-    st.info(
-        "Le mode élastique instantané conserve la rigidité instantanée totale mais désactive la relaxation et l'hystérésis. "
-        "Il sert de référence physique, pas de calibration."
     )
 if maxwell_anisotropy_mode == "axial_test_only":
     st.caption(
@@ -1206,7 +1375,9 @@ estimated_cost = model_cost_index(estimated_steps, n_layers, n_phi, pre_steps)
 estimated_relaxation_steps = int(np.ceil((relaxation_ramp_time_s + relaxation_hold_time_s) / dt))
 estimated_relaxation_cost = model_cost_index(estimated_relaxation_steps, n_layers, n_phi, pre_steps)
 estimated_prestrain_cost = estimated_cost * int(eps_study_points)
-estimated_suspended_steps = int(np.ceil(float(suspended_duration_s) / dt))
+estimated_suspended_steps = int(np.ceil(float(suspended_duration_s) / dt)) + (
+    5 if bool(suspended_equilibrate_before_pressure) else 0
+)
 estimated_suspended_cost = model_cost_index(estimated_suspended_steps, n_layers, n_phi, pre_steps, step_multiplier=6.0)
 parallel_worker_count = max(1, int(parallel_workers))
 estimated_compute_s = estimate_compute_seconds(timing_profile, "blocked", estimated_cost)
@@ -1270,6 +1441,59 @@ hysteresis_comparison_signature = (
     hysteresis_settings_signature,
 )
 
+missing_measured_pressure = pressure_input_mode == "measured_csv" and uploaded_pressure_payload is None
+run_disabled = error is not None or estimated_cost > 250_000 or missing_measured_pressure
+relaxation_run_disabled = error is not None or estimated_relaxation_cost > 250_000
+suspended_run_disabled = error is not None or estimated_suspended_cost > 250_000
+prestrain_range_error = float(eps_study_max) <= float(eps_study_min)
+prestrain_study_run_disabled = error is not None or prestrain_range_error or estimated_prestrain_cost > 750_000
+
+st.markdown(
+    (
+        '<div class="calculation-bar"><strong>Simulation principale</strong><br>'
+        f"Actionnement bloqué, durée simulée {estimated_duration_s:.1f} s, "
+        f"temps de calcul estimé {escape(format_seconds(estimated_compute_s))}.</div>"
+    ),
+    unsafe_allow_html=True,
+)
+action_column, action_status_column = st.columns([1.0, 1.65], vertical_alignment="center")
+run_blocked_now = action_column.button(
+    "Calculer l’actionnement bloqué",
+    type="primary",
+    icon=":material/play_arrow:",
+    use_container_width=True,
+    disabled=run_disabled,
+)
+with action_status_column:
+    if missing_measured_pressure:
+        st.warning("Importez l’historique de pression CSV avant de lancer ce calcul.")
+    elif estimated_cost > 250_000:
+        st.warning("Réduisez le maillage, la durée ou le nombre de cycles pour lancer ce calcul dans l’interface.")
+    elif estimated_cost > 120_000:
+        st.caption("Calcul exigeant : la barre de progression donnera une estimation actualisée.")
+    else:
+        st.caption("Les résultats seront conservés et réaffichés au prochain démarrage.")
+
+if run_blocked_now:
+    (config, data, summary), elapsed_s = run_with_progress(
+        "Actionnement bloqué",
+        estimated_compute_s,
+        run_model,
+        current_settings,
+        uploaded_pressure_payload,
+    )
+    timing_profile = record_timing_sample(timing_profile, TIMING_PROFILE_PATH, "blocked", estimated_cost, elapsed_s)
+    st.session_state["calculator_result"] = {
+        "config": config,
+        "data": data,
+        "summary": summary,
+        "elapsed_s": elapsed_s,
+        "estimated_s": estimated_compute_s,
+        "settings": dict(current_settings),
+        "signature": blocked_result_signature,
+    }
+    save_result_cache(BLOCKED_RESULT_PATH, st.session_state["calculator_result"])
+
 left, right = st.columns([1.3, 1.2], gap="large")
 
 with left:
@@ -1279,26 +1503,33 @@ with left:
         horizontal=True,
         format_func=lambda value: VISUAL_STATE_LABELS.get(value, value),
     )
-    fig_visual = make_cavatappi_figure(current_settings, visual_state)
-    st.pyplot(fig_visual)
-    plt.close(fig_visual)
+    st.iframe(
+        make_cavatappi_interactive_html(current_settings, visual_state),
+        width="stretch",
+        height="content",
+        tab_index=0,
+    )
 
 with right:
     geom = derived_geometry(current_settings)
     st.subheader("Résultats géométriques")
-    c1, c2 = st.columns(2)
-    c1.metric("Nombre de spires", f"{geom['turns']:.2f}")
-    c2.metric("Pas", f"{geom['pitch0_mm']:.2f} mm")
-    c1.metric("Indice rho/Rout", f"{geom['spring_index']:.2f}")
-    c2.metric("Mandrin estimé", f"{geom['equivalent_mandrel_diameter_mm']:.2f} mm")
-    c1.metric("Aire de paroi du tube", f"{geom['wall_area_mm2']:.3f} mm²")
-    c2.metric("Volume interne", f"{geom['tube_internal_volume_ml']:.4f} mL")
-    c1.metric("Remplissage nylon", f"{100.0 * geom['nylon_fill_ratio']:.1f} %")
-    c2.metric("Longueur précontrainte", f"{geom['prestrained_length_mm']:.2f} mm")
+    render_metric_grid(
+        [
+            ("Nombre de spires", f"{geom['turns']:.2f}"),
+            ("Pas", f"{geom['pitch0_mm']:.2f} mm"),
+            ("Indice ρ/Rout", f"{geom['spring_index']:.2f}"),
+            ("Mandrin estimé", f"{geom['equivalent_mandrel_diameter_mm']:.2f} mm"),
+            ("Aire de paroi", f"{geom['wall_area_mm2']:.3f} mm²"),
+            ("Volume interne", f"{geom['tube_internal_volume_ml']:.4f} mL"),
+            ("Remplissage nylon", f"{100.0 * geom['nylon_fill_ratio']:.1f} %"),
+            ("Longueur précontrainte", f"{geom['prestrained_length_mm']:.2f} mm"),
+        ]
+    )
 
-    fig_section = make_cross_section_figure(current_settings)
-    st.pyplot(fig_section)
-    plt.close(fig_section)
+    with st.expander("Afficher la coupe du tube", expanded=False):
+        fig_section = make_cross_section_figure(current_settings)
+        st.pyplot(fig_section)
+        plt.close(fig_section)
 
 tabs = st.tabs(
     [
@@ -1311,13 +1542,6 @@ tabs = st.tabs(
     ]
 )
 
-missing_measured_pressure = pressure_input_mode == "measured_csv" and uploaded_pressure_payload is None
-run_disabled = error is not None or estimated_cost > 250_000 or missing_measured_pressure
-relaxation_run_disabled = error is not None or estimated_relaxation_cost > 250_000
-suspended_run_disabled = error is not None or estimated_suspended_cost > 250_000
-prestrain_range_error = float(eps_study_max) <= float(eps_study_min)
-prestrain_study_run_disabled = error is not None or prestrain_range_error or estimated_prestrain_cost > 750_000
-
 with tabs[0]:
     blocked_csv_payload = None
     st.caption(f"Temps de calcul estimé : ~{format_seconds(estimated_compute_s)}.")
@@ -1329,43 +1553,26 @@ with tabs[0]:
         else:
             st.warning("Les réglages du solveur sont trop lourds pour l'interface interactive.")
 
-    if st.button("Calculer l'actionnement bloqué", disabled=run_disabled):
-        (config, data, summary), elapsed_s = run_with_progress(
-            "Actionnement bloqué",
-            estimated_compute_s,
-            run_model,
-            current_settings,
-            uploaded_pressure_payload,
-        )
-        timing_profile = record_timing_sample(timing_profile, TIMING_PROFILE_PATH, "blocked", estimated_cost, elapsed_s)
-        st.session_state["calculator_result"] = {
-            "config": config,
-            "data": data,
-            "summary": summary,
-            "elapsed_s": elapsed_s,
-            "estimated_s": estimated_compute_s,
-            "settings": dict(current_settings),
-            "signature": blocked_result_signature,
-        }
-        save_result_cache(BLOCKED_RESULT_PATH, st.session_state["calculator_result"])
-
     stored_result = st.session_state["calculator_result"]
     result = stored_result if result_matches_settings(stored_result, blocked_result_signature, BLOCKED_RESULT_IGNORE_KEYS) else None
     if result is None:
         if stored_result is None:
-            st.info("Cliquez sur 'Calculer l'actionnement bloqué' pour lancer le modèle.")
+            st.info("Utilisez le bouton de calcul situé au-dessus du visualiseur pour lancer le modèle.")
         else:
             st.warning("Les paramètres ont changé depuis le dernier calcul. Veuillez relancer l'actionnement bloqué pour mettre les résultats à jour.")
     else:
         summary = result["summary"]
         data = result["data"]
         config = result["config"]
-        k1, k2, k3, k4 = st.columns(4)
         force_gain = float(np.nanmax(data["force_act_mN"]))
-        k1.metric("Force min", f"{summary['force_min_mN']:.1f} mN")
-        k2.metric("Force max", f"{summary['force_max_mN']:.1f} mN")
-        k3.metric("Gain d'actionnement", f"{force_gain:.1f} mN")
-        k4.metric("Couple max", f"{summary['torque_act_max_microNm']:.1f} microN m")
+        render_metric_grid(
+            [
+                ("Force minimale", f"{summary['force_min_mN']:.1f} mN"),
+                ("Force maximale", f"{summary['force_max_mN']:.1f} mN"),
+                ("Gain d’actionnement", f"{force_gain:.1f} mN"),
+                ("Couple maximal", f"{summary['torque_act_max_microNm']:.1f} µN·m"),
+            ]
+        )
         st.caption(
             f"pression : {'CSV mesuré' if result['settings'].get('pressure_input_mode') == 'measured_csv' else 'profil généré'} | "
             f"durée : {data['time'][-1]:.1f} s | "
@@ -1375,7 +1582,10 @@ with tabs[0]:
             f"calcul : {format_seconds(result.get('elapsed_s', 0.0))} "
             f"(estimé {format_seconds(result.get('estimated_s', 0.0))})"
         )
-        blocked_csv_payload = mapping_to_csv_bytes(data)
+        blocked_csv_payload = mapping_to_csv_bytes(
+            data,
+            export_metadata(result["settings"], "actionnement_bloque"),
+        )
 
     render_csv_download(
         blocked_csv_payload,
@@ -1396,7 +1606,10 @@ with tabs[1]:
         fig_response = plot_time_response_fr(result["data"])
         st.pyplot(fig_response)
         plt.close(fig_response)
-        temporal_csv_payload = mapping_to_csv_bytes(result["data"])
+        temporal_csv_payload = mapping_to_csv_bytes(
+            result["data"],
+            export_metadata(result["settings"], "courbes_temporelles"),
+        )
 
     render_csv_download(
         temporal_csv_payload,
@@ -1500,6 +1713,7 @@ with tabs[2]:
                 hysteresis_export_cases,
                 selected_hysteresis_cycles,
                 str(hysteresis_compare_mode),
+                export_metadata(current_settings, "hysterese"),
             )
         except ValueError:
             hysteresis_csv_payload = None
@@ -1556,11 +1770,14 @@ with tabs[3]:
     else:
         relaxation_data = relaxation_result["data"]
         hold_start_index = int(relaxation_data["hold_start_index"])
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Force au début du maintien", f"{relaxation_data['force_total_mN'][hold_start_index]:.1f} mN")
-        r2.metric("Force en fin de maintien", f"{relaxation_data['force_total_mN'][-1]:.1f} mN")
-        r3.metric("Relaxation de force", f"{relaxation_data['force_hold_relax_mN'][-1]:.1f} mN")
-        r4.metric("Pression maintenue", f"{np.nanmax(relaxation_data['pressure_MPa']):.3f} MPa")
+        render_metric_grid(
+            [
+                ("Force au début du maintien", f"{relaxation_data['force_total_mN'][hold_start_index]:.1f} mN"),
+                ("Force en fin de maintien", f"{relaxation_data['force_total_mN'][-1]:.1f} mN"),
+                ("Variation de force", f"{relaxation_data['force_hold_relax_mN'][-1]:.1f} mN"),
+                ("Pression maintenue", f"{np.nanmax(relaxation_data['pressure_MPa']):.3f} MPa"),
+            ]
+        )
         st.caption(
             f"Calcul : {format_seconds(relaxation_result.get('elapsed_s', 0.0))} "
             f"(estimé {format_seconds(relaxation_result.get('estimated_s', 0.0))})"
@@ -1568,7 +1785,10 @@ with tabs[3]:
         fig_relax = plot_relaxation_response(relaxation_data)
         st.pyplot(fig_relax)
         plt.close(fig_relax)
-        relaxation_csv_payload = mapping_to_csv_bytes(relaxation_data)
+        relaxation_csv_payload = mapping_to_csv_bytes(
+            relaxation_data,
+            export_metadata(relaxation_result["settings"], "relaxation"),
+        )
 
     render_csv_download(
         relaxation_csv_payload,
@@ -1628,10 +1848,13 @@ with tabs[4]:
     else:
         study_data = prestrain_result["data"]
         best_index = int(np.nanargmax(study_data["force_max_mN"]))
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Force max", f"{study_data['force_max_mN'][best_index]:.1f} mN")
-        s2.metric("Gain max", f"{study_data['force_gain_mN'][best_index]:.1f} mN")
-        s3.metric("Points calculés", f"{len(study_data['eps'])}")
+        render_metric_grid(
+            [
+                ("Force maximale", f"{study_data['force_max_mN'][best_index]:.1f} mN"),
+                ("Gain maximal", f"{study_data['force_gain_mN'][best_index]:.1f} mN"),
+                ("Valeurs calculées", f"{len(study_data['eps'])}"),
+            ]
+        )
         st.caption(
             f"Calcul : {format_seconds(prestrain_result.get('elapsed_s', 0.0))} "
             f"(estimé {format_seconds(prestrain_result.get('estimated_s', 0.0))})"
@@ -1639,7 +1862,10 @@ with tabs[4]:
         fig_study = plot_prestrain_study(study_data)
         st.pyplot(fig_study)
         plt.close(fig_study)
-        prestrain_csv_payload = mapping_to_csv_bytes(study_data)
+        prestrain_csv_payload = mapping_to_csv_bytes(
+            study_data,
+            export_metadata(prestrain_result["settings"], "etude_precontrainte"),
+        )
 
     render_csv_download(
         prestrain_csv_payload,
@@ -1672,12 +1898,28 @@ with tabs[5]:
         )
     if bool(suspended_hold_pressure) and float(suspended_duration_s) <= suspended_ramp_time_s:
         st.warning("Le maintien à pression constante ne sera visible que si la durée dépasse le temps de rampe.")
-    st.info(
-        "Ce mode résout les équilibres mécaniques suivants : "
-        "F_tube + F_nylon = F_load sin(beta_h), "
-        "M_tube + M_nylon = -F_load Rh sin(beta_h), "
-        "T_tube + T_nylon = F_load Rh cos(beta_h)."
-    )
+    with st.expander("Comprendre le mode masse suspendue", expanded=False):
+        st.markdown(
+            "Le solveur cherche la géométrie qui équilibre la charge suspendue avec les efforts du tube et du nylon : "
+            "`F_tube + F_nylon = F_load sin(βh)`, "
+            "`M_tube + M_nylon = -F_load Rh sin(βh)` et "
+            "`T_tube + T_nylon = F_load Rh cos(βh)`."
+        )
+        st.markdown(
+            "La contraction vaut `L(t = 0) - L(t)`. La référence `L(t = 0)` est prise après la précontrainte "
+            "et, si l’option est activée, après la stabilisation sous la masse. Une contraction négative indique "
+            "donc un actionneur plus long que sa position de référence."
+        )
+        st.markdown(
+            "Le suivi de position représente directement la longueur axiale instantanée. Une diminution de cette "
+            "longueur correspond à une contraction ; un retour vers `L(t = 0)` correspond au relâchement."
+        )
+    if bool(current_settings["suspended_equilibrate_before_pressure"]):
+        st.caption("La position initiale est calculée après stabilisation viscoélastique sous la masse à 0 MPa.")
+    else:
+        st.warning(
+            "La stabilisation initiale est désactivée : la courbe inclura aussi la récupération de la précontrainte sous la masse."
+        )
     if estimated_suspended_cost > 120_000 and not suspended_run_disabled:
         st.warning("Le mode masse suspendue peut être lent. Augmentez le pas de temps ou réduisez le maillage.")
     if suspended_run_disabled and error is None:
@@ -1721,11 +1963,14 @@ with tabs[5]:
             st.warning("Les paramètres ont changé depuis le dernier calcul. Veuillez relancer le calcul masse suspendue pour mettre les courbes à jour.")
     else:
         suspended_data = suspended_result["data"]
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("Contraction max", f"{np.nanmax(suspended_data['free_contraction_mm']):.3f} mm")
-        a2.metric("Actionnement max", f"{np.nanmax(suspended_data['free_actuation_percent']):.2f} %")
-        a3.metric("Longueur finale", f"{suspended_data['axial_length_mm'][-1]:.2f} mm")
-        a4.metric("Résidu max", f"{np.nanmax(suspended_data['residual']):.2e}")
+        render_metric_grid(
+            [
+                ("Contraction maximale", f"{np.nanmax(suspended_data['free_contraction_mm']):.3f} mm"),
+                ("Actionnement maximal", f"{np.nanmax(suspended_data['free_actuation_percent']):.2f} %"),
+                ("Longueur finale", f"{suspended_data['axial_length_mm'][-1]:.2f} mm"),
+                ("Résidu maximal", f"{np.nanmax(suspended_data['residual']):.2e} N·mm"),
+            ]
+        )
         if bool(suspended_data.get("suspended_hold_pressure", False)):
             hold_index = int(suspended_data.get("suspended_hold_start_index", 0))
             hold_time = float(suspended_data["time"][hold_index])
@@ -1743,7 +1988,10 @@ with tabs[5]:
         )
         st.pyplot(fig_suspended)
         plt.close(fig_suspended)
-        suspended_csv_payload = mapping_to_csv_bytes(suspended_data)
+        suspended_csv_payload = mapping_to_csv_bytes(
+            suspended_data,
+            export_metadata(suspended_result["settings"], "masse_suspendue"),
+        )
 
     render_csv_download(
         suspended_csv_payload,

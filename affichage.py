@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from io import StringIO
 from typing import Any
 
@@ -9,6 +10,39 @@ import numpy as np
 from matplotlib.patches import Circle
 
 from parametres import PSI_TO_MPA, SettingValue, VISUAL_STATE_LABELS, derived_geometry
+
+
+PLOT_BACKGROUND = "#0e1117"
+PLOT_PANEL = "#141922"
+PLOT_TEXT = "#e8edf5"
+PLOT_GRID = "#647084"
+
+
+def _style_figure(fig):
+    """Aligne les figures Matplotlib sur l'interface sombre sans modifier les données."""
+    fig.patch.set_facecolor(PLOT_BACKGROUND)
+    for ax in fig.axes:
+        ax.set_facecolor(PLOT_PANEL)
+        ax.tick_params(colors=PLOT_TEXT)
+        ax.xaxis.label.set_color(PLOT_TEXT)
+        ax.yaxis.label.set_color(PLOT_TEXT)
+        ax.title.set_color(PLOT_TEXT)
+        for text in ax.texts:
+            text.set_color(PLOT_TEXT)
+        for spine in ax.spines.values():
+            spine.set_color("#566173")
+        for line in (*ax.get_xgridlines(), *ax.get_ygridlines()):
+            line.set_color(PLOT_GRID)
+            line.set_alpha(0.24)
+        legend = ax.get_legend()
+        if legend is not None:
+            legend.get_frame().set_facecolor(PLOT_PANEL)
+            legend.get_frame().set_edgecolor("#566173")
+            for text in legend.get_texts():
+                text.set_color(PLOT_TEXT)
+    for text in fig.texts:
+        text.set_color(PLOT_TEXT)
+    return fig
 
 
 def _csv_value(value: Any) -> Any:
@@ -68,9 +102,20 @@ def _csv_bytes(rows: list[dict[str, Any]], fieldnames: list[str]) -> bytes:
     return ("\ufeff" + stream.getvalue()).encode("utf-8")
 
 
-def mapping_to_csv_bytes(data: dict[str, Any]) -> bytes:
+def _metadata_columns(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    columns: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if isinstance(value, (str, int, float, bool, np.number, np.bool_)) or value is None:
+            columns[f"param_{key}"] = "" if value is None else _csv_value(value)
+    return columns
+
+
+def mapping_to_csv_bytes(data: dict[str, Any], metadata: dict[str, Any] | None = None) -> bytes:
     """Exporte les séries de même longueur et répète les métadonnées scalaires."""
     arrays, scalars, row_count = _csv_columns(data)
+    scalars.update(_metadata_columns(metadata))
     preferred = [key for key in ("time", "eps", "pressure_MPa") if key in arrays]
     array_names = preferred + [key for key in arrays if key not in preferred]
     fieldnames = array_names + [key for key in scalars if key not in array_names]
@@ -82,10 +127,16 @@ def mapping_to_csv_bytes(data: dict[str, Any]) -> bytes:
     return _csv_bytes(rows, fieldnames)
 
 
-def hysteresis_to_csv_bytes(cases: list[dict[str, Any]], cycles: list[int], mode: str) -> bytes:
+def hysteresis_to_csv_bytes(
+    cases: list[dict[str, Any]],
+    cycles: list[int],
+    mode: str,
+    metadata: dict[str, Any] | None = None,
+) -> bytes:
     """Exporte les cycles affichés sous forme longue, y compris les comparaisons."""
     rows: list[dict[str, Any]] = []
     result_names: list[str] = []
+    metadata_columns = _metadata_columns(metadata)
 
     for case in cases:
         arrays, scalars, _ = _csv_columns(case["data"])
@@ -118,6 +169,7 @@ def hysteresis_to_csv_bytes(cases: list[dict[str, Any]], cycles: list[int], mode
                 }
                 row.update({key: array[index] for key, array in arrays.items()})
                 row.update(scalars)
+                row.update(metadata_columns)
                 if "pressure_MPa" in arrays:
                     row["pressure_psi"] = float(arrays["pressure_MPa"][index]) / PSI_TO_MPA
                 rows.append(row)
@@ -134,6 +186,7 @@ def hysteresis_to_csv_bytes(cases: list[dict[str, Any]], cycles: list[int], mode
         "cycle",
         "time_in_cycle_s",
         *result_names,
+        *[key for key in metadata_columns if key not in result_names],
     ]
     return _csv_bytes(rows, fieldnames)
 
@@ -144,7 +197,7 @@ def format_seconds(seconds: float) -> str:
         return f"{seconds:.1f} s"
     minutes, rem = divmod(seconds, 60.0)
     if minutes < 60.0:
-        return f"{int(minutes)} min {rem:04.1f} s"
+        return f"{int(minutes)} min {rem:.1f} s"
     hours, minutes = divmod(minutes, 60.0)
     return f"{int(hours)} h {int(minutes):02d} min"
 
@@ -266,6 +319,683 @@ def make_cavatappi_figure(settings: dict[str, SettingValue], state: str):
     return fig
 
 
+def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: str) -> str:
+    """Construit un visualiseur 3D interactif autonome sur un canvas HTML."""
+    geom = derived_geometry(settings)
+    length = float(settings["initial_length_mm"])
+    pitch = float(geom["pitch0_mm"])
+    if state == "prestrained":
+        length = float(geom["prestrained_length_mm"])
+        pitch = float(geom["prestrained_pitch_mm"])
+
+    config = {
+        "rho": float(settings["rho0_mm"]),
+        "rout": float(settings["rout_mm"]),
+        "rin": float(settings["rin_mm"]),
+        "nylonRadius": 0.5 * float(settings["nylon_diameter_mm"]),
+        "length": length,
+        "pitch": pitch,
+        "elev": float(settings.get("view_elev_deg", 22.0)),
+        "azim": float(settings.get("view_azim_deg", -58.0)),
+        "color": "#1778c8" if state == "fabricated" else "#d63b32",
+        "title": f"Géométrie du Cavatappi - {VISUAL_STATE_LABELS.get(state, state)}",
+    }
+    payload = json.dumps(config, ensure_ascii=False).replace("<", "\\u003c")
+
+    template = r"""
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+  #viewer {
+    position: relative;
+    width: 100%;
+    height: 552px;
+    overflow: hidden;
+    border: 1px solid rgba(128, 128, 128, 0.32);
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.015);
+  }
+  @media (max-width: 600px) {
+    #viewer { height: 420px; }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    outline: none;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas:active { cursor: grabbing; }
+  canvas:focus-visible { box-shadow: inset 0 0 0 2px #2684ff; }
+  #reset, #grid-toggle, #auto-rotate {
+    position: absolute;
+    top: 10px;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid rgba(128, 128, 128, 0.38);
+    border-radius: 5px;
+    color: inherit;
+    background: rgba(250, 250, 250, 0.88);
+    font: 21px/1 system-ui, sans-serif;
+    cursor: pointer;
+    z-index: 2;
+  }
+  #reset { right: 10px; }
+  #grid-toggle { right: 50px; font-size: 18px; }
+  #auto-rotate { right: 90px; font-size: 15px; }
+  #reset:hover, #grid-toggle:hover, #auto-rotate:hover { background: rgba(230, 237, 245, 0.96); }
+  #grid-toggle[aria-pressed="false"] { opacity: 0.56; }
+  #auto-rotate[aria-pressed="false"] { opacity: 0.72; }
+  @media (prefers-color-scheme: dark) {
+    #reset, #grid-toggle, #auto-rotate { background: rgba(38, 39, 48, 0.92); }
+    #reset:hover, #grid-toggle:hover, #auto-rotate:hover { background: rgba(55, 58, 69, 0.96); }
+  }
+</style>
+</head>
+<body>
+<div id="viewer">
+  <canvas id="cavatappi" tabindex="0" aria-label="Visualisation 3D interactive du Cavatappi"></canvas>
+  <button id="auto-rotate" type="button" title="Lancer la rotation automatique" aria-label="Lancer la rotation automatique" aria-pressed="false">▶</button>
+  <button id="grid-toggle" type="button" title="Afficher ou masquer la grille" aria-label="Afficher ou masquer la grille" aria-pressed="true">▦</button>
+  <button id="reset" type="button" title="Réinitialiser la vue" aria-label="Réinitialiser la vue">↻</button>
+</div>
+<script>
+(() => {
+  "use strict";
+  const cfg = __CONFIG__;
+  const canvas = document.getElementById("cavatappi");
+  const viewer = document.getElementById("viewer");
+  const resetButton = document.getElementById("reset");
+  const gridButton = document.getElementById("grid-toggle");
+  const autoRotateButton = document.getElementById("auto-rotate");
+  const ctx = canvas.getContext("2d");
+  const initialYaw = cfg.azim * Math.PI / 180;
+  const initialPitch = cfg.elev * Math.PI / 180;
+  let yaw = initialYaw;
+  let viewPitch = initialPitch;
+  let zoom = 1;
+  let gridVisible = true;
+  let autoRotating = false;
+  let animationFrame = null;
+  let previousAnimationTime = 0;
+  let dragging = false;
+  let previousX = 0;
+  let previousY = 0;
+
+  const turns = Math.max(cfg.length / Math.max(cfg.pitch, 1e-9), 0.1);
+  const sampleCount = Math.min(2400, Math.max(320, Math.ceil(100 * turns)));
+  const helix = [];
+  for (let i = 0; i < sampleCount; i += 1) {
+    const phase = 2 * Math.PI * turns * i / (sampleCount - 1);
+    helix.push([
+      cfg.rho * Math.cos(phase),
+      cfg.rho * Math.sin(phase),
+      cfg.pitch * phase / (2 * Math.PI)
+    ]);
+  }
+
+  const outerRadius = cfg.rho + cfg.rout;
+  const dimPad = Math.max(0.8, 2.1 * cfg.rout);
+  const cameraDistance = Math.max(
+    4 * outerRadius,
+    3.2 * Math.hypot(cfg.length, 2 * outerRadius)
+  );
+  const centered = (point) => [point[0], point[1], point[2] - 0.5 * cfg.length];
+
+  function rotate(point) {
+    const p = centered(point);
+    const cy = Math.cos(yaw);
+    const sy = Math.sin(yaw);
+    const cp = Math.cos(viewPitch);
+    const sp = Math.sin(viewPitch);
+    const x1 = cy * p[0] - sy * p[1];
+    const y1 = sy * p[0] + cy * p[1];
+    return [
+      x1,
+      -sp * y1 + cp * p[2],
+      cp * y1 + sp * p[2]
+    ];
+  }
+
+  function perspectivePoint(point) {
+    const p = rotate(point);
+    const factor = cameraDistance / Math.max(0.25 * cameraDistance, cameraDistance - p[2]);
+    return [p[0] * factor, p[1] * factor, p[2], factor];
+  }
+
+  function theme() {
+    const dark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    return {
+      text: dark ? "#e7e9ee" : "#20242a",
+      muted: dark ? "#aeb4bf" : "#69717c",
+      guide: dark ? "rgba(190,196,207,0.58)" : "rgba(80,87,96,0.58)",
+      grid: dark ? "rgba(174,184,199,0.16)" : "rgba(76,91,110,0.14)",
+      gridMajor: dark ? "rgba(174,184,199,0.28)" : "rgba(76,91,110,0.25)",
+      backdrop: dark ? "rgba(16,18,24,0.90)" : "rgba(255,255,255,0.90)",
+      inner: dark ? "#f1f3f6" : "#ffffff",
+      nylon: "#e48a21"
+    };
+  }
+
+  function geometryBounds() {
+    const points = helix.map(perspectivePoint);
+    const dimensionPoints = [
+      [outerRadius + dimPad, 0, 0],
+      [outerRadius + dimPad, 0, cfg.length],
+      [-outerRadius, -outerRadius - 1.7 * dimPad, 0],
+      [outerRadius, -outerRadius - 1.7 * dimPad, 0],
+      [-outerRadius - dimPad, outerRadius + dimPad, 0],
+      [-outerRadius - dimPad, outerRadius + dimPad, Math.min(cfg.pitch, cfg.length)]
+    ].map(perspectivePoint);
+    points.push(...dimensionPoints);
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const p of points) {
+      minX = Math.min(minX, p[0]);
+      maxX = Math.max(maxX, p[0]);
+      minY = Math.min(minY, p[1]);
+      maxY = Math.max(maxY, p[1]);
+    }
+    return { minX, maxX, minY, maxY };
+  }
+
+  function projector() {
+    const bounds = geometryBounds();
+    const width = canvas.clientWidth;
+    const height = canvas.clientHeight;
+    const marginX = Math.max(54, width * 0.10);
+    const marginTop = 58;
+    const marginBottom = 42;
+    const spanX = Math.max(bounds.maxX - bounds.minX, 1e-6);
+    const spanY = Math.max(bounds.maxY - bounds.minY, 1e-6);
+    const scale = zoom * Math.min(
+      Math.max(20, width - 2 * marginX) / spanX,
+      Math.max(20, height - marginTop - marginBottom) / spanY
+    );
+    const centerX = 0.5 * (bounds.minX + bounds.maxX);
+    const centerY = 0.5 * (bounds.minY + bounds.maxY);
+    return {
+      scale,
+      point(point) {
+        const p = perspectivePoint(point);
+        return [
+          width * 0.5 + (p[0] - centerX) * scale,
+          marginTop + 0.5 * (height - marginTop - marginBottom) - (p[1] - centerY) * scale,
+          p[2],
+          p[3]
+        ];
+      }
+    };
+  }
+
+  function strokePolyline(points, color, width, dashed = false) {
+    if (points.length < 2) return;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.setLineDash(dashed ? [5, 5] : []);
+    ctx.beginPath();
+    ctx.moveTo(points[0][0], points[0][1]);
+    for (let i = 1; i < points.length; i += 1) ctx.lineTo(points[i][0], points[i][1]);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function niceStep(rawStep) {
+    const exponent = Math.floor(Math.log10(Math.max(rawStep, 1e-9)));
+    const fraction = rawStep / Math.pow(10, exponent);
+    const niceFraction = fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10;
+    return niceFraction * Math.pow(10, exponent);
+  }
+
+  function shadedColor(hexColor, factor, alpha = 1) {
+    const value = hexColor.replace("#", "");
+    const full = value.length === 3 ? value.split("").map((digit) => digit + digit).join("") : value;
+    const channels = [0, 2, 4].map((index) => parseInt(full.slice(index, index + 2), 16));
+    const adjusted = channels.map((channel) => {
+      const result = factor <= 1
+        ? channel * factor
+        : channel + (255 - channel) * Math.min(factor - 1, 1);
+      return Math.max(0, Math.min(255, Math.round(result)));
+    });
+    return `rgba(${adjusted[0]},${adjusted[1]},${adjusted[2]},${alpha})`;
+  }
+
+  function drawDepthShadedHelix(project, baseWidth) {
+    const points = helix.map(project.point);
+    const radialDepths = points.map((point, index) => {
+      const axisPoint = project.point([0, 0, helix[index][2]]);
+      return point[2] - axisPoint[2];
+    });
+    const minRadialDepth = Math.min(...radialDepths);
+    const maxRadialDepth = Math.max(...radialDepths);
+    const radialDepthSpan = Math.max(maxRadialDepth - minRadialDepth, 1e-9);
+    const segments = [];
+    for (let index = 0; index < points.length - 1; index += 1) {
+      const a = points[index];
+      const b = points[index + 1];
+      const depth = 0.5 * (a[2] + b[2]);
+      const radialDepth = 0.5 * (radialDepths[index] + radialDepths[index + 1]);
+      const proximity = (radialDepth - minRadialDepth) / radialDepthSpan;
+      segments.push({
+        a,
+        b,
+        depth,
+        proximity,
+        width: baseWidth * (0.82 + 0.24 * proximity)
+      });
+    }
+    segments.sort((left, right) => left.depth - right.depth);
+
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (const segment of segments) {
+      ctx.strokeStyle = `rgba(3,8,14,${0.10 + 0.08 * segment.proximity})`;
+      ctx.lineWidth = segment.width + 1.7;
+      ctx.beginPath();
+      ctx.moveTo(segment.a[0], segment.a[1]);
+      ctx.lineTo(segment.b[0], segment.b[1]);
+      ctx.stroke();
+    }
+    for (const segment of segments) {
+      ctx.strokeStyle = shadedColor(
+        cfg.color,
+        0.66 + 0.48 * segment.proximity,
+        0.88 + 0.12 * segment.proximity
+      );
+      ctx.lineWidth = segment.width;
+      ctx.beginPath();
+      ctx.moveTo(segment.a[0], segment.a[1]);
+      ctx.lineTo(segment.b[0], segment.b[1]);
+      ctx.stroke();
+    }
+    for (const segment of segments) {
+      ctx.strokeStyle = `rgba(255,255,255,${0.04 + 0.18 * segment.proximity})`;
+      ctx.lineWidth = Math.max(0.65, 0.13 * segment.width);
+      ctx.beginPath();
+      ctx.moveTo(segment.a[0], segment.a[1]);
+      ctx.lineTo(segment.b[0], segment.b[1]);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawReferenceGrid(project, colors) {
+    if (!gridVisible) return;
+    const extent = outerRadius + 0.55 * dimPad;
+    const xyStep = niceStep((2 * extent) / 8);
+    const zStep = niceStep(cfg.length / 9);
+    const verticalPlaneY = 0;
+
+    for (let x = Math.ceil(-extent / xyStep) * xyStep; x <= extent + 1e-9; x += xyStep) {
+      const major = Math.abs(x) < 1e-9;
+      strokePolyline(
+        [project.point([x, verticalPlaneY, 0]), project.point([x, verticalPlaneY, cfg.length])],
+        major ? colors.gridMajor : colors.grid,
+        major ? 1.15 : 0.8
+      );
+    }
+    for (let z = 0; z <= cfg.length + 1e-9; z += zStep) {
+      const major = z < 1e-9 || Math.abs(z - cfg.length) < 0.5 * zStep;
+      strokePolyline(
+        [project.point([-extent, verticalPlaneY, Math.min(z, cfg.length)]), project.point([extent, verticalPlaneY, Math.min(z, cfg.length)])],
+        major ? colors.gridMajor : colors.grid,
+        major ? 1.15 : 0.8
+      );
+    }
+
+    for (let x = Math.ceil(-extent / xyStep) * xyStep; x <= extent + 1e-9; x += xyStep) {
+      strokePolyline(
+        [project.point([x, -extent, 0]), project.point([x, extent, 0])],
+        Math.abs(x) < 1e-9 ? colors.gridMajor : colors.grid,
+        Math.abs(x) < 1e-9 ? 1.15 : 0.8
+      );
+    }
+    for (let y = Math.ceil(-extent / xyStep) * xyStep; y <= extent + 1e-9; y += xyStep) {
+      strokePolyline(
+        [project.point([-extent, y, 0]), project.point([extent, y, 0])],
+        Math.abs(y) < 1e-9 ? colors.gridMajor : colors.grid,
+        Math.abs(y) < 1e-9 ? 1.15 : 0.8
+      );
+    }
+  }
+
+  function drawOrientationGizmo(project) {
+    const origin3d = project.point([0, 0, 0]);
+    const axisLength = Math.max(outerRadius, 1);
+    const screenOrigin = [34, canvas.clientHeight - 32];
+    const axes = [
+      { point: project.point([axisLength, 0, 0]), color: "#e05252", label: "x" },
+      { point: project.point([0, axisLength, 0]), color: "#42a66a", label: "y" },
+      { point: project.point([0, 0, axisLength]), color: "#4f83dd", label: "z" }
+    ];
+    for (const axis of axes) {
+      const dx = axis.point[0] - origin3d[0];
+      const dy = axis.point[1] - origin3d[1];
+      const norm = Math.hypot(dx, dy) || 1;
+      const end = [screenOrigin[0] + 25 * dx / norm, screenOrigin[1] + 25 * dy / norm];
+      strokePolyline([screenOrigin, end], axis.color, 2);
+      arrowHead(screenOrigin, end, axis.color);
+      ctx.save();
+      ctx.fillStyle = axis.color;
+      ctx.font = "600 11px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(axis.label, end[0] + 7 * dx / norm, end[1] + 7 * dy / norm);
+      ctx.restore();
+    }
+  }
+
+  function arrowHead(from, to, color) {
+    const angle = Math.atan2(to[1] - from[1], to[0] - from[0]);
+    const size = 8;
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(to[0], to[1]);
+    ctx.lineTo(to[0] - size * Math.cos(angle - Math.PI / 6), to[1] - size * Math.sin(angle - Math.PI / 6));
+    ctx.lineTo(to[0] - size * Math.cos(angle + Math.PI / 6), to[1] - size * Math.sin(angle + Math.PI / 6));
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function dimension(project, start, end, label, offsetX = 0, offsetY = 0) {
+    const colors = theme();
+    const a = project.point(start);
+    const b = project.point(end);
+    strokePolyline([a, b], colors.text, 1.25);
+    arrowHead(b, a, colors.text);
+    arrowHead(a, b, colors.text);
+    ctx.save();
+    ctx.font = "12px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const x = 0.5 * (a[0] + b[0]) + offsetX;
+    const y = 0.5 * (a[1] + b[1]) + offsetY;
+    const metrics = ctx.measureText(label);
+    const safeX = Math.max(metrics.width / 2 + 7, Math.min(canvas.clientWidth - metrics.width / 2 - 7, x));
+    const safeY = Math.max(50, Math.min(canvas.clientHeight - 13, y));
+    ctx.fillStyle = colors.backdrop;
+    ctx.fillRect(safeX - metrics.width / 2 - 4, safeY - 9, metrics.width + 8, 18);
+    ctx.fillStyle = colors.text;
+    ctx.fillText(label, safeX, safeY);
+    ctx.restore();
+  }
+
+  function tangentAt(end) {
+    const i0 = end === 0 ? 0 : helix.length - 2;
+    const i1 = end === 0 ? 1 : helix.length - 1;
+    const v = [
+      helix[i1][0] - helix[i0][0],
+      helix[i1][1] - helix[i0][1],
+      helix[i1][2] - helix[i0][2]
+    ];
+    const norm = Math.hypot(v[0], v[1], v[2]) || 1;
+    return v.map((value) => value / norm);
+  }
+
+  function ringPoints(center, radius, tangent) {
+    const reference = Math.abs(tangent[2]) < 0.85 ? [0, 0, 1] : [1, 0, 0];
+    let u = [
+      tangent[1] * reference[2] - tangent[2] * reference[1],
+      tangent[2] * reference[0] - tangent[0] * reference[2],
+      tangent[0] * reference[1] - tangent[1] * reference[0]
+    ];
+    const uNorm = Math.hypot(u[0], u[1], u[2]) || 1;
+    u = u.map((value) => value / uNorm);
+    const v = [
+      tangent[1] * u[2] - tangent[2] * u[1],
+      tangent[2] * u[0] - tangent[0] * u[2],
+      tangent[0] * u[1] - tangent[1] * u[0]
+    ];
+    const points = [];
+    for (let i = 0; i <= 72; i += 1) {
+      const a = 2 * Math.PI * i / 72;
+      points.push([
+        center[0] + radius * (u[0] * Math.cos(a) + v[0] * Math.sin(a)),
+        center[1] + radius * (u[1] * Math.cos(a) + v[1] * Math.sin(a)),
+        center[2] + radius * (u[2] * Math.cos(a) + v[2] * Math.sin(a))
+      ]);
+    }
+    return points;
+  }
+
+  function drawEndSection(project, colors, end) {
+    const center = helix[end === 0 ? 0 : helix.length - 1];
+    const tangent = tangentAt(end);
+    const outer = ringPoints(center, cfg.rout, tangent).map(project.point);
+    const inner = ringPoints(center, Math.min(cfg.rin, cfg.rout * 0.98), tangent).map(project.point);
+    const depth = project.point(center)[2];
+    const endDepths = [
+      project.point(helix[0])[2],
+      project.point(helix[helix.length - 1])[2]
+    ];
+    const minDepth = Math.min(...endDepths);
+    const maxDepth = Math.max(...endDepths);
+    const proximity = (depth - minDepth) / Math.max(maxDepth - minDepth, 1e-9);
+    strokePolyline(outer, shadedColor(cfg.color, 0.62 + 0.48 * proximity), 2.4);
+    strokePolyline(inner, colors.inner, 2.0);
+    if (cfg.nylonRadius > 0) {
+      const nylon = ringPoints(center, Math.min(cfg.nylonRadius, cfg.rin), tangent).map(project.point);
+      strokePolyline(nylon, colors.nylon, 1.6);
+    }
+  }
+
+  function draw() {
+    const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+    const width = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    const height = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+    const colors = theme();
+    const project = projector();
+
+    ctx.save();
+    ctx.fillStyle = colors.text;
+    ctx.font = `600 ${canvas.clientWidth < 430 ? 16 : 18}px system-ui, sans-serif`;
+    ctx.textAlign = "left";
+    ctx.fillText(cfg.title, 12, 27, Math.max(80, canvas.clientWidth - 144));
+    ctx.restore();
+
+    drawReferenceGrid(project, colors);
+
+    const axisA = project.point([0, 0, 0]);
+    const axisB = project.point([0, 0, cfg.length]);
+    strokePolyline([axisA, axisB], colors.guide, 1.2, true);
+
+    const physicalTubeWidth = 2 * cfg.rout * project.scale;
+    const legibleTubeWidth = Math.max(4.5, 0.50 * cfg.pitch * project.scale);
+    const tubeWidth = Math.max(4, Math.min(physicalTubeWidth, legibleTubeWidth));
+    const endOrder = [0, 1].sort((left, right) => {
+      const leftDepth = project.point(helix[left === 0 ? 0 : helix.length - 1])[2];
+      const rightDepth = project.point(helix[right === 0 ? 0 : helix.length - 1])[2];
+      return leftDepth - rightDepth;
+    });
+    drawEndSection(project, colors, endOrder[0]);
+    drawDepthShadedHelix(project, tubeWidth);
+    drawEndSection(project, colors, endOrder[1]);
+
+    const lengthX = outerRadius + dimPad;
+    strokePolyline(
+      [project.point([0, 0, 0]), project.point([lengthX, 0, 0])],
+      colors.guide,
+      1
+    );
+    strokePolyline(
+      [project.point([0, 0, cfg.length]), project.point([lengthX, 0, cfg.length])],
+      colors.guide,
+      1
+    );
+    dimension(
+      project,
+      [lengthX, 0, 0],
+      [lengthX, 0, cfg.length],
+      `L = ${cfg.length.toFixed(1)} mm`,
+      23,
+      0
+    );
+
+    const diameterY = -outerRadius - 1.7 * dimPad;
+    strokePolyline(
+      [project.point([-outerRadius, 0, 0]), project.point([-outerRadius, diameterY, 0])],
+      colors.guide,
+      1
+    );
+    strokePolyline(
+      [project.point([outerRadius, 0, 0]), project.point([outerRadius, diameterY, 0])],
+      colors.guide,
+      1
+    );
+    dimension(
+      project,
+      [-outerRadius, diameterY, 0],
+      [outerRadius, diameterY, 0],
+      `Ø ext. spire = ${(2 * outerRadius).toFixed(2)} mm`,
+      0,
+      18
+    );
+
+    const pitchX = -outerRadius - dimPad;
+    const pitchY = outerRadius + dimPad;
+    const visiblePitch = Math.min(cfg.pitch, cfg.length);
+    strokePolyline(
+      [project.point([0, 0, 0]), project.point([pitchX, pitchY, 0])],
+      colors.guide,
+      1
+    );
+    strokePolyline(
+      [project.point([0, 0, visiblePitch]), project.point([pitchX, pitchY, visiblePitch])],
+      colors.guide,
+      1
+    );
+    dimension(
+      project,
+      [pitchX, pitchY, 0],
+      [pitchX, pitchY, visiblePitch],
+      `pas = ${cfg.pitch.toFixed(2)} mm`,
+      -24,
+      0
+    );
+    drawOrientationGizmo(project);
+  }
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (autoRotating) setAutoRotation(false);
+    dragging = true;
+    previousX = event.clientX;
+    previousY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+    canvas.focus({ preventScroll: true });
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const dx = event.clientX - previousX;
+    const dy = event.clientY - previousY;
+    previousX = event.clientX;
+    previousY = event.clientY;
+    yaw += dx * 0.009;
+    viewPitch = Math.max(-Math.PI * 0.49, Math.min(Math.PI * 0.49, viewPitch + dy * 0.009));
+    draw();
+  });
+  const stopDragging = (event) => {
+    dragging = false;
+    if (event.pointerId !== undefined && canvas.hasPointerCapture(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+  };
+  canvas.addEventListener("pointerup", stopDragging);
+  canvas.addEventListener("pointercancel", stopDragging);
+  canvas.addEventListener("wheel", (event) => {
+    event.preventDefault();
+    zoom = Math.max(0.65, Math.min(2.4, zoom * Math.exp(-event.deltaY * 0.001)));
+    draw();
+  }, { passive: false });
+  canvas.addEventListener("keydown", (event) => {
+    const angularStep = 5 * Math.PI / 180;
+    if (event.key === "ArrowLeft") yaw -= angularStep;
+    else if (event.key === "ArrowRight") yaw += angularStep;
+    else if (event.key === "ArrowUp") viewPitch = Math.min(Math.PI * 0.49, viewPitch + angularStep);
+    else if (event.key === "ArrowDown") viewPitch = Math.max(-Math.PI * 0.49, viewPitch - angularStep);
+    else return;
+    event.preventDefault();
+    draw();
+  });
+  resetButton.addEventListener("click", () => {
+    setAutoRotation(false);
+    yaw = initialYaw;
+    viewPitch = initialPitch;
+    zoom = 1;
+    canvas.focus({ preventScroll: true });
+    draw();
+  });
+  function setAutoRotation(enabled) {
+    autoRotating = enabled;
+    autoRotateButton.setAttribute("aria-pressed", String(enabled));
+    autoRotateButton.textContent = enabled ? "Ⅱ" : "▶";
+    autoRotateButton.title = enabled ? "Arrêter la rotation automatique" : "Lancer la rotation automatique";
+    autoRotateButton.setAttribute("aria-label", autoRotateButton.title);
+    if (!enabled) {
+      if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+      animationFrame = null;
+      previousAnimationTime = 0;
+      return;
+    }
+    const animate = (timestamp) => {
+      if (!autoRotating) return;
+      if (previousAnimationTime > 0) {
+        const elapsed = Math.min(50, timestamp - previousAnimationTime);
+        yaw += elapsed * 0.00024;
+      }
+      previousAnimationTime = timestamp;
+      draw();
+      animationFrame = requestAnimationFrame(animate);
+    };
+    animationFrame = requestAnimationFrame(animate);
+  }
+  autoRotateButton.addEventListener("click", () => {
+    setAutoRotation(!autoRotating);
+    canvas.focus({ preventScroll: true });
+  });
+  gridButton.addEventListener("click", () => {
+    gridVisible = !gridVisible;
+    gridButton.setAttribute("aria-pressed", String(gridVisible));
+    canvas.focus({ preventScroll: true });
+    draw();
+  });
+
+  const observer = new ResizeObserver(draw);
+  observer.observe(viewer);
+  if (window.matchMedia) {
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    if (media.addEventListener) media.addEventListener("change", draw);
+  }
+  draw();
+})();
+</script>
+</body>
+</html>
+"""
+    return template.replace("__CONFIG__", payload)
+
+
 def make_cross_section_figure(settings: dict[str, SettingValue]):
     rout = float(settings["rout_mm"])
     rin = float(settings["rin_mm"])
@@ -273,7 +1003,7 @@ def make_cross_section_figure(settings: dict[str, SettingValue]):
 
     fig, ax = plt.subplots(figsize=(4.9, 4.9), constrained_layout=True)
     ax.add_patch(Circle((0.0, 0.0), rout, facecolor="#d7e8ff", edgecolor="#1f77b4", lw=2.0, label="tube PVC"))
-    ax.add_patch(Circle((0.0, 0.0), rin, facecolor="white", edgecolor="#1f77b4", lw=1.5, label="alesage interne"))
+    ax.add_patch(Circle((0.0, 0.0), rin, facecolor=PLOT_PANEL, edgecolor="#6fb7ff", lw=1.5, label="alésage interne"))
     ax.add_patch(Circle((0.0, 0.0), nylon_radius, facecolor="#ffd8a8", edgecolor="#ff7f0e", lw=1.8, label="nylon"))
     limit = 1.55 * rout
     ax.set_xlim(-limit, limit)
@@ -283,7 +1013,7 @@ def make_cross_section_figure(settings: dict[str, SettingValue]):
     ax.set_ylabel("mm")
     ax.set_title("Section du tube")
     ax.grid(False)
-    arrow = {"arrowstyle": "<->", "color": "#222222", "lw": 1.1, "shrinkA": 0.0, "shrinkB": 0.0}
+    arrow = {"arrowstyle": "<->", "color": PLOT_TEXT, "lw": 1.1, "shrinkA": 0.0, "shrinkB": 0.0}
     ax.annotate("", xy=(-rout, -1.22 * rout), xytext=(rout, -1.22 * rout), arrowprops=arrow)
     ax.text(0.0, -1.34 * rout, f"2Rout = {2.0 * rout:.2f} mm", ha="center", va="top", fontsize=9)
     ax.annotate("", xy=(-rin, 1.17 * rout), xytext=(rin, 1.17 * rout), arrowprops=arrow)
@@ -295,9 +1025,23 @@ def make_cross_section_figure(settings: dict[str, SettingValue]):
             xytext=(nylon_radius, 0.0),
             arrowprops={"arrowstyle": "<->", "color": "#8a4b08", "lw": 1.0, "shrinkA": 0.0, "shrinkB": 0.0},
         )
-        ax.text(0.0, 0.12 * rout, f"nylon = {2.0 * nylon_radius:.2f} mm", ha="center", fontsize=8.5)
+        ax.text(
+            0.0,
+            0.12 * rout,
+            f"nylon = {2.0 * nylon_radius:.2f} mm",
+            ha="center",
+            fontsize=8.5,
+            color="#ffffff",
+            bbox={
+                "boxstyle": "round,pad=0.25",
+                "facecolor": PLOT_PANEL,
+                "edgecolor": "#ff9f43",
+                "alpha": 0.96,
+                "linewidth": 0.9,
+            },
+        )
     ax.legend(loc="upper right")
-    return fig
+    return _style_figure(fig)
 
 
 def plot_time_response_fr(data: dict[str, np.ndarray]):
@@ -305,7 +1049,7 @@ def plot_time_response_fr(data: dict[str, np.ndarray]):
     axes[0].plot(data["time"], data["force_total_mN"], lw=1.5, color="#1f77b4")
     axes[0].set_ylabel("Force bloquée (mN)")
     axes[1].plot(data["time"], data["torque_act_microNm"], lw=1.5, color="#d62728")
-    axes[1].set_ylabel("Couple d'actionnement (microN m)")
+    axes[1].set_ylabel("Couple d'actionnement (µN·m)")
     axes[2].plot(data["time"], data["pressure_MPa"], lw=1.5, color="#2ca02c")
     axes[2].set_ylabel("Pression (MPa)")
     axes[2].set_xlabel("Temps depuis le debut de pression (s)")
@@ -313,7 +1057,7 @@ def plot_time_response_fr(data: dict[str, np.ndarray]):
     axes[0].set_title("Réponse du modèle Cavatappi")
     for ax in axes:
         ax.grid(True, alpha=0.3)
-    return fig
+    return _style_figure(fig)
 
 
 def _add_direction_arrows(ax, x, y, color, n_arrows: int = 6) -> None:
@@ -385,7 +1129,7 @@ def plot_hysteresis_with_arrows(data, cycle: int = 1, period: float | None = Non
         pressure_psi[-1], torque_microNm[-1], s=28, facecolor="white", edgecolor=torque_color, zorder=3, label="fin"
     )
     axes[1].set_xlabel("Pression (psi)")
-    axes[1].set_ylabel("Couple d'actionnement (microN m)")
+    axes[1].set_ylabel("Couple d'actionnement (µN·m)")
     axes[1].set_title(f"Hystérèse pression-couple - cycle {cycle}")
     axes[1].legend()
 
@@ -393,7 +1137,7 @@ def plot_hysteresis_with_arrows(data, cycle: int = 1, period: float | None = Non
         ax.grid(True, alpha=0.3)
     if show:
         plt.show()
-    return fig
+    return _style_figure(fig)
 
 
 def plot_hysteresis_overlay(cases: list[dict], cycles: list[int], show: bool = False):
@@ -447,7 +1191,7 @@ def plot_hysteresis_overlay(cases: list[dict], cycles: list[int], show: bool = F
     axes[0].set_ylabel("Force bloquée (mN)")
     axes[0].set_title("Hystérèse pression-force")
     axes[1].set_xlabel("Pression (psi)")
-    axes[1].set_ylabel("Couple d'actionnement (microN m)")
+    axes[1].set_ylabel("Couple d'actionnement (µN·m)")
     axes[1].set_title("Hystérèse pression-couple")
 
     for ax in axes:
@@ -455,7 +1199,7 @@ def plot_hysteresis_overlay(cases: list[dict], cycles: list[int], show: bool = F
         ax.legend(loc="best", fontsize=8)
     if show:
         plt.show()
-    return fig
+    return _style_figure(fig)
 
 
 def plot_relaxation_response(data: dict[str, np.ndarray]):
@@ -477,7 +1221,7 @@ def plot_relaxation_response(data: dict[str, np.ndarray]):
 
     axes[2].plot(t_hold, data["torque_hold_relax_microNm"][hold_start_index:], color="#d62728", lw=1.6)
     axes[2].axhline(0.0, color="0.35", lw=0.9)
-    axes[2].set_ylabel("Variation de couple (microN m)")
+    axes[2].set_ylabel("Variation de couple (µN·m)")
 
     axes[3].plot(time, data["pressure_MPa"], color="#2ca02c", lw=1.6)
     axes[3].axvline(ramp_time, color="0.35", lw=1.0, ls="--")
@@ -488,13 +1232,13 @@ def plot_relaxation_response(data: dict[str, np.ndarray]):
         ax.grid(True, alpha=0.28)
     axes[1].set_xlabel("Temps de maintien à pression constante (s)")
     axes[2].set_xlabel("Temps de maintien à pression constante (s)")
-    return fig
+    return _style_figure(fig)
 
 
 def plot_suspended_response(data: dict[str, np.ndarray], show_geometry: bool = False):
     time = np.asarray(data["time"], dtype=float)
-    n_axes = 4 if show_geometry else 3
-    fig_height = 9.2 if show_geometry else 7.0
+    n_axes = 5 if show_geometry else 4
+    fig_height = 11.0 if show_geometry else 8.8
     fig, axes = plt.subplots(n_axes, 1, figsize=(9.2, fig_height), sharex=True, constrained_layout=True)
     fig.suptitle("Actionnement libre avec masse suspendue")
     axes = np.asarray(axes).ravel()
@@ -505,41 +1249,55 @@ def plot_suspended_response(data: dict[str, np.ndarray], show_geometry: bool = F
             hold_start_time = float(time[hold_index])
 
     axes[0].plot(time, data["free_actuation_percent"], color="#1f77b4", lw=1.6)
-    axes[0].set_ylabel("Actionnement (%)")
+    axes[0].set_ylabel("Actionnement dû à la pression (%)")
 
     contraction_mm = np.asarray(data["free_contraction_mm"], dtype=float)
     axes[1].plot(time, contraction_mm, color="#ff7f0e", lw=1.7)
     axes[1].axhline(0.0, color="0.35", lw=0.8)
-    axes[1].set_ylabel("Contraction (mm)")
+    axes[1].set_ylabel("Contraction due à la pression (mm)")
 
-    axes[2].plot(time, data["pressure_MPa"], color="#2ca02c", lw=1.6)
-    axes[2].set_ylabel("Pression (MPa)")
+    axes[2].plot(time, data["axial_length_mm"], color="#9467bd", lw=1.7, label="position de la masse")
+    axes[2].plot(
+        time,
+        data["reference_axial_length_mm"],
+        color="#2ca02c",
+        lw=1.3,
+        ls=":",
+        label="longueur initiale à t = 0",
+    )
+    axes[2].set_ylabel("Position axiale de la masse (mm)")
+    axes[2].legend(loc="best")
 
-    axes[2].set_xlabel("Temps depuis le debut de pression (s)")
+    pressure_axis_index = 3
+    geometry_axis_index = 4
+    axes[pressure_axis_index].plot(time, data["pressure_MPa"], color="#2ca02c", lw=1.6)
+    axes[pressure_axis_index].set_ylabel("Pression (MPa)")
+
+    axes[pressure_axis_index].set_xlabel("Temps depuis le début de pression (s)")
     if not show_geometry:
         for ax in axes:
             if hold_start_time is not None:
                 ax.axvline(hold_start_time, color="0.35", lw=1.0, ls="--")
             ax.grid(True, alpha=0.28)
-        return fig
+        return _style_figure(fig)
 
-    axes[3].set_ylabel("Rh (mm)")
-    ax_angle = axes[3].twinx()
+    axes[geometry_axis_index].set_ylabel("Rh (mm)")
+    ax_angle = axes[geometry_axis_index].twinx()
     ax_angle.set_ylabel("beta_h (deg)")
-    axes[3].set_xlabel("Temps depuis le début de pression (s)")
+    axes[geometry_axis_index].set_xlabel("Temps depuis le début de pression (s)")
 
     if "rho_mm" in data and "alpha_deg" in data:
-        axes[3].plot(time, data["rho_mm"], color="#d62728", lw=1.5, label="Rh")
+        axes[geometry_axis_index].plot(time, data["rho_mm"], color="#d62728", lw=1.5, label="Rh")
         ax_angle.plot(time, data["alpha_deg"], color="#17becf", lw=1.2, label="beta_h")
-        lines, labels = axes[3].get_legend_handles_labels()
+        lines, labels = axes[geometry_axis_index].get_legend_handles_labels()
         lines2, labels2 = ax_angle.get_legend_handles_labels()
-        axes[3].legend(lines + lines2, labels + labels2, loc="best")
+        axes[geometry_axis_index].legend(lines + lines2, labels + labels2, loc="best")
     else:
-        axes[3].text(
+        axes[geometry_axis_index].text(
             0.5,
             0.5,
             "Données Rh / beta_h absentes : relancez le calcul masse suspendue.",
-            transform=axes[3].transAxes,
+            transform=axes[geometry_axis_index].transAxes,
             ha="center",
             va="center",
         )
@@ -548,7 +1306,7 @@ def plot_suspended_response(data: dict[str, np.ndarray], show_geometry: bool = F
         if hold_start_time is not None:
             ax.axvline(hold_start_time, color="0.35", lw=1.0, ls="--")
         ax.grid(True, alpha=0.28)
-    return fig
+    return _style_figure(fig)
 
 
 def plot_prestrain_study(result: dict[str, np.ndarray]):
@@ -567,4 +1325,4 @@ def plot_prestrain_study(result: dict[str, np.ndarray]):
 
     for ax in axes:
         ax.grid(True, alpha=0.3)
-    return fig
+    return _style_figure(fig)

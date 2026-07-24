@@ -7,7 +7,7 @@ Ce dossier contient tout le nécessaire pour lancer l'interface Streamlit du mod
 - `Base.py` : moteur scientifique du modèle.
 - `parametres.py` : paramètres, géométrie, pression et cache.
 - `pression.py` : lecture des historiques CSV mesurés et conversion des unités.
-- `affichage.py` : visualiseur Cavatappi et graphes Matplotlib.
+- `affichage.py` : visualiseur Cavatappi 3D interactif avec perspective, éclairage de profondeur, grille et rotation automatique, ainsi que les graphes Matplotlib.
 - `parallel.py` : exécution parallèle des études comparatives.
 - `timing.py` : estimation et suivi des temps de calcul.
 - `interface.py` : application Streamlit.
@@ -90,6 +90,26 @@ Le second test contrôle notamment la convergence de l'équilibre bloqué, la
 décomposition force/couple, la durée exacte des profils de pression et
 l'équation de déplacement du mode masse suspendue.
 
+## Contraction avec une masse suspendue
+
+La contraction est calculée directement par rapport à la longueur de l'actionneur
+au début de l'essai :
+
+```text
+contraction(t) = L(t = 0) - L(t)
+actionnement(t) = 100 [L(t = 0) - L(t)] / L(t = 0)
+```
+
+La valeur reste signée. Une valeur positive indique une contraction et une
+valeur négative signifie que l'actionneur est plus long qu'à `t = 0`. Aucun
+témoin numérique ni aucune valeur absolue ne sont utilisés.
+
+Par défaut, la masse est appliquée avant le début de l'essai et l'état de Maxwell
+est amené à son équilibre à `0 MPa`. L'horloge est ensuite remise à zéro avant la
+montée en pression. L'option peut être désactivée pour étudier explicitement la
+récupération de la précontrainte immédiatement après la mise en charge, mais ce
+transitoire ne doit alors pas être interprété comme une relaxation due à la pression.
+
 ## Domaine d'utilisation
 
 - La pression maximale proposée par l'interface est limitée à 1,5 MPa, domaine expérimental de l'article.
@@ -122,13 +142,10 @@ tendance au mouvement produit la force calculée par le modèle.
 
 ## Comparaison avec la figure 7
 
-Le mode Maxwell généralisé reste le modèle temporel principal. Une réponse
-`Elastique instantanee` est aussi disponible comme référence sans relaxation :
-elle ne constitue pas une calibration et ne doit pas servir à représenter
-l'hystérèse. Le mode par défaut conserve plutôt un état élastique `t_k`
-séparé puis applique Maxwell aux incréments d'actionnement. Cette formulation
-rapproche simultanément les niveaux de force et le couple de la théorie publiée
-sans changer les modules du matériau.
+La Beta utilise uniquement le modèle de Maxwell généralisé. La précontrainte
+forme une base élastique conservée, puis les branches de Maxwell décrivent les
+variations de contrainte produites après le début de l'actionnement. Le mode
+élastique instantané et la précontrainte viscoélastique ne sont pas proposés.
 
 La validation distingue maintenant deux cibles : la courbe théorique noire de
 l'article et les points expérimentaux colorés. Les erreurs RMSE sont calculées
@@ -146,25 +163,50 @@ L'option de zéro initial soustrait uniquement l'offset du capteur au premier
 
 ## Condition du nylon
 
-Trois conditions discrètes sont disponibles, sans coefficient intermédiaire :
+La Beta utilise uniquement un nylon linéaire bilatéral lié aux extrémités. Il
+participe entièrement à la précontrainte et à l'actionnement, avec des facteurs
+de couplage fixés à `1`. Les modes traction seulement et glissement axial ont
+été retirés.
 
-- `Linéaire bilatéral` reproduit l'équation (4) de l'article et autorise traction et compression ;
-- `Traction seulement` annule la force lorsque le filament devient mou ;
-- `Glissant axialement` annule sa force axiale tout en conservant son confinement géométrique en flexion et torsion.
+## Intégration temporelle
 
-Le paramètre Intégration temporelle correspond à la façon dont le modèle avance dans le temps, pas après pas, pour mettre à jour la partie viscoélastique du tube. À chaque pas de temps dt, le modèle connaît une nouvelle pression, calcule une nouvelle déformation, puis met à jour les contraintes dans les branches de Maxwell.
+L'intégration temporelle détermine comment la mémoire de contrainte des branches
+de Maxwell est mise à jour entre `t` et `t + dt`. Pour chaque branche :
 
-Euler explicite de l'article met à jour séparément chaque branche :
+```text
+d sigma_i / dt = E_i d epsilon / dt - sigma_i / tau_i
+tau_i = eta_i / E_i
+```
 
-branche i à t + dt = branche i à t + effet élastique de la déformation - relaxation pendant dt
+Le temps `tau_i` contrôle la rapidité de relaxation. Le pas `dt` contrôle la
+fréquence à laquelle la pression, la déformation, la géométrie et l'équilibre
+mécanique sont recalculés. Cette intégration est donc indispensable pour obtenir
+la relaxation, l'hystérésis et la dépendance à la vitesse d'actionnement.
 
-Cette formule exige un pas inférieur à deux fois le plus petit temps de relaxation. Un pas supérieur au temps de relaxation peut déjà produire des oscillations numériques.
+`Euler explicite` approxime la dérivée au début du pas :
 
-L'intégration exponentielle cohérente utilise la décroissance exacte de chaque branche sur le pas :
+```text
+sigma_i(t + dt) = sigma_i(t)
+                  + E_i Delta epsilon
+                  - dt sigma_i(t) / tau_i
+```
 
-contrainte_i(t + dt) = exp(-dt / tau_i) contrainte_i(t) + contribution de la déformation du pas
+Cette méthode est d'ordre 1 et impose `dt < 2 tau_min`. Un pas proche de cette
+limite peut déjà créer des oscillations numériques ou des contraintes de signe
+incorrect. Un petit pas reste nécessaire pour obtenir une courbe précise.
 
-Le même opérateur tangent exponentiel est utilisé pour la condition de pression radiale et pour la mise à jour des contraintes. C'est le choix par défaut recommandé.
+`Intégration exponentielle stable` applique la décroissance exacte de la branche
+pendant le pas :
+
+```text
+sigma_i(t + dt) = exp(-dt / tau_i) sigma_i(t)
+                  + contribution de la déformation du pas
+```
+
+Elle évite l'instabilité propre à Euler pour la relaxation de Maxwell et constitue
+le choix recommandé. Elle ne rend toutefois pas un grand `dt` précis : il faut
+encore échantillonner suffisamment la rampe de pression, les changements de
+géométrie, les pics et les boucles d'hystérésis.
 
 ## actionnement libre
 Rh désigne le rayon de l’hélice, c’est-à-dire la distance entre l’axe central de l’actionneur et la ligne centrale du tube enroulé. Dans l’interface, il est affiché en mm.

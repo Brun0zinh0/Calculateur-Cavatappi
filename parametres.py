@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import shutil
 import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -18,7 +19,34 @@ P_MAX_MPA = 1.50
 P_MAX_PSI = P_MAX_MPA / PSI_TO_MPA
 DEFAULT_PARALLEL_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 
-CACHE_DIR = Path(tempfile.gettempdir()) / "tcpa_cavatappi_beta_cache"
+LEGACY_CACHE_DIR = Path(tempfile.gettempdir()) / "tcpa_cavatappi_beta_cache"
+
+
+def _select_storage_directory() -> Path:
+    candidates = []
+    if os.environ.get("CAVATAPPI_DATA_DIR"):
+        candidates.append(Path(os.environ["CAVATAPPI_DATA_DIR"]).expanduser())
+    if os.environ.get("LOCALAPPDATA"):
+        candidates.append(Path(os.environ["LOCALAPPDATA"]) / "CalculateurCavatappi" / "Beta")
+    candidates.extend(
+        [
+            Path(__file__).resolve().parent / ".cavatappi_data",
+            LEGACY_CACHE_DIR,
+        ]
+    )
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_test"
+            probe.write_bytes(b"ok")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+    return LEGACY_CACHE_DIR
+
+
+CACHE_DIR = _select_storage_directory()
 SETTINGS_PATH = CACHE_DIR / "cavatappi_beta_settings.json"
 TIMING_PROFILE_PATH = CACHE_DIR / "cavatappi_beta_timing_profile.json"
 BLOCKED_RESULT_PATH = CACHE_DIR / "cavatappi_beta_blocked.pkl"
@@ -33,17 +61,18 @@ RESULT_CACHE_PATHS = (
     SUSPENDED_RESULT_PATH,
     HYSTERESIS_RESULT_PATH,
 )
-SETTINGS_SCHEMA_VERSION = 12
+SETTINGS_SCHEMA_VERSION = 14
+SETTINGS_EXPORT_FORMAT = "cavatappi-beta-settings"
 
 INTEGRATION_OPTIONS = ["exponential", "paper_explicit"]
 VISUAL_STATE_OPTIONS = ["fabricated", "prestrained"]
 SECTION_UPDATE_OPTIONS = ["fixed", "updated"]
 BIAS_ANGLE_PROFILE_OPTIONS = ["paper_linear", "uniform_twist"]
-CONSTITUTIVE_OPTIONS = ["generalized_maxwell", "instantaneous_elastic"]
+CONSTITUTIVE_OPTIONS = ["generalized_maxwell"]
 AXIAL_MODULUS_OPTIONS = ["paper_table", "maxwell_sum"]
-PRESTRAIN_REFERENCE_OPTIONS = ["elastic_tk_reference", "viscoelastic_ramp"]
+PRESTRAIN_REFERENCE_OPTIONS = ["elastic_tk_reference"]
 MAXWELL_ANISOTROPY_OPTIONS = ["axial_test_only", "paper_equal"]
-NYLON_CONDITION_OPTIONS = ["bonded_linear", "tension_only", "axially_sliding_confined"]
+NYLON_CONDITION_OPTIONS = ["bonded_linear"]
 PRESSURE_INPUT_OPTIONS = ["generated", "measured_csv"]
 
 INTEGRATION_LABELS = {
@@ -64,7 +93,6 @@ BIAS_ANGLE_PROFILE_LABELS = {
 }
 CONSTITUTIVE_LABELS = {
     "generalized_maxwell": "Maxwell généralisé",
-    "instantaneous_elastic": "Élastique instantané",
 }
 AXIAL_MODULUS_LABELS = {
     "paper_table": "Module axial saisi manuellement",
@@ -72,7 +100,6 @@ AXIAL_MODULUS_LABELS = {
 }
 PRESTRAIN_REFERENCE_LABELS = {
     "elastic_tk_reference": "Précontrainte élastique conservée",
-    "viscoelastic_ramp": "Précontrainte viscoélastique",
 }
 MAXWELL_ANISOTROPY_LABELS = {
     "axial_test_only": "Relaxation limitée à la direction axiale",
@@ -80,8 +107,6 @@ MAXWELL_ANISOTROPY_LABELS = {
 }
 NYLON_CONDITION_LABELS = {
     "bonded_linear": "Linéaire bilatéral, lié aux extrémités",
-    "tension_only": "Filament non collé, traction seulement",
-    "axially_sliding_confined": "Glissant axialement, confiné dans le tube",
 }
 PRESSURE_INPUT_LABELS = {
     "generated": "Profil généré par le modèle",
@@ -128,6 +153,7 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "suspended_duration_s": 120.0,
     "suspended_pressure_rate_mpa_s": 0.10,
     "suspended_hold_pressure": False,
+    "suspended_equilibrate_before_pressure": True,
     "suspended_show_geometry_plot": False,
     "dt": 0.5,
     "pre_steps": 24,
@@ -243,7 +269,168 @@ def option_index(options: list[str], value: object) -> int:
         return 0
 
 
+def _migrate_legacy_storage() -> None:
+    """Recopie une seule fois les anciennes données conservées dans le dossier temporaire."""
+    if CACHE_DIR == LEGACY_CACHE_DIR or not LEGACY_CACHE_DIR.exists():
+        return
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "cavatappi_beta_settings.json",
+        "cavatappi_beta_timing_profile.json",
+        "cavatappi_beta_blocked.pkl",
+        "cavatappi_beta_relaxation.pkl",
+        "cavatappi_beta_prestrain.pkl",
+        "cavatappi_beta_suspended.pkl",
+        "cavatappi_beta_hysteresis.pkl",
+    ):
+        source = LEGACY_CACHE_DIR / name
+        destination = CACHE_DIR / name
+        if source.is_file() and not destination.exists():
+            try:
+                shutil.copy2(source, destination)
+            except OSError:
+                pass
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _coerce_setting(key: str, value: Any) -> SettingValue:
+    default = DEFAULT_SETTINGS[key]
+    if isinstance(default, bool):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1", "oui", "yes"}:
+                return True
+            if normalized in {"false", "0", "non", "no"}:
+                return False
+            raise ValueError(f"Valeur booléenne invalide pour '{key}'.")
+        return bool(value)
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, float):
+        converted = float(value)
+        if not np.isfinite(converted):
+            raise ValueError(f"Valeur non finie pour '{key}'.")
+        return converted
+    return str(value)
+
+
+def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
+    """Fusionne, convertit et verrouille les options constitutives de la version Beta."""
+    if not isinstance(saved, dict):
+        raise ValueError("Le contenu des paramètres doit être un objet JSON.")
+
+    settings = dict(DEFAULT_SETTINGS)
+    for key in settings.keys() & saved.keys():
+        settings[key] = _coerce_setting(key, saved[key])
+
+    settings["_settings_schema_version"] = SETTINGS_SCHEMA_VERSION
+    settings["constitutive_mode"] = "generalized_maxwell"
+    settings["prestrain_reference_mode"] = "elastic_tk_reference"
+    settings["nylon_condition_mode"] = "bonded_linear"
+    settings["nylon_axial_prestrain_coupling"] = 1.0
+    settings["nylon_axial_actuation_coupling"] = 1.0
+    settings["nylon_scale"] = 1.0
+    settings["parallel_workers"] = max(1, min(int(settings["parallel_workers"]), max(1, os.cpu_count() or 1)))
+
+    bounded_values = {
+        "eps": (0.0, 1.5),
+        "eps_study_min": (0.0, 3.0),
+        "eps_study_max": (0.0, 3.0),
+        "eps_study_points": (2.0, 60.0),
+        "p_max_mpa": (0.0, P_MAX_MPA),
+        "rout_mm": (0.05, 5.0),
+        "rin_mm": (0.01, 4.0),
+        "nylon_diameter_mm": (0.01, 4.0),
+        "rho0_mm": (0.05, 10.0),
+        "alpha0_deg": (0.1, 85.0),
+        "theta_f_deg": (0.0, 89.0),
+        "initial_length_mm": (1.0, 500.0),
+        "n_cycles": (1.0, 60.0),
+        "duration_s": (1.0, 5000.0),
+        "flow_rate_mL_min": (0.01, 200.0),
+        "volume_mL": (0.001, 100.0),
+        "relaxation_ramp_time_s": (0.01, 1000.0),
+        "relaxation_hold_time_s": (0.0, 5000.0),
+        "suspended_mass_g": (0.1, 5000.0),
+        "suspended_duration_s": (0.1, 5000.0),
+        "suspended_pressure_rate_mpa_s": (0.001, 10.0),
+        "dt": (0.01, 20.0),
+        "pre_steps": (1.0, 240.0),
+        "n_layers": (1.0, 30.0),
+        "n_phi": (4.0, 120.0),
+        "parallel_workers": (1.0, float(max(1, os.cpu_count() or 1))),
+        "E_axial_mpa": (0.001, 10000.0),
+        "E_radius_mpa": (0.001, 10000.0),
+        "G12_mpa": (0.001, 10000.0),
+        "maxwell_E0_mpa": (0.0, 10000.0),
+        "maxwell_E1_mpa": (0.0, 10000.0),
+        "maxwell_E2_mpa": (0.0, 10000.0),
+        "maxwell_E3_mpa": (0.0, 10000.0),
+        "maxwell_eta1_mpa_s": (1.0e-9, 1.0e9),
+        "maxwell_eta2_mpa_s": (1.0e-9, 1.0e9),
+        "maxwell_eta3_mpa_s": (1.0e-9, 1.0e9),
+        "E_nylon_mpa": (0.001, 100000.0),
+        "G_nylon_mpa": (0.001, 100000.0),
+        "nu12": (-0.49, 0.49),
+        "nu23": (-0.49, 0.49),
+        "view_elev_deg": (0.0, 90.0),
+        "view_azim_deg": (-180.0, 180.0),
+    }
+    for key, (lower, upper) in bounded_values.items():
+        value = float(settings[key])
+        if not lower <= value <= upper:
+            raise ValueError(f"Le paramètre '{key}' doit être compris entre {lower:g} et {upper:g}.")
+
+    for key, options in (
+        ("integration", INTEGRATION_OPTIONS),
+        ("bias_angle_profile", BIAS_ANGLE_PROFILE_OPTIONS),
+        ("section_update_mode", SECTION_UPDATE_OPTIONS),
+        ("axial_modulus_mode", AXIAL_MODULUS_OPTIONS),
+        ("maxwell_anisotropy_mode", MAXWELL_ANISOTROPY_OPTIONS),
+        ("pressure_input_mode", PRESSURE_INPUT_OPTIONS),
+    ):
+        if str(settings[key]) not in options:
+            raise ValueError(f"Option inconnue pour '{key}'.")
+
+    error = settings_error(settings)
+    if error:
+        raise ValueError(error)
+    return settings
+
+
+def parse_settings_export(payload: bytes | str) -> dict[str, SettingValue]:
+    try:
+        raw = payload.decode("utf-8-sig") if isinstance(payload, bytes) else payload
+        document = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Le fichier de paramètres n'est pas un JSON valide.") from exc
+    if not isinstance(document, dict):
+        raise ValueError("Le fichier de paramètres doit contenir un objet JSON.")
+    if "settings" in document:
+        if document.get("format") != SETTINGS_EXPORT_FORMAT:
+            raise ValueError("Ce fichier n'est pas un export de paramètres Cavatappi Beta.")
+        document = document["settings"]
+    return normalize_settings(document)
+
+
 def load_settings() -> dict[str, SettingValue]:
+    _migrate_legacy_storage()
     try:
         with SETTINGS_PATH.open("r", encoding="utf-8") as file:
             saved = json.load(file)
@@ -269,7 +456,7 @@ def load_settings() -> dict[str, SettingValue]:
         saved["p_max_mpa"] = min(float(saved.get("p_max_mpa", P_MAX_MPA)), P_MAX_MPA)
         saved["section_update_mode"] = DEFAULT_SETTINGS["section_update_mode"]
         saved["bias_angle_profile"] = DEFAULT_SETTINGS["bias_angle_profile"]
-        saved.setdefault("constitutive_mode", DEFAULT_SETTINGS["constitutive_mode"])
+        saved["constitutive_mode"] = DEFAULT_SETTINGS["constitutive_mode"]
         saved["axial_modulus_mode"] = DEFAULT_SETTINGS["axial_modulus_mode"]
         saved["prestrain_reference_mode"] = DEFAULT_SETTINGS["prestrain_reference_mode"]
         saved["maxwell_anisotropy_mode"] = DEFAULT_SETTINGS["maxwell_anisotropy_mode"]
@@ -280,33 +467,21 @@ def load_settings() -> dict[str, SettingValue]:
         saved.setdefault("pressure_input_mode", DEFAULT_SETTINGS["pressure_input_mode"])
         saved["_settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
-    settings = dict(DEFAULT_SETTINGS)
-    settings.update({key: saved[key] for key in settings.keys() & saved.keys()})
-    for key in (
-        "n_cycles",
-        "hysteresis_cycle",
-        "eps_study_points",
-        "n_layers",
-        "n_phi",
-        "pre_steps",
-        "parallel_workers",
-    ):
-        settings[key] = int(settings[key])
-    for key in (
-        "use_fixed_duration",
-        "nonlinear_pressure",
-        "measured_pressure_subtract_initial",
-        "suspended_hold_pressure",
-        "suspended_show_geometry_plot",
-    ):
-        settings[key] = bool(settings[key])
-    return settings
+    try:
+        return normalize_settings(saved)
+    except (TypeError, ValueError):
+        return dict(DEFAULT_SETTINGS)
 
 
 def save_settings(settings: dict[str, SettingValue]) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with SETTINGS_PATH.open("w", encoding="utf-8") as file:
-        json.dump(settings, file, indent=2, sort_keys=True)
+    normalized = normalize_settings(settings)
+    payload = json.dumps(normalized, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    try:
+        if SETTINGS_PATH.read_bytes() == payload:
+            return
+    except OSError:
+        pass
+    _atomic_write(SETTINGS_PATH, payload)
 
 
 def reset_settings_and_cache() -> dict[str, SettingValue]:
@@ -321,6 +496,7 @@ def reset_settings_and_cache() -> dict[str, SettingValue]:
 
 
 def load_result_cache(path: Path) -> Any | None:
+    _migrate_legacy_storage()
     try:
         with path.open("rb") as file:
             return pickle.load(file)
@@ -329,9 +505,7 @@ def load_result_cache(path: Path) -> Any | None:
 
 
 def save_result_cache(path: Path, payload: Any) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as file:
-        pickle.dump(payload, file)
+    _atomic_write(path, pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 def geometry_error(settings: dict[str, SettingValue]) -> str | None:
@@ -440,16 +614,16 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
         return "Le mode de mise à jour de section est inconnu."
     if str(settings.get("bias_angle_profile")) not in BIAS_ANGLE_PROFILE_OPTIONS:
         return "Le profil radial de l'angle de biais est inconnu."
-    if str(settings.get("constitutive_mode")) not in CONSTITUTIVE_OPTIONS:
-        return "Le mode constitutif est inconnu."
+    if str(settings.get("constitutive_mode")) != "generalized_maxwell":
+        return "La version Beta utilise uniquement le modèle de Maxwell généralisé."
     if str(settings.get("axial_modulus_mode")) not in AXIAL_MODULUS_OPTIONS:
         return "La convention du module axial est inconnue."
-    if str(settings.get("prestrain_reference_mode")) not in PRESTRAIN_REFERENCE_OPTIONS:
-        return "Le mode de traitement de la précontrainte est inconnu."
+    if str(settings.get("prestrain_reference_mode")) != "elastic_tk_reference":
+        return "La version Beta utilise uniquement une précontrainte élastique conservée."
     if str(settings.get("maxwell_anisotropy_mode")) not in MAXWELL_ANISOTROPY_OPTIONS:
         return "Le mode d'anisotropie viscoelastique est inconnu."
-    if str(settings.get("nylon_condition_mode")) not in NYLON_CONDITION_OPTIONS:
-        return "La condition physique du nylon est inconnue."
+    if str(settings.get("nylon_condition_mode")) != "bonded_linear":
+        return "La version Beta utilise uniquement un nylon linéaire bilatéral lié aux extrémités."
     if str(settings.get("pressure_input_mode", "generated")) not in PRESSURE_INPUT_OPTIONS:
         return "La source de pression est inconnue."
     for key in ("nylon_axial_prestrain_coupling", "nylon_axial_actuation_coupling"):
@@ -548,11 +722,7 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         E3=float(settings["maxwell_E3_mpa"]),
         eta3=float(settings["maxwell_eta3_mpa_s"]),
     )
-    constitutive_mode = str(settings.get("constitutive_mode", "generalized_maxwell"))
-    if constitutive_mode == "instantaneous_elastic":
-        maxwell = replace(maxwell, E0=maxwell.E_total, E1=0.0, E2=0.0, E3=0.0)
-    elif constitutive_mode != "generalized_maxwell":
-        raise ValueError("Mode constitutif inconnu.")
+    constitutive_mode = "generalized_maxwell"
     axial_modulus_mode = str(settings.get("axial_modulus_mode", "maxwell_sum"))
     if axial_modulus_mode == "maxwell_sum":
         E_axial = maxwell.E_total
@@ -570,13 +740,9 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         E_nylon=float(settings["E_nylon_mpa"]),
         G_nylon=float(settings["G_nylon_mpa"]),
         maxwell_anisotropy_mode=str(settings.get("maxwell_anisotropy_mode", "paper_equal")),
-        nylon_condition_mode=str(settings.get("nylon_condition_mode", "bonded_linear")),
-        nylon_axial_prestrain_coupling=(
-            0.0 if str(settings.get("nylon_condition_mode")) == "axially_sliding_confined" else 1.0
-        ),
-        nylon_axial_actuation_coupling=(
-            0.0 if str(settings.get("nylon_condition_mode")) == "axially_sliding_confined" else 1.0
-        ),
+        nylon_condition_mode="bonded_linear",
+        nylon_axial_prestrain_coupling=1.0,
+        nylon_axial_actuation_coupling=1.0,
     )
     geom = GeometryParams(
         Rout=float(settings["rout_mm"]),
@@ -601,7 +767,7 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
             n_phi=int(settings["n_phi"]),
             pre_steps=int(settings["pre_steps"]),
             integration=str(settings["integration"]),
-            prestrain_reference_mode=str(settings.get("prestrain_reference_mode", "elastic_tk_reference")),
+            prestrain_reference_mode="elastic_tk_reference",
             constitutive_mode=constitutive_mode,
             axial_modulus_mode=axial_modulus_mode,
             flow_rate_mL_min=float(settings["flow_rate_mL_min"]),

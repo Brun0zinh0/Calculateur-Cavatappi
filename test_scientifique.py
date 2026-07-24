@@ -6,6 +6,7 @@ Exécution : python test_scientifique.py
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from io import StringIO
 import sys
 from pathlib import Path
@@ -86,7 +87,52 @@ def test_suspended_equation_24() -> None:
     )
     assert np.max(np.abs(expected_length - data["axial_length_mm"])) < 1.0e-10
     assert data["free_contraction_mm"][0] == 0.0
+    assert np.allclose(
+        data["free_contraction_mm"],
+        data["reference_axial_length_mm"] - data["axial_length_mm"],
+    )
+    assert "zero_pressure_baseline_length_mm" not in data
     assert np.max(data["residual"]) < 1.0e-4
+
+
+def test_suspended_unloading_returns_toward_t0() -> None:
+    settings = dict(parametres.DEFAULT_SETTINGS)
+    settings.update({"eps": 0.8, "dt": 2.0, "n_layers": 1, "n_phi": 4, "pre_steps": 2})
+    config = parametres.build_config(settings)
+    time = np.arange(0.0, 122.0, config.dt)
+    pressure = np.where(
+        time <= 15.0,
+        0.1 * time,
+        np.where(time <= 30.0, 0.1 * (30.0 - time), 0.0),
+    )
+    pressure = np.clip(pressure, 0.0, 1.5)
+    _, data = Base.run_suspended_actuation(
+        config,
+        load_N=0.981,
+        pressure_time=time,
+        pressure_MPa=pressure,
+    )
+    corrected = np.asarray(data["free_contraction_mm"], dtype=float)
+    assert abs(corrected[-1]) < 0.1 * np.max(np.abs(corrected))
+    assert np.min(corrected[(pressure == 0.0) & (time > 0.0)]) < 0.0
+
+
+def test_suspended_held_pressure_relaxes_toward_extension() -> None:
+    settings = dict(parametres.DEFAULT_SETTINGS)
+    settings.update({"eps": 0.8, "dt": 2.0, "n_layers": 1, "n_phi": 4, "pre_steps": 2})
+    config = parametres.build_config(settings)
+    time = np.arange(0.0, 122.0, config.dt)
+    pressure = np.minimum(0.1 * time, 1.5)
+    _, data = Base.run_suspended_actuation(
+        config,
+        load_N=0.981,
+        pressure_time=time,
+        pressure_MPa=pressure,
+    )
+    hold_index = int(np.flatnonzero(pressure >= 1.5)[0])
+    assert data["axial_length_mm"][-1] > data["axial_length_mm"][hold_index]
+    assert data["free_contraction_mm"][-1] < data["free_contraction_mm"][hold_index]
+    assert bool(data["suspended_load_equilibrated"])
 
 
 def test_input_guards() -> None:
@@ -146,17 +192,55 @@ def test_tk_reference_state() -> None:
     assert np.max(np.abs(model.sigma_reference - reference_before)) == 0.0
 
 
-def test_nylon_physical_modes() -> None:
+def test_fixed_constitutive_prestrain_and_nylon_modes() -> None:
     settings = dict(parametres.DEFAULT_SETTINGS)
-    settings.update({"nylon_condition_mode": "tension_only", "n_layers": 1, "n_phi": 4, "pre_steps": 1})
+    settings.update(
+        {
+            "constitutive_mode": "instantaneous_elastic",
+            "prestrain_reference_mode": "viscoelastic_ramp",
+            "nylon_condition_mode": "tension_only",
+            "n_layers": 1,
+            "n_phi": 4,
+            "pre_steps": 1,
+        }
+    )
     config = parametres.build_config(settings)
+    assert config.constitutive_mode == "generalized_maxwell"
+    assert config.prestrain_reference_mode == "elastic_tk_reference"
+    assert config.mat.nylon_condition_mode == "bonded_linear"
+    assert config.mat.nylon_axial_prestrain_coupling == 1.0
+    assert config.mat.nylon_axial_actuation_coupling == 1.0
+    assert parametres.settings_error(settings) is not None
     model = Base.TCPAMaxwellBlockedModel(
         mat=config.mat,
         geom=config.geom,
         disc=Base.default_discretization(n_layers=1, n_phi=4, pre_steps=1),
         prestrain_reference_mode=config.prestrain_reference_mode,
     )
-    assert model._next_nylon_axial_force(-0.01, 1.0) == 0.0
+    assert model._next_nylon_axial_force(-0.01, 1.0) < 0.0
+
+    try:
+        Base.TCPAMaxwellBlockedModel(
+            mat=replace(config.mat, nylon_condition_mode="tension_only"),
+            geom=config.geom,
+            disc=Base.default_discretization(n_layers=1, n_phi=4, pre_steps=1),
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Le moteur Beta aurait dû refuser une ancienne condition du nylon.")
+
+    try:
+        Base.TCPAMaxwellBlockedModel(
+            mat=config.mat,
+            geom=config.geom,
+            disc=Base.default_discretization(n_layers=1, n_phi=4, pre_steps=1),
+            prestrain_reference_mode="viscoelastic_ramp",
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Le moteur Beta aurait dû refuser une précontrainte non élastique.")
 
 
 def test_measured_pressure_csv() -> None:
@@ -206,10 +290,12 @@ def main() -> None:
         test_pressure_histories,
         test_blocked_equilibrium,
         test_suspended_equation_24,
+        test_suspended_unloading_returns_toward_t0,
+        test_suspended_held_pressure_relaxes_toward_extension,
         test_input_guards,
         test_paper_physical_conventions,
         test_tk_reference_state,
-        test_nylon_physical_modes,
+        test_fixed_constitutive_prestrain_and_nylon_modes,
         test_measured_pressure_csv,
         test_result_csv_exports,
     )
