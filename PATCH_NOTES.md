@@ -36,3 +36,10 @@ Pour finir la possibilité d'exporter les résultats en fichier CSV pour les tra
 - LisibilitÃ© corrigÃ©e dans la coupe du tube, notamment l'annotation du diamÃ¨tre du nylon.
 - Progression, estimation de durÃ©e, rÃ©initialisation et messages d'Ã©tat amÃ©liorÃ©s.
 - Conservation des modes constitutifs fixes de la Beta et renforcement des validations d'entrÃ©e.
+
+## Mise Ã  jour visuelle du visualiseur 3D (28 juillet 2026)
+
+- Le tube PVC utilise dÃ©sormais un rendu blanc cassÃ© semi-transparent.
+- Les ombres, reflets et contours ont Ã©tÃ© retravaillÃ©s pour amÃ©liorer la perception de la gÃ©omÃ©trie.
+- Un liserÃ© discret distingue les Ã©tats fabriquÃ© et prÃ©contraint.
+- Le rendu a Ã©tÃ© vÃ©rifiÃ© sur ordinateur et mobile, ainsi que pendant la rotation interactive.

@@ -337,7 +337,8 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
         "pitch": pitch,
         "elev": float(settings.get("view_elev_deg", 22.0)),
         "azim": float(settings.get("view_azim_deg", -58.0)),
-        "color": "#1778c8" if state == "fabricated" else "#d63b32",
+        "tubeColor": "#f2eee3",
+        "accentColor": "#67b7f7" if state == "fabricated" else "#f07167",
         "title": f"Géométrie du Cavatappi - {VISUAL_STATE_LABELS.get(state, state)}",
     }
     payload = json.dumps(config, ensure_ascii=False).replace("<", "\\u003c")
@@ -357,9 +358,9 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     width: 100%;
     height: 552px;
     overflow: hidden;
-    border: 1px solid rgba(128, 128, 128, 0.32);
+    border: 1px solid rgba(204, 199, 184, 0.24);
     border-radius: 6px;
-    background: rgba(255, 255, 255, 0.015);
+    background: rgba(246, 242, 232, 0.025);
   }
   @media (max-width: 600px) {
     #viewer { height: 420px; }
@@ -480,7 +481,10 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
       grid: dark ? "rgba(174,184,199,0.16)" : "rgba(76,91,110,0.14)",
       gridMajor: dark ? "rgba(174,184,199,0.28)" : "rgba(76,91,110,0.25)",
       backdrop: dark ? "rgba(16,18,24,0.90)" : "rgba(255,255,255,0.90)",
-      inner: dark ? "#f1f3f6" : "#ffffff",
+      tubeEdge: dark ? "rgba(249,245,234,0.84)" : "rgba(104,99,87,0.72)",
+      tubeShadow: dark ? "rgba(0,0,0,0.34)" : "rgba(52,49,43,0.20)",
+      tubeHighlight: dark ? "rgba(255,253,247,0.34)" : "rgba(255,255,255,0.50)",
+      inner: dark ? "rgba(177,184,194,0.86)" : "rgba(72,79,88,0.72)",
       nylon: "#e48a21"
     };
   }
@@ -573,7 +577,7 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     return `rgba(${adjusted[0]},${adjusted[1]},${adjusted[2]},${alpha})`;
   }
 
-  function drawDepthShadedHelix(project, baseWidth) {
+  function drawDepthShadedHelix(project, baseWidth, colors) {
     const points = helix.map(project.point);
     const radialDepths = points.map((point, index) => {
       const axisPoint = project.point([0, 0, helix[index][2]]);
@@ -603,8 +607,8 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     ctx.lineCap = "round";
     ctx.lineJoin = "round";
     for (const segment of segments) {
-      ctx.strokeStyle = `rgba(3,8,14,${0.10 + 0.08 * segment.proximity})`;
-      ctx.lineWidth = segment.width + 1.7;
+      ctx.strokeStyle = colors.tubeShadow;
+      ctx.lineWidth = segment.width + 2.4;
       ctx.beginPath();
       ctx.moveTo(segment.a[0], segment.a[1]);
       ctx.lineTo(segment.b[0], segment.b[1]);
@@ -612,9 +616,9 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     }
     for (const segment of segments) {
       ctx.strokeStyle = shadedColor(
-        cfg.color,
-        0.66 + 0.48 * segment.proximity,
-        0.88 + 0.12 * segment.proximity
+        cfg.tubeColor,
+        0.74 + 0.30 * segment.proximity,
+        0.62 + 0.20 * segment.proximity
       );
       ctx.lineWidth = segment.width;
       ctx.beginPath();
@@ -623,8 +627,20 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
       ctx.stroke();
     }
     for (const segment of segments) {
-      ctx.strokeStyle = `rgba(255,255,255,${0.04 + 0.18 * segment.proximity})`;
-      ctx.lineWidth = Math.max(0.65, 0.13 * segment.width);
+      ctx.strokeStyle = colors.tubeHighlight;
+      ctx.lineWidth = Math.max(0.75, 0.22 * segment.width);
+      ctx.beginPath();
+      ctx.moveTo(segment.a[0], segment.a[1]);
+      ctx.lineTo(segment.b[0], segment.b[1]);
+      ctx.stroke();
+    }
+    for (const segment of segments) {
+      ctx.strokeStyle = shadedColor(
+        cfg.accentColor,
+        0.88 + 0.12 * segment.proximity,
+        0.07 + 0.05 * segment.proximity
+      );
+      ctx.lineWidth = Math.max(0.55, 0.07 * segment.width);
       ctx.beginPath();
       ctx.moveTo(segment.a[0], segment.a[1]);
       ctx.lineTo(segment.b[0], segment.b[1]);
@@ -787,7 +803,12 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     const minDepth = Math.min(...endDepths);
     const maxDepth = Math.max(...endDepths);
     const proximity = (depth - minDepth) / Math.max(maxDepth - minDepth, 1e-9);
-    strokePolyline(outer, shadedColor(cfg.color, 0.62 + 0.48 * proximity), 2.4);
+    strokePolyline(
+      outer,
+      shadedColor(cfg.tubeColor, 0.76 + 0.24 * proximity, 0.90),
+      3.0
+    );
+    strokePolyline(outer, shadedColor(cfg.accentColor, 1.0, 0.72), 1.0);
     strokePolyline(inner, colors.inner, 2.0);
     if (cfg.nylonRadius > 0) {
       const nylon = ringPoints(center, Math.min(cfg.nylonRadius, cfg.rin), tangent).map(project.point);
@@ -830,7 +851,7 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
       return leftDepth - rightDepth;
     });
     drawEndSection(project, colors, endOrder[0]);
-    drawDepthShadedHelix(project, tubeWidth);
+    drawDepthShadedHelix(project, tubeWidth, colors);
     drawEndSection(project, colors, endOrder[1]);
 
     const lengthX = outerRadius + dimPad;
