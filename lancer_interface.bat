@@ -20,7 +20,7 @@ if errorlevel 1 (
 %PYTHON_CMD% -c "import sys; sys.path.insert(0, sys.argv[1]); import parametres as p; assert hasattr(p, 'MAXWELL_ANISOTROPY_LABELS'), 'parametres.py est incomplet'" "%~dp0"
 if errorlevel 1 (
     echo.
-    echo ERREUR : les fichiers du dossier Beta sont incomplets ou incompatibles.
+    echo ERREUR : les fichiers du dossier Alpha V2 sont incomplets ou incompatibles.
     echo Verifiez que lancer_interface.bat, interface.py et parametres.py proviennent de la meme version.
     pause
     exit /b 1

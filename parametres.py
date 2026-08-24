@@ -19,7 +19,7 @@ P_MAX_MPA = 1.50
 P_MAX_PSI = P_MAX_MPA / PSI_TO_MPA
 DEFAULT_PARALLEL_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 
-LEGACY_CACHE_DIR = Path(tempfile.gettempdir()) / "tcpa_cavatappi_beta_cache"
+LEGACY_CACHE_DIR = Path(tempfile.gettempdir()) / "tcpa_cavatappi_alpha_v2_cache"
 
 
 def _select_storage_directory() -> Path:
@@ -27,7 +27,7 @@ def _select_storage_directory() -> Path:
     if os.environ.get("CAVATAPPI_DATA_DIR"):
         candidates.append(Path(os.environ["CAVATAPPI_DATA_DIR"]).expanduser())
     if os.environ.get("LOCALAPPDATA"):
-        candidates.append(Path(os.environ["LOCALAPPDATA"]) / "CalculateurCavatappi" / "Beta")
+        candidates.append(Path(os.environ["LOCALAPPDATA"]) / "CalculateurCavatappi" / "AlphaV2")
     candidates.extend(
         [
             Path(__file__).resolve().parent / ".cavatappi_data",
@@ -47,13 +47,13 @@ def _select_storage_directory() -> Path:
 
 
 CACHE_DIR = _select_storage_directory()
-SETTINGS_PATH = CACHE_DIR / "cavatappi_beta_settings.json"
-TIMING_PROFILE_PATH = CACHE_DIR / "cavatappi_beta_timing_profile.json"
-BLOCKED_RESULT_PATH = CACHE_DIR / "cavatappi_beta_blocked.pkl"
-RELAXATION_RESULT_PATH = CACHE_DIR / "cavatappi_beta_relaxation.pkl"
-PRESTRAIN_RESULT_PATH = CACHE_DIR / "cavatappi_beta_prestrain.pkl"
-SUSPENDED_RESULT_PATH = CACHE_DIR / "cavatappi_beta_suspended.pkl"
-HYSTERESIS_RESULT_PATH = CACHE_DIR / "cavatappi_beta_hysteresis.pkl"
+SETTINGS_PATH = CACHE_DIR / "cavatappi_alpha_v2_settings.json"
+TIMING_PROFILE_PATH = CACHE_DIR / "cavatappi_alpha_v2_timing_profile.json"
+BLOCKED_RESULT_PATH = CACHE_DIR / "cavatappi_alpha_v2_blocked.pkl"
+RELAXATION_RESULT_PATH = CACHE_DIR / "cavatappi_alpha_v2_relaxation.pkl"
+PRESTRAIN_RESULT_PATH = CACHE_DIR / "cavatappi_alpha_v2_prestrain.pkl"
+SUSPENDED_RESULT_PATH = CACHE_DIR / "cavatappi_alpha_v2_suspended.pkl"
+HYSTERESIS_RESULT_PATH = CACHE_DIR / "cavatappi_alpha_v2_hysteresis.pkl"
 RESULT_CACHE_PATHS = (
     BLOCKED_RESULT_PATH,
     RELAXATION_RESULT_PATH,
@@ -61,17 +61,29 @@ RESULT_CACHE_PATHS = (
     SUSPENDED_RESULT_PATH,
     HYSTERESIS_RESULT_PATH,
 )
-SETTINGS_SCHEMA_VERSION = 14
-SETTINGS_EXPORT_FORMAT = "cavatappi-beta-settings"
+SETTINGS_SCHEMA_VERSION = 16
+SETTINGS_EXPORT_FORMAT = "cavatappi-alpha-v2-settings"
 
 INTEGRATION_OPTIONS = ["exponential", "paper_explicit"]
 VISUAL_STATE_OPTIONS = ["fabricated", "prestrained"]
 SECTION_UPDATE_OPTIONS = ["fixed", "updated"]
 BIAS_ANGLE_PROFILE_OPTIONS = ["paper_linear", "uniform_twist"]
+UNCOILED_COMPLIANCE_OPTIONS = ["tangent_beam", "axial_rod"]
 CONSTITUTIVE_OPTIONS = ["generalized_maxwell"]
 AXIAL_MODULUS_OPTIONS = ["paper_table", "maxwell_sum"]
-PRESTRAIN_REFERENCE_OPTIONS = ["elastic_tk_reference"]
+# viscoelastic_history = schema de l'article : branches de Maxwell actives des
+# la phase d'elongation (20 mm/min), aucune reference elastique conservee.
+# (audit 2026-08, item 3.2)
+PRESTRAIN_REFERENCE_OPTIONS = ["elastic_tk_reference", "viscoelastic_history"]
+PRESTRAIN_REFERENCE_LABELS = {
+    "elastic_tk_reference": "Référence élastique conservée (défaut historique)",
+    "viscoelastic_history": "Histoire viscoélastique complète (schéma de l'article)",
+}
 MAXWELL_ANISOTROPY_OPTIONS = ["axial_test_only", "paper_equal"]
+# paper_crossed = lettre (probablement coquillee) des articles : nu(s->phi)
+# applique sur eps_r et nu(s->r) sur eps_phi ; physical = appariement physique.
+# Impact mesure de l'echange : <= 1,5 % sur le couple. (audit 2026-08, 3.4)
+POISSON_PAIRING_OPTIONS = ["paper_crossed", "physical"]
 NYLON_CONDITION_OPTIONS = ["bonded_linear"]
 PRESSURE_INPUT_OPTIONS = ["generated", "measured_csv"]
 
@@ -90,6 +102,10 @@ SECTION_UPDATE_LABELS = {
 BIAS_ANGLE_PROFILE_LABELS = {
     "paper_linear": "Variation linéaire avec le rayon",
     "uniform_twist": "Torsion uniforme (loi en tangente)",
+}
+UNCOILED_COMPLIANCE_LABELS = {
+    "tangent_beam": "Traction et flexion au raccord",
+    "axial_rod": "Traction axiale uniquement",
 }
 CONSTITUTIVE_LABELS = {
     "generalized_maxwell": "Maxwell généralisé",
@@ -128,6 +144,8 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "alpha0_deg": 10.53,
     "theta_f_deg": 37.91,
     "initial_length_mm": 32.45,
+    "uncoiled_length_mm": 0.0,
+    "uncoiled_compliance_mode": "tangent_beam",
     "bias_angle_profile": "paper_linear",
     "section_update_mode": "fixed",
     "n_cycles": 11,
@@ -141,6 +159,9 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "flow_rate_mL_min": 10.0,
     "volume_mL": 1.50,
     "nonlinear_pressure": False,
+    "show_temporal_torque": True,
+    "overlay_temporal_pressure": False,
+    "experimental_overlay_single_graph": True,
     "pressure_input_mode": "generated",
     "measured_pressure_time_column": "",
     "measured_pressure_column": "",
@@ -161,6 +182,7 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "prestrain_reference_mode": "elastic_tk_reference",
     "constitutive_mode": "generalized_maxwell",
     "maxwell_anisotropy_mode": "paper_equal",
+    "poisson_pairing": "paper_crossed",
     "axial_modulus_mode": "maxwell_sum",
     "E_axial_mpa": 31.24,
     "E_radius_mpa": 8.82,
@@ -222,6 +244,7 @@ class MaterialParams:
     E_nylon: float = 3.69e3
     G_nylon: float = 0.79e3
     maxwell_anisotropy_mode: str = "paper_equal"
+    poisson_pairing: str = "paper_crossed"
     nylon_condition_mode: str = "bonded_linear"
     nylon_axial_prestrain_coupling: float = 1.0
     nylon_axial_actuation_coupling: float = 1.0
@@ -236,6 +259,8 @@ class GeometryParams:
     alpha0_deg: float = 10.53
     theta_f_deg: float = 37.91
     initial_length: float = 32.45
+    uncoiled_length: float = 0.0
+    uncoiled_compliance_mode: str = "tangent_beam"
     bias_angle_profile: str = "paper_linear"
     section_update_mode: str = "fixed"
 
@@ -256,7 +281,10 @@ class SimulationParams:
     axial_modulus_mode: str = "maxwell_sum"
     flow_rate_mL_min: float = 10.0
     volume_mL: float = 1.50
-    nonlinear_pressure: bool = True
+    # Defaut lineaire, aligne sur DEFAULT_SETTINGS et le README (l'ancien
+    # defaut True de cette dataclass contredisait les autres points d'entree).
+    # (audit 2026-08, item 2.4)
+    nonlinear_pressure: bool = False
     nylon_stiffness_scale: float = 1.0
     mat: MaterialParams = field(default_factory=MaterialParams)
     geom: GeometryParams = field(default_factory=GeometryParams)
@@ -275,13 +303,13 @@ def _migrate_legacy_storage() -> None:
         return
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for name in (
-        "cavatappi_beta_settings.json",
-        "cavatappi_beta_timing_profile.json",
-        "cavatappi_beta_blocked.pkl",
-        "cavatappi_beta_relaxation.pkl",
-        "cavatappi_beta_prestrain.pkl",
-        "cavatappi_beta_suspended.pkl",
-        "cavatappi_beta_hysteresis.pkl",
+        "cavatappi_alpha_v2_settings.json",
+        "cavatappi_alpha_v2_timing_profile.json",
+        "cavatappi_alpha_v2_blocked.pkl",
+        "cavatappi_alpha_v2_relaxation.pkl",
+        "cavatappi_alpha_v2_prestrain.pkl",
+        "cavatappi_alpha_v2_suspended.pkl",
+        "cavatappi_alpha_v2_hysteresis.pkl",
     ):
         source = LEGACY_CACHE_DIR / name
         destination = CACHE_DIR / name
@@ -331,7 +359,7 @@ def _coerce_setting(key: str, value: Any) -> SettingValue:
 
 
 def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
-    """Fusionne, convertit et verrouille les options constitutives de la version Beta."""
+    """Fusionne, convertit et verrouille les options constitutives d'Alpha V2."""
     if not isinstance(saved, dict):
         raise ValueError("Le contenu des paramètres doit être un objet JSON.")
 
@@ -341,7 +369,8 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
 
     settings["_settings_schema_version"] = SETTINGS_SCHEMA_VERSION
     settings["constitutive_mode"] = "generalized_maxwell"
-    settings["prestrain_reference_mode"] = "elastic_tk_reference"
+    if str(settings.get("prestrain_reference_mode")) not in PRESTRAIN_REFERENCE_OPTIONS:
+        settings["prestrain_reference_mode"] = "elastic_tk_reference"
     settings["nylon_condition_mode"] = "bonded_linear"
     settings["nylon_axial_prestrain_coupling"] = 1.0
     settings["nylon_axial_actuation_coupling"] = 1.0
@@ -361,6 +390,7 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
         "alpha0_deg": (0.1, 85.0),
         "theta_f_deg": (0.0, 89.0),
         "initial_length_mm": (1.0, 500.0),
+        "uncoiled_length_mm": (0.0, 500.0),
         "n_cycles": (1.0, 60.0),
         "duration_s": (1.0, 5000.0),
         "flow_rate_mL_min": (0.01, 200.0),
@@ -400,9 +430,11 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
     for key, options in (
         ("integration", INTEGRATION_OPTIONS),
         ("bias_angle_profile", BIAS_ANGLE_PROFILE_OPTIONS),
+        ("uncoiled_compliance_mode", UNCOILED_COMPLIANCE_OPTIONS),
         ("section_update_mode", SECTION_UPDATE_OPTIONS),
         ("axial_modulus_mode", AXIAL_MODULUS_OPTIONS),
         ("maxwell_anisotropy_mode", MAXWELL_ANISOTROPY_OPTIONS),
+        ("poisson_pairing", POISSON_PAIRING_OPTIONS),
         ("pressure_input_mode", PRESSURE_INPUT_OPTIONS),
     ):
         if str(settings[key]) not in options:
@@ -424,7 +456,7 @@ def parse_settings_export(payload: bytes | str) -> dict[str, SettingValue]:
         raise ValueError("Le fichier de paramètres doit contenir un objet JSON.")
     if "settings" in document:
         if document.get("format") != SETTINGS_EXPORT_FORMAT:
-            raise ValueError("Ce fichier n'est pas un export de paramètres Cavatappi Beta.")
+            raise ValueError("Ce fichier n'est pas un export de paramètres Cavatappi Alpha V2.")
         document = document["settings"]
     return normalize_settings(document)
 
@@ -456,6 +488,7 @@ def load_settings() -> dict[str, SettingValue]:
         saved["p_max_mpa"] = min(float(saved.get("p_max_mpa", P_MAX_MPA)), P_MAX_MPA)
         saved["section_update_mode"] = DEFAULT_SETTINGS["section_update_mode"]
         saved["bias_angle_profile"] = DEFAULT_SETTINGS["bias_angle_profile"]
+        saved["uncoiled_compliance_mode"] = DEFAULT_SETTINGS["uncoiled_compliance_mode"]
         saved["constitutive_mode"] = DEFAULT_SETTINGS["constitutive_mode"]
         saved["axial_modulus_mode"] = DEFAULT_SETTINGS["axial_modulus_mode"]
         saved["prestrain_reference_mode"] = DEFAULT_SETTINGS["prestrain_reference_mode"]
@@ -513,6 +546,7 @@ def geometry_error(settings: dict[str, SettingValue]) -> str | None:
     rin = float(settings["rin_mm"])
     nylon_diameter = float(settings["nylon_diameter_mm"])
     rho0 = float(settings["rho0_mm"])
+    uncoiled_length = float(settings["uncoiled_length_mm"])
     values = np.array(
         [rout, rin, nylon_diameter, rho0, settings["initial_length_mm"], settings["alpha0_deg"]], dtype=float
     )
@@ -524,6 +558,10 @@ def geometry_error(settings: dict[str, SettingValue]) -> str | None:
         return "Le diamètre du nylon ne doit pas dépasser le diamètre intérieur du tube."
     if rho0 <= rout:
         return "rho0 doit être supérieur à Rout pour une ligne centrale hélicoïdale."
+    if not np.isfinite(uncoiled_length) or uncoiled_length < 0.0:
+        return "La longueur désenroulée doit être finie et positive ou nulle."
+    if str(settings.get("uncoiled_compliance_mode")) not in UNCOILED_COMPLIANCE_OPTIONS:
+        return "Le modèle mécanique des extrémités désenroulées est inconnu."
     return None
 
 
@@ -615,15 +653,17 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
     if str(settings.get("bias_angle_profile")) not in BIAS_ANGLE_PROFILE_OPTIONS:
         return "Le profil radial de l'angle de biais est inconnu."
     if str(settings.get("constitutive_mode")) != "generalized_maxwell":
-        return "La version Beta utilise uniquement le modèle de Maxwell généralisé."
+        return "Alpha V2 utilise uniquement le modèle de Maxwell généralisé."
     if str(settings.get("axial_modulus_mode")) not in AXIAL_MODULUS_OPTIONS:
         return "La convention du module axial est inconnue."
-    if str(settings.get("prestrain_reference_mode")) != "elastic_tk_reference":
-        return "La version Beta utilise uniquement une précontrainte élastique conservée."
+    if str(settings.get("prestrain_reference_mode")) not in PRESTRAIN_REFERENCE_OPTIONS:
+        return "Le mode de précontrainte est inconnu."
     if str(settings.get("maxwell_anisotropy_mode")) not in MAXWELL_ANISOTROPY_OPTIONS:
         return "Le mode d'anisotropie viscoelastique est inconnu."
+    if str(settings.get("poisson_pairing", "paper_crossed")) not in POISSON_PAIRING_OPTIONS:
+        return "L'appariement des coefficients de Poisson est inconnu."
     if str(settings.get("nylon_condition_mode")) != "bonded_linear":
-        return "La version Beta utilise uniquement un nylon linéaire bilatéral lié aux extrémités."
+        return "Alpha V2 utilise uniquement un nylon linéaire bilatéral lié aux extrémités."
     if str(settings.get("pressure_input_mode", "generated")) not in PRESSURE_INPUT_OPTIONS:
         return "La source de pression est inconnue."
     for key in ("nylon_axial_prestrain_coupling", "nylon_axial_actuation_coupling"):
@@ -670,28 +710,71 @@ def derived_geometry(settings: dict[str, SettingValue]) -> dict[str, float]:
     alpha = np.deg2rad(float(settings["alpha0_deg"]))
     eps = float(settings["eps"])
     initial_length = float(settings["initial_length_mm"])
+    uncoiled_length = float(settings["uncoiled_length_mm"])
 
     h0 = rho0 * np.tan(alpha)
     pitch0 = 2.0 * np.pi * h0
     turns = initial_length / pitch0
-    centerline_length = initial_length / max(np.sin(alpha), 1e-12)
+    centerline_length_active = initial_length / max(np.sin(alpha), 1e-12)
+    centerline_length = centerline_length_active + uncoiled_length
     wall_area = np.pi * (rout**2 - rin**2)
     inner_area = np.pi * rin**2
     nylon_area = np.pi * (0.5 * float(settings["nylon_diameter_mm"])) ** 2
+    tube_inertia = 0.25 * np.pi * (rout**4 - rin**4)
+    nylon_radius = 0.5 * float(settings["nylon_diameter_mm"])
+    nylon_inertia = 0.25 * np.pi * nylon_radius**4
+    if str(settings.get("axial_modulus_mode", "maxwell_sum")) == "maxwell_sum":
+        tube_axial_modulus = sum(
+            float(settings[key])
+            for key in ("maxwell_E0_mpa", "maxwell_E1_mpa", "maxwell_E2_mpa", "maxwell_E3_mpa")
+        )
+    else:
+        tube_axial_modulus = float(settings["E_axial_mpa"])
+    nylon_modulus = float(settings["E_nylon_mpa"])
+    end_axial_rigidity = tube_axial_modulus * wall_area + nylon_modulus * nylon_area
+    end_bending_rigidity = tube_axial_modulus * tube_inertia + nylon_modulus * nylon_inertia
+    compliance_mode = str(settings.get("uncoiled_compliance_mode", "tangent_beam"))
+    if uncoiled_length <= 0.0:
+        end_compliance = 0.0
+        end_stiffness = np.inf
+    elif compliance_mode == "axial_rod":
+        end_compliance = uncoiled_length / end_axial_rigidity
+        end_stiffness = 1.0 / end_compliance
+    else:
+        half_uncoiled = 0.5 * uncoiled_length
+        end_compliance = 2.0 * (
+            half_uncoiled * np.sin(alpha) ** 2 / end_axial_rigidity
+            + half_uncoiled**3 * np.cos(alpha) ** 2 / (3.0 * end_bending_rigidity)
+        )
+        end_stiffness = 1.0 / end_compliance
     tube_internal_volume_ml = inner_area * centerline_length * 1.0e-3
-    prestrained_length = (1.0 + eps) * initial_length
+    prestrained_active_length = (1.0 + eps) * initial_length
+    total_initial_length = initial_length + uncoiled_length
+    prestrained_length = prestrained_active_length + uncoiled_length
     prestrained_pitch = (1.0 + eps) * pitch0
 
     return {
         "h0_mm_per_rad": h0,
         "pitch0_mm": pitch0,
         "turns": turns,
+        "active_length_mm": initial_length,
+        "uncoiled_length_mm": uncoiled_length,
+        "total_initial_length_mm": total_initial_length,
+        "active_fraction": initial_length / max(total_initial_length, 1e-12),
+        "centerline_length_active_mm": centerline_length_active,
         "centerline_length_mm": centerline_length,
         "wall_area_mm2": wall_area,
         "inner_area_mm2": inner_area,
         "nylon_area_mm2": nylon_area,
+        "tube_second_moment_mm4": tube_inertia,
+        "nylon_second_moment_mm4": nylon_inertia,
         "nylon_fill_ratio": nylon_area / inner_area,
+        "uncoiled_axial_rigidity_N": end_axial_rigidity,
+        "uncoiled_bending_rigidity_N_mm2": end_bending_rigidity,
+        "uncoiled_compliance_mm_per_N": end_compliance,
+        "uncoiled_stiffness_N_per_mm": end_stiffness,
         "tube_internal_volume_ml": tube_internal_volume_ml,
+        "prestrained_active_length_mm": prestrained_active_length,
         "prestrained_length_mm": prestrained_length,
         "prestrained_pitch_mm": prestrained_pitch,
         "spring_index": rho0 / rout,
@@ -740,6 +823,7 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         E_nylon=float(settings["E_nylon_mpa"]),
         G_nylon=float(settings["G_nylon_mpa"]),
         maxwell_anisotropy_mode=str(settings.get("maxwell_anisotropy_mode", "paper_equal")),
+        poisson_pairing=str(settings.get("poisson_pairing", "paper_crossed")),
         nylon_condition_mode="bonded_linear",
         nylon_axial_prestrain_coupling=1.0,
         nylon_axial_actuation_coupling=1.0,
@@ -752,10 +836,16 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         alpha0_deg=float(settings["alpha0_deg"]),
         theta_f_deg=float(settings["theta_f_deg"]),
         initial_length=float(settings["initial_length_mm"]),
+        uncoiled_length=float(settings["uncoiled_length_mm"]),
+        uncoiled_compliance_mode=str(settings.get("uncoiled_compliance_mode", "tangent_beam")),
         bias_angle_profile=str(settings.get("bias_angle_profile", "paper_linear")),
         section_update_mode=str(settings.get("section_update_mode", "fixed")),
     )
     duration_s = float(settings["duration_s"]) if bool(settings["use_fixed_duration"]) else None
+    prestrain_reference_mode = str(settings.get("prestrain_reference_mode", "elastic_tk_reference"))
+    if prestrain_reference_mode not in PRESTRAIN_REFERENCE_OPTIONS:
+        # Coercition des anciens modes retires (ex. viscoelastic_ramp).
+        prestrain_reference_mode = "elastic_tk_reference"
     return with_scaled_nylon(
         SimulationParams(
             eps=float(settings["eps"]),
@@ -767,7 +857,7 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
             n_phi=int(settings["n_phi"]),
             pre_steps=int(settings["pre_steps"]),
             integration=str(settings["integration"]),
-            prestrain_reference_mode="elastic_tk_reference",
+            prestrain_reference_mode=prestrain_reference_mode,
             constitutive_mode=constitutive_mode,
             axial_modulus_mode=axial_modulus_mode,
             flow_rate_mL_min=float(settings["flow_rate_mL_min"]),
@@ -810,8 +900,10 @@ def make_pressure_history(config: SimulationParams) -> tuple[np.ndarray | None, 
     pressure = np.zeros_like(t)
 
     if config.nonlinear_pressure:
-        gamma_load = 3.5
-        gamma_unload = 2.8
+        # Exposants centralises dans Base.py depuis l'audit 2026-08 (item 2.4).
+        from Base import NONLINEAR_GAMMA_LOAD as gamma_load
+        from Base import NONLINEAR_GAMMA_UNLOAD as gamma_unload
+
         x = phase[loading] / 0.5
         y = (phase[~loading] - 0.5) / 0.5
         pressure[loading] = config.Pmax * x**gamma_load

@@ -32,6 +32,8 @@ from affichage import (
     make_cross_section_figure,
     mapping_to_csv_bytes,
     plot_hysteresis_overlay,
+    plot_experimental_force_pressure,
+    plot_time_response_with_experiment_fr,
     plot_prestrain_study,
     plot_relaxation_response,
     plot_suspended_response,
@@ -47,6 +49,8 @@ from parametres import (
     HYSTERESIS_RESULT_PATH,
     INTEGRATION_LABELS,
     INTEGRATION_OPTIONS,
+    PRESTRAIN_REFERENCE_LABELS,
+    PRESTRAIN_REFERENCE_OPTIONS,
     MAXWELL_ANISOTROPY_LABELS,
     MAXWELL_ANISOTROPY_OPTIONS,
     PRESSURE_INPUT_LABELS,
@@ -60,6 +64,8 @@ from parametres import (
     SETTINGS_SCHEMA_VERSION,
     SUSPENDED_RESULT_PATH,
     TIMING_PROFILE_PATH,
+    UNCOILED_COMPLIANCE_LABELS,
+    UNCOILED_COMPLIANCE_OPTIONS,
     VISUAL_STATE_LABELS,
     VISUAL_STATE_OPTIONS,
     build_config,
@@ -83,8 +89,11 @@ from parallel import (
 )
 from pression import (
     estimate_measured_period,
+    experimental_force_pressure_payload,
     infer_column,
+    infer_force_unit,
     infer_pressure_unit,
+    infer_time_unit,
     measured_pressure_payload,
     parse_uploaded_numeric_csv,
 )
@@ -123,7 +132,7 @@ def render_csv_download(payload: bytes | None, filename: str, key: str) -> None:
 
 def export_metadata(settings: dict[str, SettingValue], simulation: str) -> dict[str, SettingValue]:
     return {
-        "export_format": "cavatappi-beta-results",
+        "export_format": "cavatappi-alpha-v2-results",
         "settings_schema_version": SETTINGS_SCHEMA_VERSION,
         "model_version": getattr(modele, "MODEL_VERSION", "inconnue"),
         "simulation": simulation,
@@ -193,7 +202,11 @@ def render_metric_grid(items: list[tuple[str, str]]) -> None:
     )
     st.markdown(f'<div class="metric-grid">{blocks}</div>', unsafe_allow_html=True)
 
-BLOCKED_RESULT_IGNORE_KEYS = {
+TEMPORAL_DISPLAY_SETTING_KEYS = {
+    "show_temporal_torque",
+    "overlay_temporal_pressure",
+}
+BLOCKED_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "eps_study_min",
     "eps_study_max",
     "eps_study_points",
@@ -214,7 +227,7 @@ BLOCKED_RESULT_IGNORE_KEYS = {
     "view_elev_deg",
     "view_azim_deg",
 }
-RELAXATION_RESULT_IGNORE_KEYS = {
+RELAXATION_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "eps_study_min",
     "eps_study_max",
     "eps_study_points",
@@ -238,7 +251,7 @@ RELAXATION_RESULT_IGNORE_KEYS = {
     "view_elev_deg",
     "view_azim_deg",
 }
-PRESTRAIN_RESULT_IGNORE_KEYS = {
+PRESTRAIN_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "eps",
     "hysteresis_cycle",
     "hysteresis_cycles",
@@ -257,7 +270,7 @@ PRESTRAIN_RESULT_IGNORE_KEYS = {
     "view_elev_deg",
     "view_azim_deg",
 }
-SUSPENDED_RESULT_IGNORE_KEYS = {
+SUSPENDED_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "eps_study_min",
     "eps_study_max",
     "eps_study_points",
@@ -279,7 +292,7 @@ SUSPENDED_RESULT_IGNORE_KEYS = {
     "view_elev_deg",
     "view_azim_deg",
 }
-HYSTERESIS_COMPARE_IGNORE_KEYS = {
+HYSTERESIS_COMPARE_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "eps_study_min",
     "eps_study_max",
     "eps_study_points",
@@ -721,7 +734,7 @@ settings.setdefault("suspended_show_geometry_plot", INTERFACE_DEFAULT_SUSPENDED_
 settings = apply_view_query_params(settings)
 timing_profile = load_timing_profile(TIMING_PROFILE_PATH)
 
-st.set_page_config(page_title="Calculateur Cavatappi - Beta", layout="wide")
+st.set_page_config(page_title="Calculateur Cavatappi - Alpha V2", layout="wide")
 st.markdown(
     """
     <style>
@@ -806,7 +819,9 @@ with st.sidebar.expander("Géométrie", expanded=False):
         [
             "Ces paramètres définissent la forme fabriquée de l'actionneur et la section tube/nylon.",
             "Rout et Rin règlent l'épaisseur du tube, donc sa raideur et la surface soumise à la pression.",
-            "rho0, alpha0 et la longueur initiale définissent l'hélice de départ.",
+            "rho0, alpha0 et la longueur hélicoïdale active définissent la spire de départ.",
+            "La longueur désenroulée est la somme des portions aux deux extrémités. Elle ajoute une compliance mécanique en série : les extrémités se déforment sous la force et libèrent partiellement la spire pourtant bloquée globalement.",
+            "Le mode traction et flexion utilise l'orientation tangentielle de sortie de la spire ; le mode axial suppose des extrémités parfaitement alignées avec l'axe.",
             "theta_f est l'angle de biais des fibres/matière du tube utilisé pour l'anisotropie.",
             "La mise à jour hélicoïdale conserve la section initiale ; le mode évolutif actualise aussi les rayons et l'orientation du matériau.",
         ]
@@ -828,7 +843,31 @@ with st.sidebar.expander("Géométrie", expanded=False):
         ),
     )
     initial_length_mm = st.number_input(
-        "Longueur initiale de l'actionneur (mm)", 1.0, 500.0, float(settings["initial_length_mm"]), 0.5
+        "Longueur hélicoïdale active initiale (mm)", 1.0, 500.0, float(settings["initial_length_mm"]), 0.5
+    )
+    uncoiled_length_mm = st.number_input(
+        "Longueur totale désenroulée aux extrémités (mm)",
+        0.0,
+        500.0,
+        float(settings["uncoiled_length_mm"]),
+        0.5,
+        help=(
+            "Somme des longueurs non hélicoïdales aux deux extrémités. Elles ne produisent pas "
+            "d'actionnement, mais leur élasticité réduit la force transmise en blocage."
+        ),
+    )
+    uncoiled_compliance_mode = st.selectbox(
+        "Modèle mécanique des extrémités",
+        UNCOILED_COMPLIANCE_OPTIONS,
+        index=option_index(
+            UNCOILED_COMPLIANCE_OPTIONS,
+            settings.get("uncoiled_compliance_mode", "tangent_beam"),
+        ),
+        format_func=lambda value: UNCOILED_COMPLIANCE_LABELS.get(value, value),
+        help=(
+            "Traction et flexion : modèle de poutre composite tube/nylon au raccord tangent à la spire. "
+            "Traction axiale : modèle de barre composite alignée avec l'axe, nettement plus rigide."
+        ),
     )
     section_update_mode = st.selectbox(
         "Mise à jour de la section du tube",
@@ -870,6 +909,27 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
         "Profil de pression phénoménologique non linéaire",
         bool(settings["nonlinear_pressure"]),
         help="Ce profil utilise des exposants empiriques. Pour un protocole contrôlé, conservez le profil linéaire.",
+    )
+    st.markdown("**Affichage des courbes temporelles**")
+    show_temporal_torque = st.checkbox(
+        "Afficher le couple",
+        bool(settings["show_temporal_torque"]),
+        help="Ajoute le couple d'actionnement aux courbes temporelles.",
+    )
+    overlay_temporal_pressure = st.checkbox(
+        "Superposer la pression et la force",
+        bool(settings["overlay_temporal_pressure"]),
+        help="Affiche la pression sur un second axe vertical du graphique de force.",
+    )
+    experimental_overlay_single_graph = st.checkbox(
+        "Superposer l'essai expérimental sur le graphe principal",
+        bool(settings.get("experimental_overlay_single_graph", True)),
+        help=(
+            "Quand la pression injectée est un historique mesuré CSV et qu'un essai "
+            "expérimental est chargé dans l'onglet des courbes temporelles, affiche "
+            "simulation et mesure sur un seul graphe (pression sur l'axe secondaire, "
+            "couple masqué). Décochée : l'essai reste sur un graphique distinct."
+        ),
     )
     if use_fixed_duration:
         st.caption("La durée fixe remplace le débit demandé par un débit effectif calculé à partir du nombre de cycles.")
@@ -1051,7 +1111,9 @@ G12_mpa = float(settings["G12_mpa"])
 nu12 = float(settings["nu12"])
 nu23 = float(settings["nu23"])
 constitutive_mode = "generalized_maxwell"
-prestrain_reference_mode = "elastic_tk_reference"
+prestrain_reference_mode = str(settings.get("prestrain_reference_mode", "elastic_tk_reference"))
+if prestrain_reference_mode not in PRESTRAIN_REFERENCE_OPTIONS:
+    prestrain_reference_mode = "elastic_tk_reference"
 maxwell_E0_mpa = float(settings["maxwell_E0_mpa"])
 maxwell_E1_mpa = float(settings["maxwell_E1_mpa"])
 maxwell_eta1_mpa_s = float(settings["maxwell_eta1_mpa_s"])
@@ -1159,6 +1221,22 @@ if show_advanced_settings:
                 "avec τ_i = η_i/E_i."
             ),
         )
+        prestrain_reference_mode = st.selectbox(
+            "Précontrainte",
+            PRESTRAIN_REFERENCE_OPTIONS,
+            index=option_index(PRESTRAIN_REFERENCE_OPTIONS, prestrain_reference_mode),
+            format_func=lambda value: PRESTRAIN_REFERENCE_LABELS.get(value, value),
+            help=(
+                "Référence élastique conservée : la précontrainte forme une base "
+                "élastique figée, les branches de Maxwell ne décrivent que "
+                "l'actionnement (défaut historique, baseline de validation). "
+                "Histoire viscoélastique complète : les branches sont actives dès "
+                "l'élongation à 20 mm/min, comme dans l'article — la relaxation de "
+                "la prétension, l'atténuation des premiers cycles (training) et la "
+                "fig. 11 d'EXP deviennent simulables ; les niveaux absolus de force "
+                "sont plus bas d'environ 20 %. (audit 2026-08, item 3.2)"
+            ),
+        )
         active_tau = [
             eta / modulus
             for modulus, eta in (
@@ -1202,6 +1280,8 @@ current_settings = {
     "theta_f_deg": float(theta_f_deg),
     "bias_angle_profile": str(bias_angle_profile),
     "initial_length_mm": float(initial_length_mm),
+    "uncoiled_length_mm": float(uncoiled_length_mm),
+    "uncoiled_compliance_mode": str(uncoiled_compliance_mode),
     "section_update_mode": str(section_update_mode),
     "n_cycles": int(n_cycles),
     "hysteresis_cycle": parse_cycle_list(hysteresis_cycles, int(n_cycles))[0],
@@ -1214,6 +1294,9 @@ current_settings = {
     "flow_rate_mL_min": float(flow_rate_mL_min),
     "volume_mL": float(volume_mL),
     "nonlinear_pressure": bool(nonlinear_pressure),
+    "show_temporal_torque": bool(show_temporal_torque),
+    "overlay_temporal_pressure": bool(overlay_temporal_pressure),
+    "experimental_overlay_single_graph": bool(experimental_overlay_single_graph),
     "pressure_input_mode": str(pressure_input_mode),
     "measured_pressure_time_column": str(measured_pressure_time_column),
     "measured_pressure_column": str(measured_pressure_column),
@@ -1268,7 +1351,7 @@ with settings_actions:
         st.download_button(
             "Exporter les paramètres en JSON",
             data=settings_export_bytes(current_settings if error is None else settings),
-            file_name="parametres_cavatappi_beta.json",
+            file_name="parametres_cavatappi_alpha_v2.json",
             mime="application/json",
             icon=":material/download:",
             use_container_width=True,
@@ -1276,7 +1359,7 @@ with settings_actions:
         st.download_button(
             "Exporter les paramètres en CSV",
             data=settings_export_csv_bytes(current_settings if error is None else settings),
-            file_name="parametres_cavatappi_beta.csv",
+            file_name="parametres_cavatappi_alpha_v2.csv",
             mime="text/csv; charset=utf-8",
             icon=":material/download:",
             use_container_width=True,
@@ -1327,7 +1410,6 @@ with settings_actions:
 initialize_cached_results()
 if "hysteresis_comparison_result" not in st.session_state:
     st.session_state["hysteresis_comparison_result"] = None
-
 if error:
     st.error(error)
 maxwell_sum = float(maxwell_E0_mpa + maxwell_E1_mpa + maxwell_E2_mpa + maxwell_E3_mpa)
@@ -1513,18 +1595,29 @@ with left:
 with right:
     geom = derived_geometry(current_settings)
     st.subheader("Résultats géométriques")
+    end_stiffness = float(geom["uncoiled_stiffness_N_per_mm"])
+    end_stiffness_label = f"{end_stiffness:.3f} N/mm" if np.isfinite(end_stiffness) else "rigide"
     render_metric_grid(
         [
             ("Nombre de spires", f"{geom['turns']:.2f}"),
             ("Pas", f"{geom['pitch0_mm']:.2f} mm"),
+            ("Longueur active", f"{geom['active_length_mm']:.2f} mm"),
+            ("Longueur totale initiale", f"{geom['total_initial_length_mm']:.2f} mm"),
             ("Indice ρ/Rout", f"{geom['spring_index']:.2f}"),
             ("Mandrin estimé", f"{geom['equivalent_mandrel_diameter_mm']:.2f} mm"),
             ("Aire de paroi", f"{geom['wall_area_mm2']:.3f} mm²"),
             ("Volume interne", f"{geom['tube_internal_volume_ml']:.4f} mL"),
             ("Remplissage nylon", f"{100.0 * geom['nylon_fill_ratio']:.1f} %"),
+            ("Raideur des extrémités", end_stiffness_label),
             ("Longueur précontrainte", f"{geom['prestrained_length_mm']:.2f} mm"),
         ]
     )
+    if geom["uncoiled_length_mm"] > 0.0:
+        st.caption(
+            f"{geom['uncoiled_length_mm']:.2f} mm sont modélisés comme des extrémités élastiques en série "
+            f"avec une raideur équivalente de {end_stiffness:.3f} N/mm "
+            f"({100.0 * geom['active_fraction']:.1f} % de la longueur initiale reste hélicoïdale active)."
+        )
 
     with st.expander("Afficher la coupe du tube", expanded=False):
         fig_section = make_cross_section_figure(current_settings)
@@ -1565,13 +1658,28 @@ with tabs[0]:
         data = result["data"]
         config = result["config"]
         force_gain = float(np.nanmax(data["force_act_mN"]))
-        render_metric_grid(
-            [
-                ("Force minimale", f"{summary['force_min_mN']:.1f} mN"),
-                ("Force maximale", f"{summary['force_max_mN']:.1f} mN"),
-                ("Gain d’actionnement", f"{force_gain:.1f} mN"),
-                ("Couple maximal", f"{summary['torque_act_max_microNm']:.1f} µN·m"),
-            ]
+        blocked_metrics = [
+            ("Force minimale", f"{summary['force_min_mN']:.1f} mN"),
+            ("Force maximale", f"{summary['force_max_mN']:.1f} mN"),
+            ("Gain d’actionnement", f"{force_gain:.1f} mN"),
+            ("Couple maximal", f"{summary['torque_act_max_microNm']:.1f} µN·m"),
+        ]
+        if float(result["settings"].get("uncoiled_length_mm", 0.0)) > 0.0:
+            blocked_metrics.extend(
+                [
+                    (
+                        "Raideur des extrémités",
+                        f"{float(data['uncoiled_stiffness_N_per_mm'][0]):.3f} N/mm",
+                    ),
+                    (
+                        "Déformation des extrémités",
+                        f"{np.nanmax(np.abs(data['uncoiled_extension_mm'])):.4f} mm",
+                    ),
+                ]
+            )
+        render_metric_grid(blocked_metrics)
+        compatibility_residual = float(
+            np.nanmax(np.abs(data.get("series_compatibility_residual_mm", np.array([0.0]))))
         )
         st.caption(
             f"pression : {'CSV mesuré' if result['settings'].get('pressure_input_mode') == 'measured_csv' else 'profil généré'} | "
@@ -1579,6 +1687,7 @@ with tabs[0]:
             f"période de cycle : {result_cycle_period(config):.2f} s | "
             f"échantillons : {len(data['time'])} | "
             f"résidu maximal : {summary['max_abs_residual_Nmm']:.2e} N·mm | "
+            f"compatibilité série : {compatibility_residual:.2e} mm | "
             f"calcul : {format_seconds(result.get('elapsed_s', 0.0))} "
             f"(estimé {format_seconds(result.get('estimated_s', 0.0))})"
         )
@@ -1603,9 +1712,10 @@ with tabs[1]:
         else:
             st.warning("Les paramètres ont changé depuis le dernier calcul. Veuillez relancer l'actionnement bloqué pour mettre les courbes à jour.")
     else:
-        fig_response = plot_time_response_fr(result["data"])
-        st.pyplot(fig_response)
-        plt.close(fig_response)
+        # Le graphe est rempli APRÈS le volet expérimental : si un essai est
+        # chargé et que la pression injectée est l'historique mesuré, la
+        # superposition se fait sur un seul graphe. (audit 2026-08, ergonomie)
+        temporal_plot_slot = st.container()
         temporal_csv_payload = mapping_to_csv_bytes(
             result["data"],
             export_metadata(result["settings"], "courbes_temporelles"),
@@ -1616,6 +1726,200 @@ with tabs[1]:
         "courbes_temporelles_actionnement_bloque.csv",
         "download_temporal_csv",
     )
+
+    experimental_overlay_data = None
+    experimental_overlay_name = ""
+    experimental_overlay_unfiltered = False
+    with st.expander("Afficher un essai expérimental CSV", expanded=False):
+        st.caption(
+            "Importez un relevé temps, pression et force. Si la pression injectée "
+            "dans la simulation est un historique mesuré (volet « Pression et "
+            "actionnement »), l'essai est superposé aux courbes simulées sur un "
+            "seul graphe ; sinon il est affiché sur un graphique distinct."
+        )
+        experimental_file = st.file_uploader(
+            "Fichier de mesure expérimental",
+            type=["csv", "txt"],
+            key="experimental_force_pressure_csv",
+            help=(
+                "Les séparateurs virgule, point-virgule et tabulation sont acceptés. "
+                "Les colonnes et leurs unités restent modifiables après l'import."
+            ),
+        )
+        if experimental_file is None:
+            st.info("Veuillez importer un fichier CSV pour afficher les mesures.")
+        else:
+            try:
+                experimental_columns = parse_uploaded_numeric_csv(experimental_file.getvalue())
+                experimental_headers = list(experimental_columns)
+                default_time_column = infer_column(experimental_headers, ("time_s", "time", "temps"), 0)
+                default_pressure_column = infer_column(
+                    experimental_headers,
+                    ("pressure_bar", "pressure", "pression"),
+                    1,
+                )
+                default_force_column = infer_column(
+                    experimental_headers,
+                    ("force_mn", "force", "load", "charge"),
+                    2,
+                )
+
+                selector_columns = st.columns(3)
+                with selector_columns[0]:
+                    time_column = st.selectbox(
+                        "Colonne de temps",
+                        experimental_headers,
+                        index=experimental_headers.index(default_time_column),
+                        key="experimental_time_column",
+                    )
+                    time_units = ["s", "ms"]
+                    time_unit = st.selectbox(
+                        "Unité de temps",
+                        time_units,
+                        index=option_index(time_units, infer_time_unit(time_column)),
+                        key="experimental_time_unit",
+                    )
+                with selector_columns[1]:
+                    pressure_column = st.selectbox(
+                        "Colonne de pression",
+                        experimental_headers,
+                        index=experimental_headers.index(default_pressure_column),
+                        key="experimental_pressure_column",
+                    )
+                    pressure_units = ["MPa", "bar", "kPa", "psi"]
+                    pressure_unit = st.selectbox(
+                        "Unité de pression",
+                        pressure_units,
+                        index=option_index(pressure_units, infer_pressure_unit(pressure_column)),
+                        key="experimental_pressure_unit",
+                    )
+                with selector_columns[2]:
+                    force_column = st.selectbox(
+                        "Colonne de force",
+                        experimental_headers,
+                        index=experimental_headers.index(default_force_column),
+                        key="experimental_force_column",
+                    )
+                    force_units = ["mN", "N", "g", "kg"]
+                    force_unit = st.selectbox(
+                        "Unité de force",
+                        force_units,
+                        index=option_index(force_units, infer_force_unit(force_column)),
+                        key="experimental_force_unit",
+                    )
+
+                unfiltered_candidates = [
+                    header
+                    for header in experimental_headers
+                    if "unfiltered" in header.lower()
+                    and ("force" in header.lower() or "load" in header.lower())
+                ]
+                show_unfiltered_force = st.checkbox(
+                    "Afficher également la force non filtrée",
+                    value=False,
+                    disabled=not unfiltered_candidates,
+                    key="experimental_show_unfiltered_force",
+                    help=(
+                        "Disponible lorsqu'une colonne de force non filtrée est reconnue "
+                        "dans le fichier."
+                    ),
+                )
+                experimental_data = experimental_force_pressure_payload(
+                    experimental_columns,
+                    time_column=time_column,
+                    pressure_column=pressure_column,
+                    force_column=force_column,
+                    pressure_unit=pressure_unit,
+                    force_unit=force_unit,
+                    time_unit=time_unit,
+                    unfiltered_force_column=(
+                        unfiltered_candidates[0]
+                        if show_unfiltered_force and unfiltered_candidates
+                        else None
+                    ),
+                )
+
+                experimental_time = np.asarray(experimental_data["time"], dtype=float)
+                experimental_pressure = np.asarray(
+                    experimental_data["pressure_MPa"],
+                    dtype=float,
+                )
+                experimental_force = np.asarray(experimental_data["force_mN"], dtype=float)
+                pressure_span = float(np.ptp(experimental_pressure))
+                baseline_limit = float(np.min(experimental_pressure)) + max(
+                    0.02 * pressure_span,
+                    1.0e-9,
+                )
+                baseline_mask = experimental_pressure <= baseline_limit
+                if int(np.count_nonzero(baseline_mask)) < 3:
+                    baseline_mask = np.zeros(len(experimental_force), dtype=bool)
+                    baseline_mask[: max(1, min(len(experimental_force), len(experimental_force) // 20))] = True
+                baseline_force = float(np.median(experimental_force[baseline_mask]))
+                maximum_force = float(np.max(experimental_force))
+
+                render_metric_grid(
+                    [
+                        ("Mesures", f"{len(experimental_time)}"),
+                        ("Durée", f"{experimental_time[-1]:.2f} s"),
+                        ("Pression maximale", f"{np.max(experimental_pressure):.3f} MPa"),
+                        ("Force initiale", f"{baseline_force:.1f} mN"),
+                        ("Force maximale", f"{maximum_force:.1f} mN"),
+                        ("Gain maximal", f"{maximum_force - baseline_force:+.1f} mN"),
+                    ]
+                )
+                experimental_overlay_data = experimental_data
+                experimental_overlay_name = Path(experimental_file.name).stem
+                experimental_overlay_unfiltered = bool(show_unfiltered_force)
+                if (
+                    result is not None
+                    and str(result["settings"].get("pressure_input_mode")) == "measured_csv"
+                    and bool(current_settings["experimental_overlay_single_graph"])
+                ):
+                    st.caption(
+                        "Pression injectée = historique mesuré : l'essai est superposé "
+                        "aux courbes simulées sur le graphe principal ci-dessus "
+                        "(un seul graphe — option « Superposer l'essai expérimental » "
+                        "de la barre latérale)."
+                    )
+                else:
+                    experimental_figure = plot_experimental_force_pressure(
+                        experimental_data,
+                        experimental_overlay_name,
+                        show_unfiltered=show_unfiltered_force,
+                    )
+                    st.pyplot(experimental_figure)
+                    plt.close(experimental_figure)
+            except (KeyError, ValueError) as exc:
+                st.error(f"Impossible de lire cet essai expérimental : {exc}")
+
+    if result is not None:
+        with temporal_plot_slot:
+            if (
+                experimental_overlay_data is not None
+                and str(result["settings"].get("pressure_input_mode")) == "measured_csv"
+                and bool(current_settings["experimental_overlay_single_graph"])
+            ):
+                fig_response = plot_time_response_with_experiment_fr(
+                    result["data"],
+                    experimental_overlay_data,
+                    experimental_overlay_name,
+                    show_unfiltered=experimental_overlay_unfiltered,
+                )
+                st.pyplot(fig_response)
+                plt.close(fig_response)
+                st.caption(
+                    "Superposition sur un seul graphe : forces simulée et mesurée sur la "
+                    "même base de temps, pression mesurée injectée sur l'axe secondaire. "
+                    "Le couple n'est pas affiché dans cette vue."
+                )
+            else:
+                fig_response = plot_time_response_fr(
+                    result["data"],
+                    show_torque=bool(current_settings["show_temporal_torque"]),
+                    overlay_pressure=bool(current_settings["overlay_temporal_pressure"]),
+                )
+                st.pyplot(fig_response)
+                plt.close(fig_response)
 
 with tabs[2]:
     hysteresis_export_cases: list[dict] = []
@@ -1913,6 +2217,14 @@ with tabs[5]:
         st.markdown(
             "Le suivi de position représente directement la longueur axiale instantanée. Une diminution de cette "
             "longueur correspond à une contraction ; un retour vers `L(t = 0)` correspond au relâchement."
+        )
+        st.markdown(
+            "**Reproduire le protocole de l'article EXP** (figures 11 et 15-17) : mettre la précontrainte "
+            "`eps` à `0` et **désactiver** la stabilisation initiale sous la masse (les essais de l'article "
+            "incluent le fluage sous poids). Depuis la décision D3 de l'audit, l'actionnement en % est "
+            "normalisé par défaut par la longueur non chargée `L_T0` (éq. 25 d'EXP) ; l'ancienne "
+            "normalisation par la référence chargée reste exportée en `_loaded_ref`. Voir le README, "
+            "section « Contraction avec une masse suspendue » (audit 2026-08)."
         )
     if bool(current_settings["suspended_equilibrate_before_pressure"]):
         st.caption("La position initiale est calculée après stabilisation viscoélastique sous la masse à 0 MPa.")

@@ -1,0 +1,83 @@
+{
+ "scope": "Solveur d'actionnement bloqué et extrémités compliantes de « alpha V2/Base.py » (version 2026.07.30-series-compliant-ends-10) : TCPAMaxwellBlockedModel (_find_dw/brentq/minimize_scalar l.973-1006, _find_blocked_series_trial/least_squares l.1008-1118, _trial_state l.781-874, équilibre l.837-848), extrémités désenroulées en série (l.457-503), nylon lié bilatéral (l.551-558, 831-835), runners run_blocked_actuation (l.1658-1704) et _prepare_actuation_history (l.1617-1639), conventions de sortie associées. Confrontation à l'article BLOCKED (éq. 3-9, 11, 14-15 relues dans le PDF, p. 7-9) et EXP (éq. 21-23), plus vérifications numériques indépendantes (scripts audit_blocked_solver*.py, audit_bias_profile.py dans le scratchpad).",
+ "verdict_summary": "Sur ce périmètre, le code est une implémentation fidèle et numériquement propre du modèle d'actionnement bloqué de l'article BLOCKED. Les trois équations d'équilibre de l'hélice (éq. 3) sont reproduites signe pour signe : deux servent à exprimer F_t et T_t, la troisième est le résidu scalaire annulé en dw par balayage 65 points + brentq, avec repli minimize_scalar qui rejette les solutions en butée et échoue bruyamment plutôt que de renvoyer un faux résultat (résidus mesurés ≤ 4e-8 N·mm). La condition de blocage est exactement celle de l'article : nombre de tours conservé (éq. 6, via la paramétrisation ρ/cosα multiplié par 1+dw) et pas d'hélice fixe (éq. 9, h constant vérifié à 1e-16 près) ; les CL de pression (éq. 14-15) et le nylon (éq. 4, E=3,69 GPa, G=0,79 GPa, participation bilatérale aux deux phases) sont conformes. L'extension « extrémités compliantes en série » est mécaniquement cohérente en interne : compatibilité delta_spire + delta_extrémités = 0 satisfaite à 3e-12 mm près, allongement = ΔF/k_ext conforme au README, formules de compliance de poutre revérifiées à la main (exactes), pas de double comptage avec la longueur active, et dégénérescence exacte vers l'éq. 9 quand la longueur désenroulée est nulle. Le principal écart avec l'article est la précontrainte purement élastique avec branches de Maxwell vierges à t_k (l'article applique la loi viscoélastique A.4 dès la phase d'élongation, p. 9) : dérive de force strictement nulle mesurée sur 600 s à P=0, donc pas de relaxation de la prétension, de dérive de cycles ni de dead-band par fluage — écart significatif mais explicitement assumé et documenté dans le README. Les autres constats sont mineurs : profil d'angle de biais par défaut qui suit le texte de l'article mais pas la formule arctan de l'éq. 11 (~5 % sur le couple), précontrainte appliquée à la spire seule quand les extrémités sont compliantes, compliance évaluée à α₀ au lieu de α_tk (~8 %), et quelques fragilités numériques latentes du solveur (politique multi-racines silencieuse, brentq non protégé contre les NaN intérieurs). Confiance globale élevée : sur ce périmètre je n'ai trouvé aucune erreur d'équation, de signe, de facteur ou d'unité.",
+ "findings": [
+  {
+   "title": "Précontrainte élastique avec branches de Maxwell vierges à t_k (écart assumé vs article)",
+   "severity": "major",
+   "claim": "L'article BLOCKED applique la loi constitutive viscoélastique incrémentale (éq. A.4) dès la phase d'élongation (p. 9 : « during elongation and actuation processes ... in conjunction with Eqs. (5) and Eq. (A.4) ») ; les contraintes des branches de Maxwell sont donc non nulles à t_k et la prétension relaxe (dérive de force des Fig. 3 et 7, dead-band attribué au fluage). Le code construit au contraire une base élastique conservée pendant prestretch_to (sigma_reference cumulé avec la raideur instantanée C_total, Base.py l.808-811, drapeau _building_reference_state l.1373-1378) et démarre l'actionnement avec sigma_i = 0 : la prétension ne relaxe jamais et correspond à un étirement infiniment rapide, alors que l'étirement réel à 20 mm/min (~78 s pour eps=0,8) relaxerait largement la branche 1 (tau_1 = 7,5 s, 55 % de la raideur).",
+   "evidence": "Vérification numérique (audit_blocked_solver.py, test 2) : maintien 600 s à P=0 après prestretch → dérive de force = 0,0 mN exactement ; max|sigma_i| = 0 après prestretch, sigma_reference = 0,75 MPa (audit_blocked_solver3.py). PDF BLOCKED p. 9 relu (blocked_p10.png). L'écart est documenté dans README.md § « Comparaison avec la figure 7 » (« La précontrainte forme une base élastique conservée ... la précontrainte viscoélastique ne [n'est] pas proposée ») : c'est un choix assumé, pas un bug caché, mais il change visiblement les comparaisons à la Fig. 7 (pas de dérive des vallées de force, pas de dead-band).",
+   "refs": "alpha V2/Base.py l.808-811, l.1361-1379 ; alpha V2/README.md § Comparaison avec la figure 7 ; BLOCKED p. 9 (éq. 14 + renvoi A.4), Fig. 3, Fig. 11"
+  },
+  {
+   "title": "Profil d'angle de biais par défaut non conforme à la formule de l'éq. (11)",
+   "severity": "minor",
+   "claim": "Le mode par défaut bias_angle_profile='paper_linear' pose theta_j = (R_j/Rout)·theta_f (linéaire en angle), alors que l'éq. (11) de l'article écrit theta_j = arctan((R_j/Rout)·tan theta_f) — formule implémentée par le mode alternatif 'uniform_twist'. Le nommage est donc inversé par rapport à l'article, et le README revendique la conformité à la section 3.3 (« Le profil radial de l'angle de biais est linéaire, conformément à la section 3.3 »). Le texte de l'article dit bien « vary linearly » mais sa formule définitive est l'arctan.",
+   "evidence": "Base.py l.530-534 relu ; PDF BLOCKED p. 9 relu (éq. 11, blocked_p10.png). Impact mesuré (audit_bias_profile.py, 6 couches, eps=0,8, Pmax=1,3) : angles de couches 17,1-36,0° (linéaire) vs 19,3-36,5° (arctan) ; pic de couple d'actionnement 493,1 vs 467,8 µN·m (~5 %), force à ~0,6 %. Constat à cheval avec le périmètre « modèle multicouche » ; signalé ici car il alimente directement les résultantes du solveur bloqué.",
+   "refs": "alpha V2/Base.py l.530-534, l.80 ; alpha V2/README.md § Domaine d'utilisation ; BLOCKED p. 9 éq. (11)"
+  },
+  {
+   "title": "La précontrainte ignore la compliance des extrémités (eps appliqué à la spire seule)",
+   "severity": "minor",
+   "claim": "Quand uncoiled_length > 0, prestretch_to impose quand même h_end = (1+eps)·h0 à la spire active : eps est une pré-déformation de la spire, pas des mors. Dans une expérience réelle avec extrémités compliantes, une partie du déplacement imposé aux mors serait absorbée par les extrémités, et la pré-déformation effective de la spire serait inférieure. Cette convention n'est pas documentée dans le README (qui ne décrit la compatibilité série que pour l'actionnement).",
+   "evidence": "Vérifié numériquement (audit_blocked_solver.py, test 7) : h_blocked/h0 = 1,8 et force de référence identique (1,5291 N) avec uncoiled_length = 0 et 10 mm. La compatibilité série n'est activée qu'au verrou lock_blocked_series_reference (l.1697), après la précontrainte. Conséquence : la correspondance eps ↔ ε_tk expérimental (éq. 8 de l'article) n'est exacte que pour des extrémités rigides.",
+   "refs": "alpha V2/Base.py l.1361-1379 (prestretch_to), l.488-494, l.1696-1697 ; BLOCKED p. 8 éq. (7)-(8)"
+  },
+  {
+   "title": "Compliance tangent_beam évaluée à alpha0 au lieu de alpha_tk et figée à l'initialisation",
+   "severity": "minor",
+   "claim": "_uncoiled_series_compliance projette la traction (sin²α) et la flexion (cos²α) avec l'angle d'hélice initial alpha0, alors que la référence série est verrouillée à t_k où l'angle vaut alpha_tk ; la compliance est de plus calculée une seule fois au __init__ et jamais réactualisée. Le point de linéarisation cohérent serait alpha_tk.",
+   "evidence": "Mesuré (audit_blocked_solver2.py, test B) : alpha0 = 10,53°, alpha_tk = 19,21° après eps = 0,8 ; compliance 0,8703 vs 0,8033 mm/N, soit 7,7 % d'écart. La flexion domine la traction d'un facteur ~4700 pour uncoiled_length = 10 mm, donc l'effet vient surtout de cos²α. Formules de poutre elles-mêmes revérifiées indépendamment : identiques à la main (écart relatif 0,0), mode axial_rod = L/EA exact. Extension hors article : incohérence interne légère, pas une erreur vs littérature.",
+   "refs": "alpha V2/Base.py l.468-482, l.400 ; README § Extrémités désenroulées"
+  },
+  {
+   "title": "Comptabilité géométrique des extrémités : quasi transversales pour la raideur, axiales pour la longueur",
+   "severity": "minor",
+   "claim": "Le mode tangent_beam modélise les extrémités comme des poutres tangentes quasi transversales (la compliance est dominée par la flexion en cos²α), mais history_arrays ajoute la longueur désenroulée complète à la longueur axiale de l'actionneur (axial_length = active + uncoiled_deformed_length), comme si ces portions étaient alignées avec l'axe. Les deux idéalisations sont individuellement défendables mais mutuellement incohérentes ; seules les longueurs rapportées sont affectées, pas les forces ni la compatibilité.",
+   "evidence": "Base.py l.1438-1441 (axial_length) vs l.475-482 (projection sin²/cos² de la compliance). La compatibilité série elle-même est cohérente (l'allongement ΔF·compliance est bien un déplacement projeté sur l'axe) et vérifiée à 1,5e-14 mm (uncoiled=10 mm) et 2,9e-12 mm (uncoiled=40 mm). À noter aussi : aucune compliance de torsion des extrémités n'est modélisée, donc la conservation du nombre de tours reste exacte — cohérent avec le README qui n'annonce que traction et flexion.",
+   "refs": "alpha V2/Base.py l.468-482, l.1432-1462 ; README § Extrémités désenroulées"
+  },
+  {
+   "title": "Fragilités numériques latentes de _find_dw (multi-racines, NaN, granularité du balayage)",
+   "severity": "minor",
+   "claim": "Trois fragilités : (1) si plusieurs racines du résidu de moment existent dans le bracket, la racine de plus petit |dw| est choisie silencieusement, sans trace de multi-stabilité ; (2) brentq est appelé sur chaque intervalle à changement de signe sans protection contre un NaN intérieur (les exceptions de _trial_state sont converties en NaN) ; (3) le balayage à 65 points (pas 1,56e-3 en dw) peut manquer une paire de racines rapprochées. En régime nominal ces risques sont dormants.",
+   "evidence": "Base.py l.982-992 (balayage + politique min|dw|), l.976-980 (NaN), l.988-990 (brentq non protégé). Sondage numérique (audit_blocked_solver.py, test 5) : au premier pas pressurisé (dP=0,3 MPa), 201/201 points finis, un seul changement de signe, résidu monotone de -538 à +658 N·mm — pas de multi-racine en nominal. Le repli minimize_scalar rejette résidu > 1e-6 N·mm et solutions en butée puis lève RuntimeError (vérifié avec un bracket volontairement décalé : échec propre, pas de résultat faux). Résidus en exploitation ≤ 3,9e-8 N·mm.",
+   "refs": "alpha V2/Base.py l.973-1006"
+  },
+  {
+   "title": "Verrou de la référence série posé après le pas initial à P(0) : extension nulle si P0 > 0",
+   "severity": "minor",
+   "claim": "run_blocked_actuation exécute le pas dt=0 à P(0) puis verrouille la référence série ; si l'historique de pression fourni démarre à P0 > 0, l'allongement des extrémités provoqué par ce saut initial est compté comme nul (la force de référence inclut déjà la réponse à P0). Le blocage physique ayant lieu à P=0 en fin d'étirement, la référence devrait précéder la mise en pression. Sans effet pour les historiques par défaut (P0 = 0).",
+   "evidence": "Vérifié (audit_blocked_solver.py, test 6) : historique constant à 0,5 MPa → force[0] = 1603 mN au verrou et uncoiled_extension[0] = 0,0 mm. Ordre des appels : Base.py l.1696 (step P[0], dt=0) puis l.1697 (lock_blocked_series_reference). Le pas dt=0 lui-même est correct : saut élastique instantané (facteurs exponentiels → 1 à dt=0), résidu ~2,6e-7 N·mm.",
+   "refs": "alpha V2/Base.py l.1696-1698, l.488-494, l.627-654"
+  },
+  {
+   "title": "Équilibre bloqué et cinématique : conformité exacte aux éq. (3), (5), (6), (9), (14), (15)",
+   "severity": "info",
+   "claim": "Le solveur résout exactement le système de l'article : Ft = (Ftube+Fnylon)/sinα (éq. 3a), Tt = (M + Ft·ρ·sinα)/cosα (éq. 3b), résidu = Tt·sinα + Ft·ρ·cosα − (Ttube+Tnylon) (éq. 3c) ; incréments dv et dkappa identiques à l'éq. (5) ; conservation du nombre de tours (éq. 6) encodée exactement par rho_new = sqrt(((1+dw)·ρ/cosα)² − h²) ; blocage éq. (9) par h_target = h_blocked constant ; CL de pression éq. (14)-(15) via b_vec[0] = −dP − k_sig et sigma_r(Rout) = 0. La condition d'encastrement (ni allongement ni rotation) est donc intégralement respectée, et l'extension série dégénère exactement vers l'éq. (9) quand uncoiled_length = 0.",
+   "evidence": "Équations relues dans le PDF (blocked_p08.png p. 7, blocked_p09.png p. 8, blocked_p10.png p. 9) et comparées ligne à ligne au code (l.560-574, l.679-720, l.837-848). Numériquement : h strictement constant (variation 2e-16) en mode rigide ; résidu de moment ≤ 3,9e-8 N·mm ; compatibilité série ≤ 2,9e-12 mm ; le pic de force diminue avec la compliance des extrémités (1672,7 → 1665,6 → 1562,2 mN pour 0/10/40 mm), comportement physiquement attendu ; couples négatifs possibles en décharge (min −205 µN·m), fidèle à la Fig. 8(b).",
+   "refs": "alpha V2/Base.py l.560-574, l.661-721, l.837-848, l.973-1006 ; BLOCKED p. 7-9 éq. (3), (5), (6), (9), (14), (15)"
+  },
+  {
+   "title": "Nylon lié bilatéral conforme aux articles (éq. 4 / EXP éq. 22)",
+   "severity": "info",
+   "claim": "Les incréments d'effort du nylon reproduisent exactement l'éq. (4) : ΔF = π·E_nylon·r²·Δw, ΔM = (π/4)·E_nylon·r⁴·Δκ, ΔT = (π/2)·G_nylon·r⁴·Δv, avec E_nylon = 3,69 GPa et G_nylon = 0,79 GPa (Table B1), rayon constant (hyp. iii). Le nylon participe à la précontrainte et à l'actionnement avec les mêmes déformations généralisées que le tube (montage lié), les facteurs de couplage étant verrouillés à 1 comme le README l'exige ; le comportement bilatéral (force de compression admise) correspond au filament élastique linéaire des articles, qui ne formulent aucune condition unilatérale.",
+   "evidence": "Base.py l.556-558, l.831-835 comparés à l'éq. (4) relue dans le PDF (blocked_p09.png p. 8) et à EXP éq. (22) ; unités cohérentes (MPa·mm² = N, MPa·mm³ = N·mm). Verrous l.332-346 (bonded_linear seul accepté, couplages forcés à 1) conformes au README § Condition du nylon.",
+   "refs": "alpha V2/Base.py l.556-558, l.831-835, l.332-346 ; BLOCKED p. 8 éq. (4), Table B1 ; EXP p. 9 éq. (22)"
+  },
+  {
+   "title": "Absence de poussée de fond hydraulique : fidèle à l'article, limitation partagée",
+   "severity": "info",
+   "claim": "La pression n'entre dans le modèle que comme condition limite radiale incrémentale sur la paroi interne (Δσ_r = −ΔP, éq. 15) ; aucun terme axial P·π·Rin² (poussée de fond sur les embouts) n'apparaît dans l'équilibre. C'est exactement le traitement de l'article BLOCKED (hyp. v ; la pression n'apparaît nulle part ailleurs que dans l'éq. 15) : ce n'est donc pas une infidélité d'implémentation, mais une limitation physique héritée du modèle publié, à garder en tête si l'on compare à un banc où le capteur de force reprend la poussée des embouts.",
+   "evidence": "Base.py l.686 (b_vec[0] = −dP − k_sig), aucune autre occurrence de la pression dans les résultantes ; PDF BLOCKED p. 9 relu (éq. 14-15 et texte : la pression n'intervient que par ΔP dans la CL radiale).",
+   "refs": "alpha V2/Base.py l.679-687 ; BLOCKED p. 9 éq. (15), hyp. (v) p. 6"
+  },
+  {
+   "title": "Enchaînement précontrainte → actionnement propre (horloge, découpe, conventions)",
+   "severity": "info",
+   "claim": "run_blocked_actuation enchaîne correctement : prestretch, pas dt=0 à P(0) qui fournit l'échantillon de référence, verrou série, historique de pression décalé de t_start puis découpe à i_act0 et re-zéro du temps ; add_corrected_output_conventions rebase les grandeurs « actuation » sur ce premier échantillon post-précontrainte (couple d'actionnement relatif, force totale conservée), ce qui correspond à la présentation de la Fig. 7 (vallées de couple ≈ 0, force incluant la prétension). L'horloge des branches de Maxwell ne dépend que de dt, donc le non-rebasage interne du temps est sans effet. _prepare_actuation_history valide correctement monotonie, positivité et appariement temps/pression.",
+   "evidence": "Base.py l.1684-1703, l.1593-1614, l.1617-1639 relus en entier ; exécution vérifiée (19 pas, temps re-basé à 0, résidus ≤ 3,9e-8 N·mm). Seule réserve, déjà signalée : l'ordre verrou/pas initial pour P0 > 0 (constat dédié).",
+   "refs": "alpha V2/Base.py l.1658-1704, l.1593-1639"
+  }
+ ]
+}

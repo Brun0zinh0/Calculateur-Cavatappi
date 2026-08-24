@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 
 import numpy as np
 
@@ -53,6 +54,73 @@ def infer_pressure_unit(header: str) -> str:
     if "bar" in lowered:
         return "bar"
     return "MPa"
+
+
+def infer_force_unit(header: str) -> str:
+    # Correspondance par mots entiers : l'ancien test de sous-chaine « mn »
+    # inferait des millinewtons pour tout en-tete generique contenant la
+    # sequence (« column1 » -> mN). (audit 2026-08, item 2.1)
+    tokens = [tok for tok in re.split(r"[^a-z0-9]+", header.lower()) if tok]
+    if "mn" in tokens:
+        return "mN"
+    if "kg" in tokens:
+        return "kg"
+    if "g" in tokens or any(tok.startswith("gram") for tok in tokens):
+        return "g"
+    return "N"
+
+
+def infer_time_unit(header: str) -> str:
+    lowered = header.lower()
+    if "ms" in lowered:
+        return "ms"
+    return "s"
+
+
+def experimental_force_pressure_payload(
+    columns: dict[str, np.ndarray],
+    time_column: str,
+    pressure_column: str,
+    force_column: str,
+    pressure_unit: str,
+    force_unit: str,
+    time_unit: str = "s",
+    unfiltered_force_column: str | None = None,
+) -> dict[str, np.ndarray]:
+    time_values = np.asarray(columns[time_column], dtype=float)
+    pressure_values = np.asarray(columns[pressure_column], dtype=float)
+    force_values = np.asarray(columns[force_column], dtype=float)
+    valid = np.isfinite(time_values) & np.isfinite(pressure_values) & np.isfinite(force_values)
+    time_values = time_values[valid]
+    pressure_values = pressure_values[valid]
+    force_values = force_values[valid]
+    if len(time_values) < 2:
+        raise ValueError("Le CSV ne contient pas assez de mesures temps/pression/force valides.")
+
+    order = np.argsort(time_values, kind="stable")
+    time_values = time_values[order]
+    pressure_values = pressure_values[order]
+    force_values = force_values[order]
+    unique_time, unique_index = np.unique(time_values, return_index=True)
+    time_values = unique_time
+    pressure_values = pressure_values[unique_index]
+    force_values = force_values[unique_index]
+
+    time_factors = {"s": 1.0, "ms": 1.0e-3}
+    pressure_factors = {"MPa": 1.0, "bar": 0.1, "kPa": 0.001, "psi": 0.006894757293168361}
+    force_factors = {"mN": 1.0, "N": 1000.0, "g": 9.80665, "kg": 9806.65}
+    if time_unit not in time_factors or pressure_unit not in pressure_factors or force_unit not in force_factors:
+        raise ValueError("Une unité sélectionnée pour l'essai expérimental est inconnue.")
+
+    payload = {
+        "time": time_factors[time_unit] * (time_values - time_values[0]),
+        "pressure_MPa": pressure_factors[pressure_unit] * pressure_values,
+        "force_mN": force_factors[force_unit] * force_values,
+    }
+    if unfiltered_force_column and unfiltered_force_column in columns:
+        unfiltered = np.asarray(columns[unfiltered_force_column], dtype=float)[valid][order][unique_index]
+        payload["force_unfiltered_mN"] = force_factors[force_unit] * unfiltered
+    return payload
 
 
 def measured_pressure_payload(

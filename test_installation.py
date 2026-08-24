@@ -18,10 +18,10 @@ def main() -> None:
     base_path = Path(modele.__file__).resolve()
     expected_local_base = (APP_DIR / "Base.py").resolve()
 
-    print("Dossier Beta      :", APP_DIR)
+    print("Dossier Alpha V2  :", APP_DIR)
     print("Base.py chargé   :", base_path)
     if base_path != expected_local_base:
-        raise AssertionError("Le moteur chargé n'est pas le Base.py local au dossier Beta.")
+        raise AssertionError("Le moteur chargé n'est pas le Base.py local au dossier Alpha V2.")
 
     settings = dict(parametres.DEFAULT_SETTINGS)
     settings.update(

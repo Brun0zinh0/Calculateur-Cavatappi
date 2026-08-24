@@ -223,32 +223,92 @@ def draw_dimension_3d(ax, start, end, label: str, text_offset=(0.0, 0.0, 0.0), c
     ax.text(midpoint[0], midpoint[1], midpoint[2], label, color=color, fontsize=9, ha="center", va="center")
 
 
+def _cubic_bezier_3d(
+    start: np.ndarray,
+    control_start: np.ndarray,
+    control_end: np.ndarray,
+    end: np.ndarray,
+    samples: int = 64,
+) -> np.ndarray:
+    t = np.linspace(0.0, 1.0, samples)[:, None]
+    omt = 1.0 - t
+    return (
+        omt**3 * start
+        + 3.0 * omt**2 * t * control_start
+        + 3.0 * omt * t**2 * control_end
+        + t**3 * end
+    )
+
+
+def _make_uncoiled_end_curves(
+    helix: np.ndarray,
+    half_uncoiled: float,
+    total_length: float,
+    rho: float,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    if half_uncoiled <= 0.0:
+        return [], np.vstack((helix[0], helix[-1]))
+
+    start_tangent = helix[1] - helix[0]
+    end_tangent = helix[-1] - helix[-2]
+    start_tangent /= max(np.linalg.norm(start_tangent), 1.0e-12)
+    end_tangent /= max(np.linalg.norm(end_tangent), 1.0e-12)
+
+    physical_ends = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, total_length],
+        ],
+        dtype=float,
+    )
+    tangent_control = min(0.42 * half_uncoiled, 0.9 * rho)
+    axial_control = 0.38 * half_uncoiled
+    bottom = _cubic_bezier_3d(
+        physical_ends[0],
+        physical_ends[0] + np.array([0.0, 0.0, axial_control]),
+        helix[0] - tangent_control * start_tangent,
+        helix[0],
+    )
+    top = _cubic_bezier_3d(
+        helix[-1],
+        helix[-1] + tangent_control * end_tangent,
+        physical_ends[1] - np.array([0.0, 0.0, axial_control]),
+        physical_ends[1],
+    )
+    return [bottom, top], physical_ends
+
+
 def make_cavatappi_figure(settings: dict[str, SettingValue], state: str):
     geom = derived_geometry(settings)
     rho = float(settings["rho0_mm"])
     rout = float(settings["rout_mm"])
-    length = float(settings["initial_length_mm"])
+    active_length = float(settings["initial_length_mm"])
+    uncoiled_length = float(settings.get("uncoiled_length_mm", 0.0))
     pitch = geom["pitch0_mm"]
     view_elev = float(settings.get("view_elev_deg", 22.0))
     view_azim = float(settings.get("view_azim_deg", -58.0))
     if state == "prestrained":
-        length = geom["prestrained_length_mm"]
+        active_length = geom["prestrained_active_length_mm"]
         pitch = geom["prestrained_pitch_mm"]
+    length = active_length + uncoiled_length
+    half_uncoiled = 0.5 * uncoiled_length
 
-    turns = max(length / pitch, 0.1)
+    turns = max(active_length / pitch, 0.1)
     n = max(250, int(80 * turns))
     theta = np.linspace(0.0, 2.0 * np.pi * turns, n)
-    z = pitch * theta / (2.0 * np.pi)
+    z = half_uncoiled + pitch * theta / (2.0 * np.pi)
     x = rho * np.cos(theta)
     y = rho * np.sin(theta)
+    helix = np.column_stack((x, y, z))
+    uncoiled_curves, _ = _make_uncoiled_end_curves(helix, half_uncoiled, length, rho)
 
     fig = plt.figure(figsize=(7.6, 5.6))
     ax = fig.add_subplot(111, projection="3d")
     color = "#1f77b4" if state == "fabricated" else "#d62728"
     ax.plot(x, y, z, color=color, lw=4.0, solid_capstyle="round")
-    ax.plot([0, 0], [0, 0], [0, length], color="0.45", lw=1.2, ls="--")
-
-    for zi in (0.0, length):
+    for curve in uncoiled_curves:
+        ax.plot(curve[:, 0], curve[:, 1], curve[:, 2], color=color, lw=4.0, solid_capstyle="round")
+    for zi in (half_uncoiled, half_uncoiled + active_length):
         circle_theta = np.linspace(0.0, 2.0 * np.pi, 160)
         ax.plot(
             rho * np.cos(circle_theta),
@@ -269,7 +329,7 @@ def make_cavatappi_figure(settings: dict[str, SettingValue], state: str):
         ax,
         (x_len, y_len, 0.0),
         (x_len, y_len, length),
-        f"L = {length:.1f} mm",
+        f"L totale = {length:.1f} mm",
         text_offset=(0.45 * dim_pad, 0.0, 0.0),
     )
     ax.plot([0.0, x_len], [0.0, y_len], [0.0, 0.0], color="0.55", lw=0.8)
@@ -287,18 +347,24 @@ def make_cavatappi_figure(settings: dict[str, SettingValue], state: str):
     ax.plot([-outer_radius, -outer_radius], [0.0, y_diam], [z_diam, z_diam], color="0.55", lw=0.8)
     ax.plot([outer_radius, outer_radius], [0.0, y_diam], [z_diam, z_diam], color="0.55", lw=0.8)
 
-    visible_pitch = min(pitch, length)
+    visible_pitch = min(pitch, active_length)
     x_pitch = -outer_radius - 0.95 * dim_pad
     y_pitch = outer_radius + 0.75 * dim_pad
     draw_dimension_3d(
         ax,
-        (x_pitch, y_pitch, 0.0),
-        (x_pitch, y_pitch, visible_pitch),
+        (x_pitch, y_pitch, half_uncoiled),
+        (x_pitch, y_pitch, half_uncoiled + visible_pitch),
         f"pas = {pitch:.2f} mm",
         text_offset=(-0.45 * dim_pad, 0.0, 0.0),
     )
-    ax.plot([0.0, x_pitch], [0.0, y_pitch], [0.0, 0.0], color="0.55", lw=0.8)
-    ax.plot([0.0, x_pitch], [0.0, y_pitch], [visible_pitch, visible_pitch], color="0.55", lw=0.8)
+    ax.plot([0.0, x_pitch], [0.0, y_pitch], [half_uncoiled, half_uncoiled], color="0.55", lw=0.8)
+    ax.plot(
+        [0.0, x_pitch],
+        [0.0, y_pitch],
+        [half_uncoiled + visible_pitch, half_uncoiled + visible_pitch],
+        color="0.55",
+        lw=0.8,
+    )
 
     ax.set_xlim(-radius_limit, radius_limit)
     ax.set_ylim(-radius_limit, radius_limit)
@@ -322,11 +388,13 @@ def make_cavatappi_figure(settings: dict[str, SettingValue], state: str):
 def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: str) -> str:
     """Construit un visualiseur 3D interactif autonome sur un canvas HTML."""
     geom = derived_geometry(settings)
-    length = float(settings["initial_length_mm"])
+    active_length = float(settings["initial_length_mm"])
+    uncoiled_length = float(settings.get("uncoiled_length_mm", 0.0))
     pitch = float(geom["pitch0_mm"])
     if state == "prestrained":
-        length = float(geom["prestrained_length_mm"])
+        active_length = float(geom["prestrained_active_length_mm"])
         pitch = float(geom["prestrained_pitch_mm"])
+    length = active_length + uncoiled_length
 
     config = {
         "rho": float(settings["rho0_mm"]),
@@ -334,6 +402,8 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
         "rin": float(settings["rin_mm"]),
         "nylonRadius": 0.5 * float(settings["nylon_diameter_mm"]),
         "length": length,
+        "activeLength": active_length,
+        "uncoiledLength": uncoiled_length,
         "pitch": pitch,
         "elev": float(settings.get("view_elev_deg", 22.0)),
         "azim": float(settings.get("view_azim_deg", -58.0)),
@@ -431,7 +501,8 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
   let previousX = 0;
   let previousY = 0;
 
-  const turns = Math.max(cfg.length / Math.max(cfg.pitch, 1e-9), 0.1);
+  const turns = Math.max(cfg.activeLength / Math.max(cfg.pitch, 1e-9), 0.1);
+  const halfUncoiled = 0.5 * cfg.uncoiledLength;
   const sampleCount = Math.min(2400, Math.max(320, Math.ceil(100 * turns)));
   const helix = [];
   for (let i = 0; i < sampleCount; i += 1) {
@@ -439,8 +510,62 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     helix.push([
       cfg.rho * Math.cos(phase),
       cfg.rho * Math.sin(phase),
-      cfg.pitch * phase / (2 * Math.PI)
+      halfUncoiled + cfg.pitch * phase / (2 * Math.PI)
     ]);
+  }
+  function unitVector(vector) {
+    const norm = Math.hypot(vector[0], vector[1], vector[2]) || 1;
+    return vector.map((value) => value / norm);
+  }
+
+  function cubicBezierPoints(start, controlStart, controlEnd, end, count = 64) {
+    const points = [];
+    for (let i = 0; i < count; i += 1) {
+      const t = i / (count - 1);
+      const omt = 1 - t;
+      points.push([0, 1, 2].map((axis) => (
+        omt ** 3 * start[axis]
+        + 3 * omt ** 2 * t * controlStart[axis]
+        + 3 * omt * t ** 2 * controlEnd[axis]
+        + t ** 3 * end[axis]
+      )));
+    }
+    return points;
+  }
+
+  let physicalEnds = [
+    [helix[0][0], helix[0][1], 0],
+    [helix[helix.length - 1][0], helix[helix.length - 1][1], cfg.length]
+  ];
+  let uncoiledLines = [];
+  if (cfg.uncoiledLength > 0) {
+    physicalEnds = [[0, 0, 0], [0, 0, cfg.length]];
+    const startTangent = unitVector([
+      helix[1][0] - helix[0][0],
+      helix[1][1] - helix[0][1],
+      helix[1][2] - helix[0][2]
+    ]);
+    const endTangent = unitVector([
+      helix[helix.length - 1][0] - helix[helix.length - 2][0],
+      helix[helix.length - 1][1] - helix[helix.length - 2][1],
+      helix[helix.length - 1][2] - helix[helix.length - 2][2]
+    ]);
+    const tangentControl = Math.min(0.42 * halfUncoiled, 0.9 * cfg.rho);
+    const axialControl = 0.38 * halfUncoiled;
+    uncoiledLines = [
+      cubicBezierPoints(
+        physicalEnds[0],
+        [0, 0, axialControl],
+        helix[0].map((value, axis) => value - tangentControl * startTangent[axis]),
+        helix[0]
+      ),
+      cubicBezierPoints(
+        helix[helix.length - 1],
+        helix[helix.length - 1].map((value, axis) => value + tangentControl * endTangent[axis]),
+        [0, 0, cfg.length - axialControl],
+        physicalEnds[1]
+      )
+    ];
   }
 
   const outerRadius = cfg.rho + cfg.rout;
@@ -491,6 +616,8 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
 
   function geometryBounds() {
     const points = helix.map(perspectivePoint);
+    points.push(...physicalEnds.map(perspectivePoint));
+    for (const line of uncoiledLines) points.push(...line.map(perspectivePoint));
     const dimensionPoints = [
       [outerRadius + dimPad, 0, 0],
       [outerRadius + dimPad, 0, cfg.length],
@@ -649,6 +776,31 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
     ctx.restore();
   }
 
+  function drawUncoiledEnds(project, baseWidth, colors) {
+    for (const line of uncoiledLines) {
+      const points = line.map(project.point);
+      strokePolyline(points, colors.tubeShadow, baseWidth + 2.4);
+      strokePolyline(points, shadedColor(cfg.tubeColor, 0.92, 0.76), baseWidth);
+      strokePolyline(points, colors.tubeHighlight, Math.max(0.75, 0.22 * baseWidth));
+      strokePolyline(points, shadedColor(cfg.accentColor, 1.0, 0.11), Math.max(0.55, 0.07 * baseWidth));
+    }
+  }
+
+  function drawUncoiledJunctions(project, baseWidth, colors) {
+    if (uncoiledLines.length !== 2) return;
+    const bridges = [
+      [...uncoiledLines[0].slice(-5), ...helix.slice(1, 5)],
+      [...helix.slice(-5, -1), ...uncoiledLines[1].slice(0, 5)]
+    ];
+    for (const bridge of bridges) {
+      const points = bridge.map(project.point);
+      strokePolyline(points, shadedColor(cfg.tubeColor, 0.90, 0.96), baseWidth + 2.4);
+      strokePolyline(points, shadedColor(cfg.tubeColor, 0.96, 0.90), baseWidth);
+      strokePolyline(points, colors.tubeHighlight, Math.max(0.75, 0.22 * baseWidth));
+      strokePolyline(points, shadedColor(cfg.accentColor, 1.0, 0.11), Math.max(0.55, 0.07 * baseWidth));
+    }
+  }
+
   function drawReferenceGrid(project, colors) {
     if (!gridVisible) return;
     const extent = outerRadius + 0.55 * dimPad;
@@ -791,14 +943,14 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
   }
 
   function drawEndSection(project, colors, end) {
-    const center = helix[end === 0 ? 0 : helix.length - 1];
-    const tangent = tangentAt(end);
+    const center = physicalEnds[end];
+    const tangent = cfg.uncoiledLength > 0 ? [0, 0, 1] : tangentAt(end);
     const outer = ringPoints(center, cfg.rout, tangent).map(project.point);
     const inner = ringPoints(center, Math.min(cfg.rin, cfg.rout * 0.98), tangent).map(project.point);
     const depth = project.point(center)[2];
     const endDepths = [
-      project.point(helix[0])[2],
-      project.point(helix[helix.length - 1])[2]
+      project.point(physicalEnds[0])[2],
+      project.point(physicalEnds[1])[2]
     ];
     const minDepth = Math.min(...endDepths);
     const maxDepth = Math.max(...endDepths);
@@ -838,20 +990,18 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
 
     drawReferenceGrid(project, colors);
 
-    const axisA = project.point([0, 0, 0]);
-    const axisB = project.point([0, 0, cfg.length]);
-    strokePolyline([axisA, axisB], colors.guide, 1.2, true);
-
     const physicalTubeWidth = 2 * cfg.rout * project.scale;
     const legibleTubeWidth = Math.max(4.5, 0.50 * cfg.pitch * project.scale);
     const tubeWidth = Math.max(4, Math.min(physicalTubeWidth, legibleTubeWidth));
     const endOrder = [0, 1].sort((left, right) => {
-      const leftDepth = project.point(helix[left === 0 ? 0 : helix.length - 1])[2];
-      const rightDepth = project.point(helix[right === 0 ? 0 : helix.length - 1])[2];
+      const leftDepth = project.point(physicalEnds[left])[2];
+      const rightDepth = project.point(physicalEnds[right])[2];
       return leftDepth - rightDepth;
     });
     drawEndSection(project, colors, endOrder[0]);
+    drawUncoiledEnds(project, tubeWidth, colors);
     drawDepthShadedHelix(project, tubeWidth, colors);
+    drawUncoiledJunctions(project, tubeWidth, colors);
     drawEndSection(project, colors, endOrder[1]);
 
     const lengthX = outerRadius + dimPad;
@@ -869,7 +1019,7 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
       project,
       [lengthX, 0, 0],
       [lengthX, 0, cfg.length],
-      `L = ${cfg.length.toFixed(1)} mm`,
+      `L totale = ${cfg.length.toFixed(1)} mm`,
       23,
       0
     );
@@ -896,21 +1046,25 @@ def make_cavatappi_interactive_html(settings: dict[str, SettingValue], state: st
 
     const pitchX = -outerRadius - dimPad;
     const pitchY = outerRadius + dimPad;
-    const visiblePitch = Math.min(cfg.pitch, cfg.length);
+    const visiblePitch = Math.min(cfg.pitch, cfg.activeLength);
+    const pitchStartZ = halfUncoiled;
     strokePolyline(
-      [project.point([0, 0, 0]), project.point([pitchX, pitchY, 0])],
+      [project.point([0, 0, pitchStartZ]), project.point([pitchX, pitchY, pitchStartZ])],
       colors.guide,
       1
     );
     strokePolyline(
-      [project.point([0, 0, visiblePitch]), project.point([pitchX, pitchY, visiblePitch])],
+      [
+        project.point([0, 0, pitchStartZ + visiblePitch]),
+        project.point([pitchX, pitchY, pitchStartZ + visiblePitch])
+      ],
       colors.guide,
       1
     );
     dimension(
       project,
-      [pitchX, pitchY, 0],
-      [pitchX, pitchY, visiblePitch],
+      [pitchX, pitchY, pitchStartZ],
+      [pitchX, pitchY, pitchStartZ + visiblePitch],
       `pas = ${cfg.pitch.toFixed(2)} mm`,
       -24,
       0
@@ -1065,19 +1219,172 @@ def make_cross_section_figure(settings: dict[str, SettingValue]):
     return _style_figure(fig)
 
 
-def plot_time_response_fr(data: dict[str, np.ndarray]):
-    fig, axes = plt.subplots(3, 1, figsize=(9.0, 7.2), sharex=True, constrained_layout=True)
-    axes[0].plot(data["time"], data["force_total_mN"], lw=1.5, color="#1f77b4")
-    axes[0].set_ylabel("Force bloquée (mN)")
-    axes[1].plot(data["time"], data["torque_act_microNm"], lw=1.5, color="#d62728")
-    axes[1].set_ylabel("Couple d'actionnement (µN·m)")
-    axes[2].plot(data["time"], data["pressure_MPa"], lw=1.5, color="#2ca02c")
-    axes[2].set_ylabel("Pression (MPa)")
-    axes[2].set_xlabel("Temps depuis le debut de pression (s)")
-    axes[2].set_xlabel("Temps depuis le début de pression (s)")
-    axes[0].set_title("Réponse du modèle Cavatappi")
-    for ax in axes:
-        ax.grid(True, alpha=0.3)
+def plot_time_response_fr(
+    data: dict[str, np.ndarray],
+    show_torque: bool = True,
+    overlay_pressure: bool = False,
+):
+    panel_count = 1 + int(show_torque) + int(not overlay_pressure)
+    figure_height = {1: 4.4, 2: 5.9, 3: 7.2}[panel_count]
+    fig, axes_array = plt.subplots(
+        panel_count,
+        1,
+        figsize=(9.0, figure_height),
+        sharex=True,
+        constrained_layout=True,
+        squeeze=False,
+    )
+    axes = list(axes_array[:, 0])
+    time = np.asarray(data["time"], dtype=float)
+    force_axis = axes[0]
+    force_line = force_axis.plot(
+        time,
+        data["force_total_mN"],
+        lw=1.6,
+        color="#67a4ff",
+        label="Force bloquée",
+    )[0]
+    force_axis.set_ylabel("Force bloquée (mN)")
+    force_axis.set_title("Réponse du modèle Cavatappi")
+
+    next_panel = 1
+    if overlay_pressure:
+        pressure_axis = force_axis.twinx()
+        pressure_line = pressure_axis.plot(
+            time,
+            data["pressure_MPa"],
+            lw=1.45,
+            color="#ff5c68",
+            label="Pression",
+        )[0]
+        pressure_axis.set_ylabel("Pression (MPa)")
+        force_axis.legend(
+            [force_line, pressure_line],
+            [force_line.get_label(), pressure_line.get_label()],
+            loc="best",
+        )
+
+    if show_torque:
+        torque_axis = axes[next_panel]
+        torque_axis.plot(
+            time,
+            data["torque_act_microNm"],
+            lw=1.5,
+            color="#f3a43b",
+        )
+        torque_axis.set_ylabel("Couple d'actionnement (µN·m)")
+        next_panel += 1
+
+    if not overlay_pressure:
+        pressure_axis = axes[next_panel]
+        pressure_axis.plot(
+            time,
+            data["pressure_MPa"],
+            lw=1.5,
+            color="#2ca02c",
+        )
+        pressure_axis.set_ylabel("Pression (MPa)")
+
+    axes[-1].set_xlabel("Temps depuis le début de pression (s)")
+    for axis in axes:
+        axis.grid(True, alpha=0.3)
+    return _style_figure(fig)
+
+
+def plot_experimental_force_pressure(
+    data: dict[str, np.ndarray],
+    test_name: str,
+    show_unfiltered: bool = False,
+):
+    time = np.asarray(data["time"], dtype=float)
+    force = np.asarray(data["force_mN"], dtype=float)
+    pressure = np.asarray(data["pressure_MPa"], dtype=float)
+    fig, force_axis = plt.subplots(figsize=(9.2, 4.6), constrained_layout=True)
+    pressure_axis = force_axis.twinx()
+
+    force_axis.plot(time, force, color="#67a4ff", lw=1.7, label="Force filtrée")
+    if show_unfiltered and "force_unfiltered_mN" in data:
+        force_axis.plot(
+            time,
+            np.asarray(data["force_unfiltered_mN"], dtype=float),
+            color="#a8c8ff",
+            lw=0.8,
+            alpha=0.45,
+            label="Force non filtrée",
+        )
+    pressure_axis.plot(time, pressure, color="#ff5c68", lw=1.45, label="Pression")
+
+    force_axis.set_title(f"Essai expérimental - {test_name}")
+    force_axis.set_xlabel("Temps (s)")
+    force_axis.set_ylabel("Force (mN)", color="#67a4ff")
+    pressure_axis.set_ylabel("Pression (MPa)", color="#ff5c68")
+    force_axis.tick_params(axis="y", colors="#67a4ff")
+    pressure_axis.tick_params(axis="y", colors="#ff5c68")
+    force_axis.grid(True)
+    lines = force_axis.get_lines() + pressure_axis.get_lines()
+    force_axis.legend(lines, [line.get_label() for line in lines], loc="best")
+    return _style_figure(fig)
+
+
+def plot_time_response_with_experiment_fr(
+    data: dict[str, np.ndarray],
+    experimental: dict[str, np.ndarray],
+    test_name: str,
+    show_unfiltered: bool = False,
+):
+    """Superpose la réponse simulée et un essai mesuré sur un seul graphe.
+
+    À utiliser lorsque la pression injectée dans la simulation est l'historique
+    mesuré de l'essai : simulation et mesure partagent alors la même base de
+    temps, et deux graphes séparés n'ont plus de raison d'être. Force simulée
+    et force mesurée sur l'axe principal, pression injectée sur l'axe
+    secondaire ; le couple n'est pas affiché dans cette vue.
+    """
+    fig, force_axis = plt.subplots(figsize=(9.2, 5.0), constrained_layout=True)
+    pressure_axis = force_axis.twinx()
+    time_sim = np.asarray(data["time"], dtype=float)
+    time_exp = np.asarray(experimental["time"], dtype=float)
+
+    force_axis.plot(
+        time_sim,
+        np.asarray(data["force_total_mN"], dtype=float),
+        color="#67a4ff",
+        lw=1.8,
+        label="Force simulée",
+    )
+    if show_unfiltered and "force_unfiltered_mN" in experimental:
+        force_axis.plot(
+            time_exp,
+            np.asarray(experimental["force_unfiltered_mN"], dtype=float),
+            color="#ffd9a0",
+            lw=0.8,
+            alpha=0.5,
+            label="Force mesurée non filtrée",
+        )
+    force_axis.plot(
+        time_exp,
+        np.asarray(experimental["force_mN"], dtype=float),
+        color="#f3a43b",
+        lw=1.2,
+        label="Force mesurée",
+    )
+    pressure_axis.plot(
+        time_sim,
+        np.asarray(data["pressure_MPa"], dtype=float),
+        color="#ff5c68",
+        lw=1.2,
+        alpha=0.85,
+        label="Pression injectée (mesurée)",
+    )
+
+    force_axis.set_title(f"Superposition simulation / essai - {test_name}")
+    force_axis.set_xlabel("Temps depuis le début de pression (s)")
+    force_axis.set_ylabel("Force (mN)")
+    pressure_axis.set_ylabel("Pression (MPa)", color="#ff5c68")
+    pressure_axis.tick_params(axis="y", colors="#ff5c68")
+    force_axis.grid(True, alpha=0.3)
+    lines = force_axis.get_lines() + pressure_axis.get_lines()
+    force_axis.legend(lines, [line.get_label() for line in lines], loc="best")
     return _style_figure(fig)
 
 

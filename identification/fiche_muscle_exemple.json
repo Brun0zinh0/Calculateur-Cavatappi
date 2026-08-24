@@ -1,0 +1,11 @@
+{
+  "rout_mm": 1.0,
+  "rin_mm": 0.4,
+  "nylon_diameter_mm": 0.77,
+  "rho0_mm": 2.16,
+  "alpha0_deg": 10.53,
+  "theta_f_deg": 37.91,
+  "initial_length_mm": 32.45,
+  "uncoiled_length_mm": 0.0,
+  "eps": 0.8
+}

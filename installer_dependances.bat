@@ -3,7 +3,7 @@ chcp 65001 >nul
 setlocal
 cd /d "%~dp0"
 
-echo Installation des dépendances Python de l'interface Cavatappi Beta...
+echo Installation des dépendances Python de l'interface Cavatappi Alpha V2...
 set "PYTHON_CMD=python"
 python --version >nul 2>&1
 if errorlevel 1 (

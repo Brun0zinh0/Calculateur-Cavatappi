@@ -43,3 +43,43 @@ Pour finir la possibilité d'exporter les résultats en fichier CSV pour les tra
 - Les ombres, reflets et contours ont Ã©tÃ© retravaillÃ©s pour amÃ©liorer la perception de la gÃ©omÃ©trie.
 - Un liserÃ© discret distingue les Ã©tats fabriquÃ© et prÃ©contraint.
 - Le rendu a Ã©tÃ© vÃ©rifiÃ© sur ordinateur et mobile, ainsi que pendant la rotation interactive.
+
+
+## Mise a jour Audit 2026-08 - alpha V3 (24 aout 2026)
+
+Cette version est issue d'un audit scientifique complet du moteur contre les
+trois articles de reference (equation par equation) et les donnees
+experimentales de l'equipe, suivi de l'execution integrale du plan de
+correction (PLAN_DE_CORRECTION.md, rapport complet dans audit/rapport_audit.html).
+Moteur 2026.08.21-audit-phase4-14, suite de tests passee de 14 a 26 tests.
+
+- Chaine de validation quantitative : validation/validation_figure7.py
+  (calibration de la numerisation corrigee, baseline de non-regression +/-2 %
+  exercee par la suite de tests), validation/validation_fig11_exp.py
+  (mode suspendu valide contre la fig. 11 d'EXP : fluage a ~10 %),
+  validation/etude_convergence.py + CONVERGENCE.md (reglages recommandes :
+  interactif 3 couches/phi 8/dt 0,5 ; production 6 couches/phi 8/dt 0,1).
+- Mode section reactualisee (updated) corrige : le ratchet de cyclage etait
+  un biais O(h) de l'integrateur geometrique explicite, elimine par un
+  correcteur de point milieu du BVP radial (fermeture de cycle x28). Sur la
+  figure 7, le couple passe de -33 % a -6/-12 % des ancrages experimentaux.
+- Precontrainte viscoelastique en option (selecteur « Precontrainte ») :
+  branches de Maxwell actives des l'elongation, training et fig. 11
+  simulables ; le defaut reste la reference elastique (fidele aux niveaux
+  publies).
+- Outil d'identification materiau (identification/identifier_materiau.py) :
+  paliers -> constantes de temps et fractions de relaxation, facteur
+  d'echelle en forme fermee, verdict « spectre vs structure » sur la
+  courbure F(P). Constat chiffre : le spectre de l'article n'est pas
+  transferable aux muscles de l'equipe (relaxation 4-9 % mesuree vs ~83 %).
+- Interface : superposition d'un essai experimental sur UN SEUL graphe quand
+  la pression injectee est l'historique mesure (option activable/desactivable
+  dans la barre laterale), option d'appariement des coefficients de Poisson,
+  actionnement en % normalise par la longueur non chargee L_T0 (ancienne
+  normalisation exportee en _loaded_ref).
+- Corrections diverses de l'audit : profils de pression lineaires par defaut
+  sur tous les points d'entree, verrou de reference serie a P=0, garde
+  theta=0, inference d'unites par mots entiers, rampe de mise en charge de la
+  masse, garde de residu d'equilibre, compliance des extremites evaluee a
+  l'angle post-precontrainte, documentation honnete des ecarts a l'article
+  (profil d'angle de biais, section figee) directement dans le README.

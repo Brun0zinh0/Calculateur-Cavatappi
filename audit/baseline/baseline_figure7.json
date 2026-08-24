@@ -1,0 +1,59 @@
+{
+  "model_version": "2026.08.21-audit-phase32-13",
+  "pmode": "rescale",
+  "established_t0_s": 185.0,
+  "text_anchors": {
+    "0.8": {
+      "force_peak_mN": 1824.6,
+      "torque_peak_microNm": 877.01
+    },
+    "1.0": {
+      "force_peak_mN": 2424.67,
+      "torque_peak_microNm": 873.41
+    }
+  },
+  "configs": {
+    "reduced": {
+      "discretization": {
+        "dt": 1.0,
+        "n_layers": 2,
+        "n_phi": 8
+      },
+      "0.8": {
+        "force_peak_mean_mN": 1677.47,
+        "force_valley_mean_mN": 1476.03,
+        "torque_peak_mean_microNm": 588.09,
+        "torque_valley_mean_microNm": -117.52,
+        "pressure_peak_mean_MPa": 1.4187
+      },
+      "1.0": {
+        "force_peak_mean_mN": 2110.83,
+        "force_valley_mean_mN": 1921.03,
+        "torque_peak_mean_microNm": 583.29,
+        "torque_valley_mean_microNm": -119.95,
+        "pressure_peak_mean_MPa": 1.4191
+      }
+    },
+    "production": {
+      "discretization": {
+        "dt": 1.0,
+        "n_layers": 6,
+        "n_phi": 16
+      },
+      "0.8": {
+        "force_peak_mean_mN": 1705.44,
+        "force_valley_mean_mN": 1498.65,
+        "torque_peak_mean_microNm": 595.88,
+        "torque_valley_mean_microNm": -120.92,
+        "pressure_peak_mean_MPa": 1.4187
+      },
+      "1.0": {
+        "force_peak_mean_mN": 2145.01,
+        "force_valley_mean_mN": 1950.09,
+        "torque_peak_mean_microNm": 590.91,
+        "torque_valley_mean_microNm": -123.48,
+        "pressure_peak_mean_MPa": 1.4191
+      }
+    }
+  }
+}
