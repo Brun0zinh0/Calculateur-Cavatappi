@@ -205,6 +205,9 @@ def render_metric_grid(items: list[tuple[str, str]]) -> None:
 TEMPORAL_DISPLAY_SETTING_KEYS = {
     "show_temporal_torque",
     "overlay_temporal_pressure",
+    # Option d'affichage pur : ne doit jamais invalider un resultat calcule
+    # (sinon cocher/decocher la superposition fait disparaitre le graphe).
+    "experimental_overlay_single_graph",
 }
 BLOCKED_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "eps_study_min",
