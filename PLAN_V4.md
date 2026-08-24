@@ -48,14 +48,30 @@ génération de force. Paramètre physique : le défaut de circularité /
 l'interférence initiale δ_c (mm), mesurable (E6/E8), pas un coefficient
 libre.
 
-### M-B. Jeu série au montage (candidat banc d'essai)
+### M-B. Engagement des extrémités désenroulées / jeu série (candidat banc + spécimen)
 
-Un jeu δ₀ dans la chaîne actionneur-capteur (fixations, spires d'extrémité)
-qui doit se fermer avant transmission : extension directe du cadre
-« compliance série » d'alpha V3 — l'élément série transmet
-F = k_ext·max(0, Δ − δ₀). Prédit un seuil **dépendant de la précharge** (un
-banc plus préchargé a moins de jeu) et identique montée/descente. Paramètre
-mesurable : δ₀ (mm) au comparateur, ou identifié sur E7.
+Deux variantes du même mécanisme d'engagement en série :
+
+- **M-B1 — redressement des extrémités désenroulées** : les portions non
+  hélicoïdales quittent la spire courbées/coudées. À basse pression, deux
+  effets absorbent les premiers incréments : le **redressement de type
+  Bourdon** du tube courbé pressurisé (piloté par la pression → produit un
+  seuil en pression), et la **transition flexion → traction** de l'extrémité
+  (très souple tant qu'elle fléchit — asymptote `tangent_beam` —, quasi
+  rigide une fois alignée — asymptote `axial_rod`). L'élément V4 interpole
+  entre ces deux asymptotes déjà présentes dans alpha V3, avec des paramètres
+  purement géométriques et mesurables : longueur désenroulée, angle de
+  sortie, rayon du coude. Prédit un seuil croissant avec la longueur
+  d'extrémités et décroissant avec la précharge, et la super-linéarité
+  (pente faible puis raidissement à l'alignement).
+- **M-B2 — jeu de montage pur** : un jeu δ₀ dans la chaîne
+  actionneur-capteur qui doit se fermer avant transmission :
+  F = k_ext·max(0, Δ − δ₀). Seuil dépendant de la précharge, identique
+  montée/descente. Paramètre : δ₀ (mm) au comparateur, ou identifié sur E7.
+
+Note : le ressort série **linéaire** actuel d'alpha V3 ne peut PAS produire
+de seuil (il adoucit la pente sans la retarder) — c'est bien la non-linéarité
+d'engagement qui fait le dead-band.
 
 ### M-C. Raidissement géométrique grande déformation (candidat courbure)
 
@@ -84,6 +100,8 @@ discrimination (une séance de banc) :
 | **E6 — volume-pression à basse pression** (pousse-seringue, V(P) de 0 à 0,15 MPa) | Compliance initiale anormalement élevée (regonflage) → M-A, et mesure directe de δ_c |
 | **E8 — observation directe** (photo/mesure du diamètre externe à 0 / 0,05 / 0,1 MPa) | Confirmation visuelle du regonflage ; entrée quantitative pour M-A |
 | Rejouer E7 après 10 cycles d'entraînement | Reproduire le 0,38 → 0,23 MPa de l'article → valide la variante « état d'affaissement » de M-A |
+| **E9 — seuil vs longueur d'extrémités** : comparer le seuil sur des muscles à extrémités désenroulées différentes (B/I/J/D de Sacha, muscles de Bruno) | Seuil croissant avec la longueur d'extrémités → M-B1 ; identique sur un muscle à extrémités quasi nulles → M-A |
+| **E8⁺ — vidéo des extrémités** entre 0 et 0,1 MPa | Redressement visible des tangentes de sortie → M-B1 confirmé visuellement |
 
 ## 4. Implémentation par étapes
 
