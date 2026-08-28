@@ -124,6 +124,15 @@ blanc de 600 s (`StabCell/`, `ANALYSE_PRELIMINAIRE.md` § D) bornent la dérive
 L'incompatibilité d'amplitude est donc bien physique (matériau ou montage),
 et le départage se joue entre les deux candidates ci-dessus.
 
+**Premier essai E10 réalisé (28/08, `test E10/`)** : relaxation −6,7 %
+reproduite sous marquage ; photos non concluantes (caméra déplacée entre T0
+et T10, à refaire caméra fixe) ; mais l'analyse des décrochements persistants
+de la courbe — validée sur les blancs StabCell — montre que le **stick-slip
+d'ancrage est réel et ne porte que ~7 % de la relaxation en médiane** (jusqu'à
+33 % sur E10). L'essentiel de la chute est lisse : matériau, ou fluage
+d'ancrage continu. Le juge de paix reste **E2** (relaxation sur tube nu, sans
+nœud dans le chemin d'effort). Détail : `ANALYSE_PRELIMINAIRE.md` § E.
+
 ## Configuration recommandée par usage (champs de l'interface)
 
 - **Prédire l'actionnement** (gains, formes, cycles) : fiche du muscle
@@ -148,4 +157,6 @@ et le départage se joue entre les deux candidates ci-dessus.
   renseignant la longueur réellement étirée ; corrigerait la dérive du ratio
   F₀ avec ε.
 - Queue lente du spectre non résolue (> 600 s) : un « 10 N » de 30-60 min.
-- Essai E10 (marquage des ancrages) pour départager matériau vs montage.
+- E10 : premier essai fait (28/08) — à-coups d'ancrage confirmés mais
+  minoritaires (~7 %) ; refaire les photos caméra fixe, puis E2 (tube nu)
+  pour attribuer la composante lisse.

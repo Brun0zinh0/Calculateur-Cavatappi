@@ -258,6 +258,57 @@ l'interprétation des données :
 - Cadence réelle ~10 Hz (`delay(100)` — le commentaire « 20 readings/second »
   du croquis est obsolète), cohérente avec les CSV.
 
+## E) Premier essai E10 — marquage des ancrages (28/08)
+
+Essai réalisé : muscle précontraint monté comme un « 10 N » normal, traits
+blancs aux deux jonctions et pointillés le long de l'hélice, photos T0/T10,
+600 s d'enregistrement à P = 0 (`test E10/`). La force a relaxé de
+**1 030 à 962 mN (−6,7 %)**, profil typique de la campagne — le phénomène à
+expliquer s'est bien produit pendant l'essai marqué.
+
+### Les photos ne tranchent pas (caméra déplacée)
+
+L'appareil a bougé entre T0 et T10 (cadrage et angle différents). Les
+décalages apparents des traits (~2-3 mm aux deux jonctions) sont de l'ordre
+de ce que la parallaxe produit, et leurs sens ne sont pas cohérents entre eux
+— aucun trait nettement **scindé** (la signature décisive) n'est visible. Un
+changement de forme au niveau de l'ancrage haut (une boucle de tube apparaît
+entre le scotch noir et le trait) est suggestif mais pas concluant sous cet
+angle. **À refaire caméra fixe** : téléphone posé/scotché, même cadrage
+exact, gros plan par jonction — ou mieux, mesure directe au pied à coulisse
+des distances trait-scotch à t0 et t10, insensible à la parallaxe.
+
+### La forme de la courbe, elle, apporte une réponse partielle
+
+Un glissement d'ancrage procède par à-coups (stick-slip) : des décrochements
+de niveau brusques et **persistants**, que la relaxation matérielle — continue
+par nature — ne produit pas. Détecteur : saut de la médiane 18 s avant/après
+chaque instant, validé sur les 5 blancs StabCell (plancher de fausse alarme :
+0-1 événement marginal à −4,5 mN par blanc ; les excursions de bruit à ±2 mN
+ne persistent pas).
+
+Résultat sur les 18 « 10 N » + E10, hors 60 premières secondes (où la branche
+rapide τ₁ ≈ 20 s du spectre rend la pente trop forte pour séparer un à-coup
+d'une relaxation lisse) :
+
+- **Les à-coups persistants existent** : 0 à 3 par essai, de −4 à −8 mN
+  (E10 : −4,9, −7,6, −7,9 mN à t = 140, 380 et 458 s), absents des blancs.
+  Le glissement d'ancrage est donc **réel**.
+- **Mais ils ne portent qu'une petite part de la relaxation** : ~7 %
+  en médiane (0 à 14 % selon les essais ; E10, cas le plus marqué : 33 %).
+  L'essentiel de la chute de force est **lisse** (≈ a·ln t).
+
+La composante lisse reste donc non attribuée : vraie viscoélasticité du
+matériau, ou fluage d'ancrage continu (le tube de PVC sous un scotch serré
+peut ramper sans à-coups). Deux voies pour fermer : refaire les photos E10
+caméra fixe (tranche le fluage continu d'ancrage), et surtout **E2** —
+relaxation sur tube nu entre mors propres, qui mesure le matériau sans aucun
+nœud dans le chemin d'effort.
+
+*Nota : la présence de la tige filetée qui longe/traverse l'hélice sur le banc
+mérite d'être documentée — si les spires la touchent, le frottement
+spire-tige peut contribuer aux à-coups et au dead-band.*
+
 ## Prochaines étapes proposées
 
 1. **Modélisation quantitative enfin possible** : remplir une fiche
