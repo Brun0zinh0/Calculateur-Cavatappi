@@ -75,10 +75,6 @@ AXIAL_MODULUS_OPTIONS = ["paper_table", "maxwell_sum"]
 # la phase d'elongation (20 mm/min), aucune reference elastique conservee.
 # (audit 2026-08, item 3.2)
 PRESTRAIN_REFERENCE_OPTIONS = ["elastic_tk_reference", "viscoelastic_history"]
-PRESTRAIN_REFERENCE_LABELS = {
-    "elastic_tk_reference": "Référence élastique conservée (défaut historique)",
-    "viscoelastic_history": "Histoire viscoélastique complète (schéma de l'article)",
-}
 MAXWELL_ANISOTROPY_OPTIONS = ["axial_test_only", "paper_equal"]
 # paper_crossed = lettre (probablement coquillee) des articles : nu(s->phi)
 # applique sur eps_r et nu(s->r) sur eps_phi ; physical = appariement physique.
@@ -115,7 +111,8 @@ AXIAL_MODULUS_LABELS = {
     "maxwell_sum": "Somme des modules de Maxwell",
 }
 PRESTRAIN_REFERENCE_LABELS = {
-    "elastic_tk_reference": "Précontrainte élastique conservée",
+    "elastic_tk_reference": "Référence élastique conservée (défaut historique)",
+    "viscoelastic_history": "Histoire viscoélastique complète (schéma de l'article)",
 }
 MAXWELL_ANISOTROPY_LABELS = {
     "axial_test_only": "Relaxation limitée à la direction axiale",
