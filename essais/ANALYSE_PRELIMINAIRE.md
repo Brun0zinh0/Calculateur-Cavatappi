@@ -305,9 +305,9 @@ caméra fixe (tranche le fluage continu d'ancrage), et surtout **E2** —
 relaxation sur tube nu entre mors propres, qui mesure le matériau sans aucun
 nœud dans le chemin d'effort.
 
-*Nota : la présence de la tige filetée qui longe/traverse l'hélice sur le banc
-mérite d'être documentée — si les spires la touchent, le frottement
-spire-tige peut contribuer aux à-coups et au dead-band.*
+*Nota : la tige filetée visible sur les photos **longe l'actionneur en
+arrière-plan** sans le traverser ni le toucher (confirmé le 28/08) — le
+chevauchement n'est que visuel, aucun frottement spire-tige à considérer.*
 
 ## Prochaines étapes proposées
 
