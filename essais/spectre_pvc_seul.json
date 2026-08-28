@@ -1,0 +1,15 @@
+{
+  "source": "deconvolution du spectre composite par le partage tube/nylon du moteur",
+  "facteur_dilution_median": 0.6153,
+  "E_sigma_mpa": 37.76,
+  "maxwell_E0_mpa": 35.1269,
+  "maxwell_E1_mpa": 1.0013,
+  "maxwell_eta1_mpa_s": 19.61,
+  "maxwell_E2_mpa": 1.6318,
+  "maxwell_eta2_mpa_s": 624.3,
+  "maxwell_E3_mpa": 0.0,
+  "maxwell_eta3_mpa_s": 1.0,
+  "tau1_s": 19.58,
+  "tau2_s": 382.59,
+  "E0_sur_somme": 0.9303
+}
