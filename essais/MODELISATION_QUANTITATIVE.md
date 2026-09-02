@@ -25,6 +25,14 @@ compliance série + spectre de Maxwell ajusté sur les essais « 10 N »
 | τ₁ / τ₂ | **19,6 s** / **382,6 s** | 7,5 s / 163,5 s |
 | E₀/ΣE | **0,887** | 0,168 |
 
+> **Mise à jour 01/09 — essais longs « 30 L »** (1 800 s, ε = 1,0, muscles
+> C/I/K/O ; `ANALYSE_PRELIMINAIRE.md` § F) : τ₂ vaut en réalité **≈ 1 200 s**
+> (l'estimation 382,6 s était bornée par la fenêtre de 600 s) et E₀/ΣE
+> descend à **≈ 0,83** — borne haute, la queue n'étant pas close à 30 min.
+> L'écart à l'article demeure (facteur ~5). Branche rapide inchangée : rien
+> ne change pour l'actionnement ; pour un maintien ≥ 10 min, utiliser
+> E₀ ≈ 31,3, E₁ ≈ 2,4 / η₁ ≈ 115, E₂ ≈ 4,3 / η₂ ≈ 5 270 MPa.
+
 Ce spectre relève de la famille « passe 4 » du résultat n° 3 : fractions de
 force brutes, relaxation axiale seule. Les chiffres ci-dessous l'emploient
 tel quel pour les neuf cas J/L/Q, là où les valeurs par muscle du § suivant
@@ -156,7 +164,10 @@ nœud dans le chemin d'effort). Détail : `ANALYSE_PRELIMINAIRE.md` § E.
 - Convention ε spire seule vs longueur totale (2.11) : à trancher en
   renseignant la longueur réellement étirée ; corrigerait la dérive du ratio
   F₀ avec ε.
-- Queue lente du spectre non résolue (> 600 s) : un « 10 N » de 30-60 min.
+- ~~Queue lente du spectre non résolue (> 600 s)~~ **fait le 01/09** : six
+  « 30 L » de 1 800 s → τ₂ ≈ 1 200 s, E₀/ΣE ≈ 0,83 (borne haute, queue non
+  close à 30 min ; deux essais écartés pour dérive suspecte — logger la
+  température ambiante). Voir l'encadré en tête et § F de l'analyse.
 - E10 : premier essai fait (28/08) — à-coups d'ancrage confirmés mais
   minoritaires (~7 %) ; refaire les photos caméra fixe, puis E2 (tube nu)
   pour attribuer la composante lisse.

@@ -73,7 +73,8 @@ mesure directe de δ_c).
 
 > **Insensible au référencement de la pression.** Vérifié sur les 18 essais
 > « 10 N » : la pression y reste nulle dans l'échelle nominale et n'excède pas
-> 0,042 MPa — un seul compte ADC — dans l'échelle reconstruite. Les
+> 0,0084 MPa — deux comptes ADC, le quantum valant 0,0042 MPa soit 0,042 bar —
+> dans l'échelle reconstruite. Les
 > ajustements ci-dessous portent sur F(t) à pression nulle et ne font
 > intervenir la pression à aucun moment. **Les valeurs de cette section sont
 > donc inchangées.**
@@ -114,9 +115,10 @@ mesurée par cinq essais à blanc de 600 s (`StabCell/`, § D) : au plus
 **+11 mN**, et de signe **opposé** à la relaxation — la cellule monte
 légèrement quand la force relaxée descend de 30 à 210 mN. Les relaxations
 mesurées sont donc réelles ; les corriger de la dérive les **augmenterait**
-même de l'ordre du point. Reste la seconde réserve : τ₂ est mal contrainte
-par une fenêtre de 600 s tandis que E₃ ne l'est pas du tout — un essai de
-30 à 60 min reste nécessaire pour la queue lente.
+même de l'ordre du point. La seconde réserve — τ₂ mal contrainte
+par une fenêtre de 600 s, E₃ pas du tout — est levée à son tour par les six
+essais longs « 30 L » du 01/09 : voir § F, qui révise τ₂ à ≈ 1 200 s et
+E₀/ΣE à ≈ 0,83 (borne haute).
 
 ### Du composite au PVC seul
 
@@ -244,19 +246,61 @@ le nouvel outil de stabilité (`stabilite_cellule_gui.py`) qui a produit les
 (`identifier_parametres_materiaux.py`). Points qui touchent à
 l'interprétation des données :
 
-- **L'Arduino écrête le psi à zéro avant l'envoi** (`if (pressure_psi < 0)
-  pressure_psi = 0`). Le repos étant à ADC ≈ 91-103 (< 0,5 V), toute
-  l'information sous 0,5 V est perdue dans les colonnes `pressure_psi/bar`
-  du CSV — le tare PC (`pressure_raw_psi − pressure_tare_psi`) ne peut pas
-  la restituer. C'est précisément la zone du dead-band : la reconstruction
-  depuis les comptes `pressure_adc` (§ C et § 6.4.2) est donc la **seule**
-  échelle valable près de l'origine, et le croquis confirme sa formule
-  (ψ = (ADC·5/1023 − 0,5)·125 psi, 0,0689476 bar/psi).
+> **Attention aux versions.** Le croquis a été modifié le 28/08 sur deux
+> points qui changent la lecture des CSV. **Tous les fichiers de la campagne
+> — `Muscle *`, `StabCell`, `test E10` — ont été acquis avec la version
+> antérieure** et doivent être dépouillés comme indiqué ci-dessous.
+
+**Écrêtage du psi — retiré du croquis, mais présent dans les données déjà
+acquises.** La version employée pour la campagne appliquait
+`if (pressure_psi < 0) pressure_psi = 0` avant l'envoi. Le repos étant à
+ADC ≈ 91-103 (< 0,5 V), toute l'information sous 0,5 V est perdue dans les
+colonnes `pressure_psi/bar` de ces fichiers, et le tare PC
+(`pressure_raw_psi − pressure_tare_psi`) ne peut pas la restituer. C'est
+précisément la zone du dead-band : **pour les fichiers existants, la
+reconstruction depuis les comptes `pressure_adc` (§ A, § C, § 6.4.2 du
+rapport) est la seule échelle valable près de l'origine**. Le croquis actuel
+transmet la valeur négative telle quelle et laisse la correction au tare ;
+les acquisitions futures n'auront donc plus besoin de cette reconstruction,
+mais elle reste exacte dans les deux cas et peut rester la méthode par défaut.
+La formule est confirmée par le croquis : ψ = (ADC·5/1023 − 0,5)·125 psi,
+0,0689476 bar/psi.
+
+**Cadence et horodatage — également modifiés.** La version de campagne émettait
+sur minuterie (`delay(100)`, soit ~10 Hz mesurés ; le commentaire
+« 20 readings/second » du croquis était obsolète) et les échantillons étaient
+datés par le PC à réception, d'où une gigue de 50 à 133 ms. Le croquis actuel
+n'émet que lorsque le HX711 signale une conversion prête — ce qui supprime
+aussi les zéros de trame — et joint la date `millis()` relevée juste après la
+lecture de la cellule. Les CSV produits désormais portent deux bases de temps,
+`time_s` (Arduino) et `time_pc_s`, dont l'écart mesure la latence de liaison.
+**Conséquence pour les fichiers de la campagne** : leur colonne `time_s` est
+datée PC, donc affectée par la gigue. Aucune incidence sur les relations
+force/pression, qui viennent de la même trame ; restait à vérifier l'effet sur
+les grandeurs construites sur le temps.
+
+*Quantifié le 28/08 (`effet_gigue.py`).* La gigue réelle des 18 essais
+« 10 N » vaut σ(Δt) = **31 ms** pour une période de 127 ms, soit σ = 22 ms sur
+chaque date (l'horloge PC ne dérivant pas, les erreurs ne s'accumulent pas :
+Var(Δt) = 2·Var(ε)). Propagée par Monte-Carlo — 40 regrilles perturbées par
+essai, réajustement complet à chaque fois — elle donne :
+
+| | Écart-type relatif médian | Maximum |
+|---|---|---|
+| τ₁ | **2,0 × 10⁻⁴** | 3,8 × 10⁻⁴ |
+| τ₂ | **1,1 × 10⁻⁴** | 1,7 × 10⁻³ |
+
+Soit **0,02 % sur τ₁ et 0,01 % sur τ₂**, à comparer à la dispersion entre
+spécimens : un facteur 2,7 sur τ₁ (12 à 32 s) et un facteur 15 sur τ₂ (108 à
+4 000 s). La gigue d'horodatage est donc sans effet mesurable sur le spectre
+identifié, et les fichiers datés PC restent pleinement exploitables. La
+réserve est levée.
+
 - L'enregistreur convertit avec g → mN = 9,80665 et protège le HX711 contre
-  les décrochages de trame (resynchronisation si saut > 50 000 comptes,
-  colonnes `hx711_raw` vs `hx711_raw_received`).
-- Cadence réelle ~10 Hz (`delay(100)` — le commentaire « 20 readings/second »
-  du croquis est obsolète), cohérente avec les CSV.
+  les décrochages de trame (resynchronisation sur 5 valeurs concordantes si
+  saut > 50 000 comptes, colonnes `hx711_raw` vs `hx711_raw_received`).
+- Le parseur accepte les trames à 5, 6 ou 7 champs : les fichiers des trois
+  versions de croquis restent donc lisibles par le même outil.
 
 ## E) Premier essai E10 — marquage des ancrages (28/08)
 
@@ -264,7 +308,9 @@ Essai réalisé : muscle précontraint monté comme un « 10 N » normal, traits
 blancs aux deux jonctions et pointillés le long de l'hélice, photos T0/T10,
 600 s d'enregistrement à P = 0 (`test E10/`). La force a relaxé de
 **1 030 à 962 mN (−6,7 %)**, profil typique de la campagne — le phénomène à
-expliquer s'est bien produit pendant l'essai marqué.
+expliquer s'est bien produit pendant l'essai marqué. *(Essai identifié
+depuis : muscle **G** — fichier `Muscle G E10.csv`, cohérent avec le « G »
+inscrit sur le scotch de la photo T0.)*
 
 ### Les photos ne tranchent pas (caméra déplacée)
 
@@ -308,6 +354,53 @@ nœud dans le chemin d'effort.
 *Nota : la tige filetée visible sur les photos **longe l'actionneur en
 arrière-plan** sans le traverser ni le toucher (confirmé le 28/08) — le
 chevauchement n'est que visuel, aucun frottement spire-tige à considérer.*
+
+## F) Essais longs « 30 L » — la queue lente enfin contrainte (01/09)
+
+Six relaxations de 1 800 s à P = 0, ε = 1,0 (« L = 30 min N » dans le
+Dataset) : muscles A, B, C, I, K, O. Dépouillement par médiane seconde par
+seconde, ajustement à deux exponentielles, détecteur d'à-coups persistants
+validé sur les blancs (§ E).
+
+| Muscle | F₀ (mN) | à 600 s | à 1 800 s | τ₁ (s) | τ₂ (s) | fractions f₁/f₂ | E₀/ΣE | R² |
+|---|---|---|---|---|---|---|---|---|
+| C | 1 242 | −12,0 % | −14,8 % | 53 | 1 271 | 0,089 / 0,076 | 0,835 | 0,992 |
+| I | 1 333 | −13,1 % | −16,2 % | 9 | 484 | 0,054 / 0,133 | 0,813 | 0,983 |
+| K | 1 324 | −8,1 % | −12,8 % | 60 | 1 668 | 0,040 / 0,130 | 0,830 | 0,997 |
+| O | 1 372 | −11,3 % | −15,1 % | 43 | 1 157 | 0,073 / 0,100 | 0,827 | 0,997 |
+| **médianes** | | | | **48** | **1 214** | **0,064 / 0,115** | **0,829** | |
+| A *(écarté)* | 1 534 | −11,6 % | −10,2 % | — | — | remonte après 600 s | — | 0,84 |
+| B *(écarté)* | 864 | −3,5 % | **+2,8 %** | — | — | dépasse son niveau initial | — | 0,01 |
+
+Cinq enseignements :
+
+1. **La relaxation ne s'arrête pas à 600 s** : −8 à −13 % à 600 s, −13 à
+   −16 % à 1 800 s sur les quatre essais propres.
+2. **τ₂ vaut ≈ 1 200 s, pas ≈ 400 s.** L'estimation de la fenêtre 600 s
+   (382,6 s) était biaisée vers le bas, mécaniquement : on ne peut pas voir
+   une constante de temps plus longue que la fenêtre. τ₁ (10-60 s) est
+   confirmée.
+3. **E₀/ΣE descend de 0,887 à ≈ 0,83** — et reste une **borne haute** : la
+   pente finale en log t (−21 à −60 mN/décade) montre que la queue n'est pas
+   close à 30 min ; une branche τ ≳ 5 000 s peut exister (les ajustements à
+   trois exponentielles la poursuivent mais extrapolent hors fenêtre, non
+   retenus). L'écart à l'article (0,168) demeure : facteur ~5.
+4. **Les à-coups d'ancrage restent minoritaires sur 30 min** : −4 à −43 mN
+   sur des chutes totales de 150 à 215 mN (médiane ≈ 8 % ; I est le plus
+   touché avec un événement isolé de −20 mN à t = 418 s).
+5. **Deux essais sur six sont écartés** : A remonte après 600 s et B finit
+   **au-dessus** de son niveau initial (+25 mN) — une force qui remonte à
+   longueur bloquée et P = 0 n'est pas de la viscoélasticité ; l'ampleur
+   (~50 mN crête à crête) dépasse la dérive de chauffe des blancs (+11 mN).
+   Suspect n° 1 : la température ambiante sur 30 min (B est aussi un muscle
+   « non fonctionnel » à extrémités courtes). Recommandation : noter ou
+   logger la température de la pièce pour les essais longs.
+
+**Spectre fenêtre 30 min** (ε = 1,0, muscles C/I/K/O, ΣE = 37,76 MPa
+maintenu) : E₀ ≈ **31,3**, E₁ ≈ **2,4** / η₁ ≈ **115** (τ₁ 48 s),
+E₂ ≈ **4,3** / η₂ ≈ **5 270** (τ₂ 1 214 s). Pour l'actionnement rien ne
+change (branche rapide inchangée) ; pour un maintien ≥ 10 min, c'est ce
+spectre qu'il faut mettre dans les champs maxwell_* de l'interface.
 
 ## Prochaines étapes proposées
 
