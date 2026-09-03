@@ -61,7 +61,7 @@ RESULT_CACHE_PATHS = (
     SUSPENDED_RESULT_PATH,
     HYSTERESIS_RESULT_PATH,
 )
-SETTINGS_SCHEMA_VERSION = 16
+SETTINGS_SCHEMA_VERSION = 17
 SETTINGS_EXPORT_FORMAT = "cavatappi-alpha-v2-settings"
 
 INTEGRATION_OPTIONS = ["exponential", "paper_explicit"]
@@ -82,6 +82,11 @@ MAXWELL_ANISOTROPY_OPTIONS = ["axial_test_only", "paper_equal"]
 POISSON_PAIRING_OPTIONS = ["paper_crossed", "physical"]
 NYLON_CONDITION_OPTIONS = ["bonded_linear"]
 PRESSURE_INPUT_OPTIONS = ["generated", "measured_csv"]
+# Alpha V4-3 : convention d'application du pre-etirement (item 2.11 de
+# l'audit). coil_only = eps sur la spire seule (defaut historique) ;
+# grip_to_grip = eps sur la longueur entre mors (spire + extremites), la
+# compatibilite serie etant resolue pendant l'etirement.
+PRESTRETCH_CONVENTION_OPTIONS = ["coil_only", "grip_to_grip"]
 
 INTEGRATION_LABELS = {
     "paper_explicit": "Euler explicite",
@@ -125,6 +130,21 @@ PRESSURE_INPUT_LABELS = {
     "generated": "Profil généré par le modèle",
     "measured_csv": "Historique pression/temps mesuré (CSV)",
 }
+PRESTRETCH_CONVENTION_LABELS = {
+    "coil_only": "Sur la spire seule (défaut historique)",
+    "grip_to_grip": "Sur la longueur entre mors (extrémités en série)",
+}
+# Alpha V4 : cles des mecanismes physiques optionnels (tous off par defaut).
+V4_MECHANISM_KEYS = (
+    "prestretch_convention",
+    "engagement_ovality_e0",
+    "engagement_ring_factor",
+    "engagement_unload_ratio",
+    "friction_pressure_coulomb_mpa",
+    "eyring_sigma_star_mpa",
+    "anchor_creep_c_mm",
+    "anchor_creep_t0_s",
+)
 
 
 DEFAULT_SETTINGS: dict[str, SettingValue] = {
@@ -204,6 +224,15 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "parallel_workers": DEFAULT_PARALLEL_WORKERS,
     "view_elev_deg": 22.0,
     "view_azim_deg": -58.0,
+    # --- Alpha V4 : mecanismes physiques optionnels (off par defaut) ---
+    "prestretch_convention": "coil_only",
+    "engagement_ovality_e0": 0.0,
+    "engagement_ring_factor": 1.0,
+    "engagement_unload_ratio": 1.0,
+    "friction_pressure_coulomb_mpa": 0.0,
+    "eyring_sigma_star_mpa": 0.0,
+    "anchor_creep_c_mm": 0.0,
+    "anchor_creep_t0_s": 10.0,
 }
 
 
@@ -245,6 +274,14 @@ class MaterialParams:
     nylon_condition_mode: str = "bonded_linear"
     nylon_axial_prestrain_coupling: float = 1.0
     nylon_axial_actuation_coupling: float = 1.0
+    # Alpha V4 (off par defaut)
+    engagement_ovality_e0: float = 0.0
+    engagement_ring_factor: float = 1.0
+    engagement_unload_ratio: float = 1.0
+    friction_pressure_coulomb_mpa: float = 0.0
+    eyring_sigma_star_mpa: float = 0.0
+    anchor_creep_c_mm: float = 0.0
+    anchor_creep_t0_s: float = 10.0
 
 
 @dataclass
@@ -260,6 +297,7 @@ class GeometryParams:
     uncoiled_compliance_mode: str = "tangent_beam"
     bias_angle_profile: str = "paper_linear"
     section_update_mode: str = "fixed"
+    prestretch_convention: str = "coil_only"
 
 
 @dataclass
@@ -418,6 +456,14 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
         "nu23": (-0.49, 0.49),
         "view_elev_deg": (0.0, 90.0),
         "view_azim_deg": (-180.0, 180.0),
+        # Alpha V4
+        "engagement_ovality_e0": (0.0, 0.9),
+        "engagement_ring_factor": (0.01, 100.0),
+        "engagement_unload_ratio": (0.05, 1.0),
+        "friction_pressure_coulomb_mpa": (0.0, 1.0),
+        "eyring_sigma_star_mpa": (0.0, 1000.0),
+        "anchor_creep_c_mm": (0.0, 50.0),
+        "anchor_creep_t0_s": (0.01, 100000.0),
     }
     for key, (lower, upper) in bounded_values.items():
         value = float(settings[key])
@@ -433,6 +479,7 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
         ("maxwell_anisotropy_mode", MAXWELL_ANISOTROPY_OPTIONS),
         ("poisson_pairing", POISSON_PAIRING_OPTIONS),
         ("pressure_input_mode", PRESSURE_INPUT_OPTIONS),
+        ("prestretch_convention", PRESTRETCH_CONVENTION_OPTIONS),
     ):
         if str(settings[key]) not in options:
             raise ValueError(f"Option inconnue pour '{key}'.")
@@ -663,6 +710,10 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
         return "Alpha V2 utilise uniquement un nylon linéaire bilatéral lié aux extrémités."
     if str(settings.get("pressure_input_mode", "generated")) not in PRESSURE_INPUT_OPTIONS:
         return "La source de pression est inconnue."
+    if str(settings.get("prestretch_convention", "coil_only")) not in PRESTRETCH_CONVENTION_OPTIONS:
+        return "La convention de pré-étirement est inconnue."
+    if float(settings.get("eyring_sigma_star_mpa", 0.0)) > 0.0 and str(settings["integration"]) != "exponential":
+        return "La viscosité activée par la contrainte (Eyring) exige l'intégration exponentielle."
     for key in ("nylon_axial_prestrain_coupling", "nylon_axial_actuation_coupling"):
         if not 0.0 <= float(settings[key]) <= 1.0:
             return "Les coefficients de couplage du nylon doivent rester entre 0 et 1."
@@ -824,6 +875,13 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         nylon_condition_mode="bonded_linear",
         nylon_axial_prestrain_coupling=1.0,
         nylon_axial_actuation_coupling=1.0,
+        engagement_ovality_e0=float(settings.get("engagement_ovality_e0", 0.0)),
+        engagement_ring_factor=float(settings.get("engagement_ring_factor", 1.0)),
+        engagement_unload_ratio=float(settings.get("engagement_unload_ratio", 1.0)),
+        friction_pressure_coulomb_mpa=float(settings.get("friction_pressure_coulomb_mpa", 0.0)),
+        eyring_sigma_star_mpa=float(settings.get("eyring_sigma_star_mpa", 0.0)),
+        anchor_creep_c_mm=float(settings.get("anchor_creep_c_mm", 0.0)),
+        anchor_creep_t0_s=float(settings.get("anchor_creep_t0_s", 10.0)),
     )
     geom = GeometryParams(
         Rout=float(settings["rout_mm"]),
@@ -837,6 +895,7 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         uncoiled_compliance_mode=str(settings.get("uncoiled_compliance_mode", "tangent_beam")),
         bias_angle_profile=str(settings.get("bias_angle_profile", "paper_linear")),
         section_update_mode=str(settings.get("section_update_mode", "fixed")),
+        prestretch_convention=str(settings.get("prestretch_convention", "coil_only")),
     )
     duration_s = float(settings["duration_s"]) if bool(settings["use_fixed_duration"]) else None
     prestrain_reference_mode = str(settings.get("prestrain_reference_mode", "elastic_tk_reference"))

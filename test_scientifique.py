@@ -1,4 +1,4 @@
-"""Tests numériques autonomes de l'interface Cavatappi Alpha V2.
+"""Tests numériques autonomes de l'interface Cavatappi (Alpha V4).
 
 Exécution : python test_scientifique.py
 """
@@ -765,6 +765,177 @@ def test_validation_figure7_non_regression() -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Alpha V4 : mecanismes physiques optionnels (off par defaut)
+# ---------------------------------------------------------------------------
+
+
+def _v4_settings(**extra) -> dict:
+    settings = dict(parametres.DEFAULT_SETTINGS)
+    settings.update({"eps": 0.8, "n_cycles": 1, "dt": 2.0, "n_layers": 2, "n_phi": 8, "pre_steps": 4, "p_max_mpa": 1.2})
+    settings.update(extra)
+    return settings
+
+
+def _loop_area(data) -> float:
+    """Aire signee de la boucle force-pression (montee puis descente) :
+    positive quand la branche de descente est au-dessus de la montee."""
+    return float(np.trapezoid(np.asarray(data["force_act_mN"], dtype=float), np.asarray(data["pressure_MPa"], dtype=float)))
+
+
+def test_v4_defaults_are_off() -> None:
+    """Toutes les cles V4 sont a leur valeur neutre par defaut, et la config
+    construite les transmet au moteur ; un moteur avec ces valeurs expose des
+    sorties V4 nulles (pression effective = pression, frottement nul)."""
+    for key in parametres.V4_MECHANISM_KEYS:
+        assert key in parametres.DEFAULT_SETTINGS, key
+    settings = _v4_settings()
+    config = parametres.build_config(settings)
+    assert config.geom.prestretch_convention == "coil_only"
+    assert config.mat.engagement_ovality_e0 == 0.0
+    assert config.mat.friction_pressure_coulomb_mpa == 0.0
+    assert config.mat.eyring_sigma_star_mpa == 0.0
+    assert config.mat.anchor_creep_c_mm == 0.0
+    _, data = Base.run_blocked_actuation(config)
+    assert np.allclose(data["pressure_effective_MPa"], data["pressure_MPa"])
+    assert np.all(data["ovality"] == 0.0)
+    assert np.all(data["anchor_creep_mm"] == 0.0)
+    assert np.all(data["pressure_friction_MPa"] == 0.0)
+    for key, bad in (
+        ("engagement_ovality_e0", 0.95),
+        ("engagement_unload_ratio", 0.0),
+        ("friction_pressure_coulomb_mpa", -1.0),
+        ("anchor_creep_t0_s", 0.0),
+        ("prestretch_convention", "inconnu"),
+    ):
+        wrong = _v4_settings(**{key: bad})
+        assert parametres.settings_error(wrong) is not None or _raises_value_error(wrong), key
+    wrong = _v4_settings(eyring_sigma_star_mpa=0.5, integration="paper_explicit", dt=0.1)
+    assert parametres.settings_error(wrong) is not None
+
+
+def _raises_value_error(settings) -> bool:
+    try:
+        parametres.normalize_settings(settings)
+    except ValueError:
+        return True
+    return False
+
+
+def test_v4_engagement_pressure_threshold() -> None:
+    """V4-1 : la pression d'engagement produit un demarrage quadratique
+    (moins de force sous P_r0), rend la pleine pression en haut de course
+    (gain conserve) et, avec r < 1, une boucle d'hysteresis de signe positif."""
+    t = np.linspace(0.0, 120.0, 61)
+    p = 1.2 * np.where(t <= 60.0, t / 60.0, (120.0 - t) / 60.0)
+    reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()), pressure_time=t, pressure_MPa=p)[1]
+    config = parametres.build_config(_v4_settings(engagement_ovality_e0=0.05))
+    model, data = Base.run_blocked_actuation(config, pressure_time=t, pressure_MPa=p)
+    P_r0 = model._engagement_reform_pressure()
+    assert 0.0 < P_r0 < 1.2, f"P_r0 = {P_r0:.3f} MPa doit etre atteint par la rampe"
+    P = np.asarray(reference["pressure_MPa"])
+    half = len(P) // 2
+    i_low = int(np.argmin(np.abs(P[:half] - 0.4 * P_r0)))
+    # sous P_r0 la pression effective vaut P^2/P_r0 : a 0,4 P_r0 la force
+    # d'actionnement doit etre nettement en dessous de la reference
+    assert data["force_act_mN"][i_low] < 0.7 * reference["force_act_mN"][i_low], "demarrage retarde attendu sous P_r0"
+    assert abs(data["pressure_effective_MPa"].max() - data["pressure_MPa"].max()) < 1.0e-9
+    gain_ratio = float(data["force_act_mN"].max() / reference["force_act_mN"].max())
+    assert 0.9 < gain_ratio < 1.05, f"gain conserve attendu, ratio {gain_ratio:.3f}"
+    hyst = Base.run_blocked_actuation(parametres.build_config(_v4_settings(engagement_ovality_e0=0.05, engagement_unload_ratio=0.5)), pressure_time=t, pressure_MPa=p)[1]
+    # descente au-dessus de la montee sous r P_r0 : integrale signee plus petite
+    assert _loop_area(hyst) < _loop_area(data) - 1.0e-6, "r < 1 doit ouvrir une boucle de signe positif"
+
+
+def test_v4_dry_friction_hysteresis() -> None:
+    """V4-2 : l'element de Coulomb sur la pression motrice ouvre une boucle
+    de signe positif (descente au-dessus de la montee), retarde le demarrage
+    de P_c, laisse une force residuelle a P = 0, ne change pas la
+    precontrainte et garde le gain a mieux que 10 %."""
+    t = np.linspace(0.0, 120.0, 61)
+    p = 1.2 * np.where(t <= 60.0, t / 60.0, (120.0 - t) / 60.0)
+    reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()), pressure_time=t, pressure_MPa=p)[1]
+    data = Base.run_blocked_actuation(parametres.build_config(_v4_settings(friction_pressure_coulomb_mpa=0.02)), pressure_time=t, pressure_MPa=p)[1]
+    assert abs(data["force_total_mN"][0] - reference["force_total_mN"][0]) < 1.0e-9
+    # integrale signee (montee puis descente) plus petite = descente au-dessus
+    assert _loop_area(data) < _loop_area(reference) - 1.0e-3
+    assert abs(data["force_act_mN"].max() / reference["force_act_mN"].max() - 1.0) < 0.10
+    assert abs(float(np.max(data["pressure_friction_MPa"])) - 0.02) < 1.0e-12
+    assert abs(float(np.min(data["pressure_friction_MPa"])) + 0.02) < 1.0e-12
+    up = np.asarray(data["force_act_mN"])[:31]
+    down = np.asarray(data["force_act_mN"])[30:][::-1]
+    up_ref = np.asarray(reference["force_act_mN"])[:31]
+    down_ref = np.asarray(reference["force_act_mN"])[30:][::-1]
+    assert float(np.mean(down - up)) > float(np.mean(down_ref - up_ref)) + 1.0
+    assert data["force_act_mN"][-1] > reference["force_act_mN"][-1] + 0.5, "force residuelle a P = 0 attendue"
+    decomposition = np.nanmax(np.abs(data["force_total_mN"] - data["force_tube_mN"] - data["force_nylon_mN"]))
+    assert decomposition < 1.0e-8
+
+
+def test_v4_eyring_amplitude_dependence() -> None:
+    """V4-4 : la viscosite activee par la contrainte accelere la relaxation de
+    la precontrainte (grande amplitude) par rapport aux viscosites constantes."""
+    t = np.arange(0.0, 121.0, 4.0)
+    p = np.zeros_like(t)
+    base = parametres.build_config(_v4_settings(prestrain_reference_mode="viscoelastic_history"))
+    eyring = parametres.build_config(_v4_settings(prestrain_reference_mode="viscoelastic_history", eyring_sigma_star_mpa=0.02))
+    _, d0 = Base.run_blocked_actuation(base, pressure_time=t, pressure_MPa=p)
+    _, d1 = Base.run_blocked_actuation(eyring, pressure_time=t, pressure_MPa=p)
+    relax0 = (d0["force_total_mN"][-1] - d0["force_total_mN"][0]) / d0["force_total_mN"][0]
+    relax1 = (d1["force_total_mN"][-1] - d1["force_total_mN"][0]) / d1["force_total_mN"][0]
+    assert relax0 < 0.0 and relax1 < relax0, f"relaxation Eyring {relax1:.4f} doit depasser {relax0:.4f}"
+
+
+def test_v4_anchor_creep_series() -> None:
+    """V4-5 : le fluage d'ancrage logarithmique relache la force a P = 0,
+    avec et sans compliance serie ; la compatibilite serie reste satisfaite."""
+    t = np.arange(0.0, 121.0, 4.0)
+    p = np.zeros_like(t)
+    for uncoiled in (0.0, 15.0):
+        cfg0 = parametres.build_config(_v4_settings(uncoiled_length_mm=uncoiled))
+        cfg1 = parametres.build_config(_v4_settings(uncoiled_length_mm=uncoiled, anchor_creep_c_mm=0.5, anchor_creep_t0_s=10.0))
+        _, d0 = Base.run_blocked_actuation(cfg0, pressure_time=t, pressure_MPa=p)
+        _, d1 = Base.run_blocked_actuation(cfg1, pressure_time=t, pressure_MPa=p)
+        assert d1["force_total_mN"][-1] < d0["force_total_mN"][-1] - 1.0, f"uncoiled={uncoiled}"
+        creep = np.asarray(d1["anchor_creep_mm"])
+        assert creep[-1] > creep[len(creep) // 2] > 0.0
+        expected = 0.5 * np.log1p(float(t[-1]) / 10.0)
+        assert abs(creep[-1] - expected) < 1.0e-6
+        if uncoiled > 0.0:
+            assert np.max(np.abs(d1["series_compatibility_residual_mm"])) < 1.0e-5
+
+
+def test_v4_prestretch_convention() -> None:
+    """V4-3 : la convention entre mors coincide avec la convention spire seule
+    sans extremites, et en differe (extremites allongees pendant l'etirement)
+    avec des extremites desenroulees."""
+    same = Base.run_blocked_actuation(parametres.build_config(_v4_settings(prestretch_convention="grip_to_grip")))[1]
+    reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()))[1]
+    assert np.allclose(same["force_total_mN"], reference["force_total_mN"])
+    coil = Base.run_blocked_actuation(parametres.build_config(_v4_settings(uncoiled_length_mm=20.0)))[1]
+    grip = Base.run_blocked_actuation(parametres.build_config(_v4_settings(uncoiled_length_mm=20.0, prestretch_convention="grip_to_grip")))[1]
+    assert grip["prestretch_end_extension_mm"][0] > 0.0
+    assert abs(grip["force_total_mN"][0] - coil["force_total_mN"][0]) > 1.0e-3 * coil["force_total_mN"][0]
+    assert np.max(np.abs(grip["residual"])) < 1.0e-4
+
+
+def test_v4_closed_loop_identification_tool() -> None:
+    """V4-6 : l'outil identification/identifier_spectre_moteur.py retrouve,
+    sur un signal synthetique produit par le moteur, une relaxation de meme
+    amplitude (verification de la boucle fermee, maillage minimal)."""
+    module_path = APP_DIR / "identification" / "identifier_spectre_moteur.py"
+    spec = importlib.util.spec_from_file_location("identifier_spectre_moteur", module_path)
+    ident = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ident)
+    base = _v4_settings(n_layers=1, n_phi=4, pre_steps=3, prestrain_reference_mode="viscoelastic_history", maxwell_anisotropy_mode="axial_test_only")
+    truth = ident.settings_with_spectrum(base, np.array([0.12]), np.array([15.0]), 37.76)
+    truth["dt"] = 4.0
+    t_sim, F_sim = ident.simulate_hold(truth, 60.0, 4.0, 300.0)
+    result = ident.identify(t_sim, F_sim, base, n_branches=1, hold_s=60.0, dt=4.0, prestretch_rate_mm_min=300.0, sigma_total=37.76, verbose=False)
+    assert result["rms_normalized"] < 5.0e-3, result
+    assert abs(result["branches"][0]["fraction"] - 0.12) < 0.04, result
+
+
 def main() -> None:
     tests = (
         test_pressure_histories,
@@ -793,6 +964,13 @@ def main() -> None:
         test_suspended_normalization_LT0,
         test_identification_tools,
         test_validation_figure7_non_regression,
+        test_v4_defaults_are_off,
+        test_v4_engagement_pressure_threshold,
+        test_v4_dry_friction_hysteresis,
+        test_v4_eyring_amplitude_dependence,
+        test_v4_anchor_creep_series,
+        test_v4_prestretch_convention,
+        test_v4_closed_loop_identification_tool,
     )
     for test in tests:
         test()

@@ -226,6 +226,36 @@ référence non chargée est exportée en `reference_unloaded_length_mm`.
 - Les résultats servent à l'étude et à la comparaison. Un dimensionnement de sécurité nécessite une validation expérimentale du spécimen réel.
 
 
+## Alpha V4 — mécanismes physiques optionnels (audit → rapport → contre-expertise)
+
+Moteur `2026.09.02-v4-15`. Six améliorations issues de la confrontation aux
+essais (chapitre 7 du rapport de stage) ont été proposées sous trois angles,
+contre-expertisées de façon adversariale (8 retenues sur 12), puis
+implémentées. **Toutes sont inactives par défaut** : avec les valeurs par
+défaut, le moteur est bit-identique à l'alpha V3 (vérifié sur les modes
+bloqué, série, section réactualisée, suspendu ; suite de 33 tests, baseline
+figure 7 intacte). Elles se règlent dans l'expander « Mécanismes Alpha V4 »
+des réglages avancés.
+
+| Mécanisme | Réglage (0 = off) | Écart visé (rapport) | Ce que ça change |
+|---|---|---|---|
+| **V4-1 Pression d'engagement** (reformage de la section ovalisée, § 7.10.3) | `engagement_ovality_e0`, `engagement_ring_factor`, `engagement_unload_ratio` | Seuil de démarrage 1,7 bar vs 0 simulé ; super-linéarité sous 2 bar | Ovalité e comme variable d'état ; P_eff = P(1 − e/e0) — démarrage quadratique P²/P_r0, pleine pression une fois la section ronde (gain conservé). P_r0 = k·E_radius·(t/R_m)³·e0 sur la **section** du tube. r < 1 : hystérésis du seuil. |
+| **V4-2 Frottement sec** (élément de Jenkins, § 7.5) | `friction_pressure_coulomb_mpa` | Aire d'hystérésis +62 mN·bar mesurée vs −6 simulée ; seuil de descente négatif (§ 7.5.4) | Élément de Coulomb sur la **transmission de la pression** : P_eff = P − P_f, P_f écrêté à ±P_c. Retard de P_c en charge, avance en décharge : descente au-dessus de la montée, force résiduelle à P = 0, indépendant de la vitesse. Établi par expérience numérique : en mode bloqué, tout patin interne (dw, dv, dκ, ±) est ré-absorbé par l'équilibre géométrique et n'ouvre aucune boucle. Calibration : hystérésis du seuil 0,038 MPa ≈ 2·P_c. |
+| **V4-3 Convention de pré-étirement** (item 2.11) | `prestretch_convention = grip_to_grip` | Dérive de F0 avec ε (×1,26 → ×1,76) | ε appliqué à la longueur entre mors ; les extrémités désenroulées s'allongent en série pendant l'étirement (résolution à deux inconnues par incrément). Sans extrémités : identique à `coil_only`. Peut **augmenter** F0 pour des extrémités courtes (physiquement correct). |
+| **V4-4 Viscosité d'Eyring** (§ 7.8.7) | `eyring_sigma_star_mpa` | Incompatibilité d'amplitude (relaxation ×0,07) | η_eff = η·(s/σ*)/sinh(s/σ*) par couche et par branche, s = norme de la contrainte de branche. Attention : dans ce modèle les contraintes de branche du tube valent ~0,01-0,05 MPa à la précontrainte (la grande déformation du muscle est géométrique) — σ* doit être de cet ordre. Exige l'intégration exponentielle. |
+| **V4-5 Fluage d'ancrage** (§ 7.10.4, essai E10) | `anchor_creep_c_mm`, `anchor_creep_t0_s` | Part d'ancrage de la relaxation (≥ 7 %) | δ(t) = c·ln(1 + t/t0) depuis le blocage, en série dans la longueur bloquée (avec ou sans compliance des extrémités). |
+| **V4-6 Identification en boucle fermée** | `identification/identifier_spectre_moteur.py` | Spectre 7.6 dilué ×14 par la chaîne | Ajuste {E_i, τ_i} pour que la force **simulée** en maintien à P = 0 reproduise la mesure (forme normalisée, ΣE maintenu). |
+
+Rejetée à l'implémentation : le « jeu radial tube-nylon » (retenu par la
+contre-expertise) — sous pression le rayon interne augmente, le jeu
+s'ouvrirait au lieu de se fermer ; mécanisme incohérent avec le sens de la
+déformation radiale du moteur.
+
+Calibration attendue : e0(ε) et k par imagerie de la section sous pression
+(essai n° 2 du tableau 10.3) ; σ* conjointement avec le spectre sur les essais « 10 N » et l'essai E2 (tube
+nu) ; P_c sur l'hystérésis du seuil et l'aire de boucle des rampes lentes ;
+c, t0 sur la part à-coups + continue des ancrages (E10, E2).
+
 ## Cache des réglages
 
 L'application sauvegarde automatiquement les derniers réglages et les derniers

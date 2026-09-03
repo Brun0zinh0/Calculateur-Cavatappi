@@ -26,7 +26,7 @@ import numpy as np
 from scipy.optimize import brentq, least_squares, minimize_scalar
 
 
-MODEL_VERSION = "2026.08.21-audit-phase4-14"
+MODEL_VERSION = "2026.09.02-v4-15"
 
 # Exposants du profil de pression phenomenologique non lineaire (uniques pour
 # tout le projet ; parametres.make_pressure_history les importe aussi).
@@ -71,6 +71,23 @@ def default_material_params(maxwell=None, **overrides):
         "nylon_condition_mode": "bonded_linear",
         "nylon_axial_prestrain_coupling": 1.0,
         "nylon_axial_actuation_coupling": 1.0,
+        # --- Alpha V4 : mecanismes physiques optionnels, tous OFF par defaut
+        # (valeurs nulles = moteur identique a l'alpha V3). ---
+        # V4-1 Pression d'engagement par reformage de la section ovalisee
+        # (rapport 7.10.3) : ovalite initiale e0, facteur d'anneau k,
+        # rapport de decharge (1 = reversible, < 1 = hysteresis du seuil).
+        "engagement_ovality_e0": 0.0,
+        "engagement_ring_factor": 1.0,
+        "engagement_unload_ratio": 1.0,
+        # V4-2 Frottement sec (element de Jenkins) sur la transmission de la
+        # pression : pression de Coulomb P_c (MPa, 0 = off).
+        "friction_pressure_coulomb_mpa": 0.0,
+        # V4-4 Viscosite activee par la contrainte (Eyring) par couche :
+        # sigma* (MPa) ; 0 = viscosites constantes.
+        "eyring_sigma_star_mpa": 0.0,
+        # V4-5 Fluage d'ancrage logarithmique en serie : delta = c ln(1 + t/t0).
+        "anchor_creep_c_mm": 0.0,
+        "anchor_creep_t0_s": 10.0,
     }
     values.update({k: v for k, v in overrides.items() if v is not None})
     return SimpleNamespace(**values)
@@ -89,6 +106,11 @@ def default_geometry_params(**overrides):
         "uncoiled_compliance_mode": "tangent_beam",
         "bias_angle_profile": "paper_linear",
         "section_update_mode": "fixed",
+        # V4-3 Convention d'application du pre-etirement (item 2.11) :
+        # coil_only = eps applique a la spire seule (defaut historique) ;
+        # grip_to_grip = eps applique a la longueur entre mors, compatibilite
+        # serie des extremites resolue pendant l'etirement.
+        "prestretch_convention": "coil_only",
     }
     values.update({k: v for k, v in overrides.items() if v is not None})
     return SimpleNamespace(**values)
@@ -182,6 +204,11 @@ class StepResult:
     axial_stretch: float
     Rin: float
     Rout: float
+    # Alpha V4 (defauts nuls : sorties inchangees quand les mecanismes sont off)
+    pressure_effective: float = 0.0
+    ovality: float = 0.0
+    pressure_friction: float = 0.0
+    anchor_creep: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +403,17 @@ class TCPAMaxwellBlockedModel:
 
         self.uncoiled_length = float(getattr(geom, "uncoiled_length", 0.0))
         self.uncoiled_compliance_mode = str(getattr(geom, "uncoiled_compliance_mode", "tangent_beam"))
+        # --- Alpha V4 : mecanismes optionnels (off par defaut) ---
+        self.engagement_ovality_e0 = float(getattr(mat, "engagement_ovality_e0", 0.0))
+        self.engagement_ring_factor = float(getattr(mat, "engagement_ring_factor", 1.0))
+        self.engagement_unload_ratio = float(getattr(mat, "engagement_unload_ratio", 1.0))
+        self.friction_pressure_coulomb = float(getattr(mat, "friction_pressure_coulomb_mpa", 0.0))
+        self.eyring_sigma_star = float(getattr(mat, "eyring_sigma_star_mpa", 0.0))
+        self.anchor_creep_c_mm = float(getattr(mat, "anchor_creep_c_mm", 0.0))
+        self.anchor_creep_t0_s = float(getattr(mat, "anchor_creep_t0_s", 10.0))
+        self.prestretch_convention = str(getattr(geom, "prestretch_convention", "coil_only"))
         self._validate_inputs()
+        self._validate_v4_inputs()
 
         self.alpha0 = np.deg2rad(geom.alpha0_deg)
         self.theta_f = np.deg2rad(geom.theta_f_deg)
@@ -415,6 +452,15 @@ class TCPAMaxwellBlockedModel:
         self.Mnylon = 0.0
         self.Tnylon = 0.0
         self.axial_stretch = 1.0
+        # Alpha V4 : variables d'etat des mecanismes optionnels
+        self.p_effective = 0.0
+        self.ovality = float(self.engagement_ovality_e0)
+        self.p_engaged = 0.0
+        self.p_friction = 0.0
+        self.anchor_creep_mm = 0.0
+        self.anchor_lock_time: Optional[float] = None
+        self._pending_anchor_creep_mm = 0.0
+        self.prestretch_end_extension_mm = 0.0
         self.history: List[StepResult] = []
         self.series_reference_locked = False
         self.series_reference_force_N = 0.0
@@ -482,6 +528,147 @@ class TCPAMaxwellBlockedModel:
         if not np.isfinite(eig_min) or eig_min <= 1e-10:
             raise ValueError("The elastic constants produce a non-physical stiffness matrix.")
 
+    def _validate_v4_inputs(self) -> None:
+        """Garde-fous des mecanismes Alpha V4 (valeurs nulles = mecanisme off)."""
+        if not 0.0 <= self.engagement_ovality_e0 < 0.95:
+            raise ValueError("engagement_ovality_e0 must lie in [0, 0.95).")
+        if not np.isfinite(self.engagement_ring_factor) or self.engagement_ring_factor <= 0.0:
+            raise ValueError("engagement_ring_factor must be strictly positive.")
+        if not 0.0 < self.engagement_unload_ratio <= 1.0:
+            raise ValueError("engagement_unload_ratio must lie in (0, 1].")
+        if not np.isfinite(self.friction_pressure_coulomb) or self.friction_pressure_coulomb < 0.0:
+            raise ValueError("friction_pressure_coulomb_mpa must be finite and non-negative.")
+        if not np.isfinite(self.eyring_sigma_star) or self.eyring_sigma_star < 0.0:
+            raise ValueError("eyring_sigma_star_mpa must be finite and non-negative (0 = off).")
+        if self.eyring_sigma_star > 0.0 and self.integration != "exponential":
+            raise ValueError("The Eyring stress-activated viscosity requires exponential integration.")
+        if not np.isfinite(self.anchor_creep_c_mm) or self.anchor_creep_c_mm < 0.0:
+            raise ValueError("anchor_creep_c_mm must be finite and non-negative.")
+        if not np.isfinite(self.anchor_creep_t0_s) or self.anchor_creep_t0_s <= 0.0:
+            raise ValueError("anchor_creep_t0_s must be strictly positive.")
+        if self.prestretch_convention not in {"coil_only", "grip_to_grip"}:
+            raise ValueError("prestretch_convention must be 'coil_only' or 'grip_to_grip'.")
+
+    # ----- Alpha V4-1 : pression d'engagement par reformage de section -----
+    @property
+    def engagement_enabled(self) -> bool:
+        return self.engagement_ovality_e0 > 0.0
+
+    def _engagement_reform_pressure(self) -> float:
+        """Pression (MPa) qui referme completement l'ovalite initiale e0.
+
+        Raideur de flexion d'anneau de la SECTION du tube (rayon moyen
+        R_m = (Rout + Rin)/2, epaisseur t = Rout - Rin, module circonferentiel
+        E_radius) : P_r0 = k E_r (t/R_m)^3 e0. Pour le tube de la campagne
+        (t = 0.40, R_m = 0.76 mm, E_r = 8.82 MPa) : P_r0 ~ 1.3 MPa x k x e0,
+        soit ~0.17 MPa (1.7 bar, seuil median mesure) pour k e0 ~ 0.13.
+        """
+        if not self.engagement_enabled:
+            return 0.0
+        thickness = float(self.geom.Rout - self.geom.Rin)
+        mean_radius = 0.5 * float(self.geom.Rout + self.geom.Rin)
+        return float(
+            self.engagement_ring_factor
+            * self.mat.E_radius
+            * (thickness / mean_radius) ** 3
+            * self.engagement_ovality_e0
+        )
+
+    def _engagement_state(self, pressure_new: float) -> Tuple[float, float]:
+        """Ovalite et pression effective apres application de pressure_new.
+
+        L'ovalite e est une variable d'etat : en charge elle ne peut que
+        decroitre vers e0 (1 - P/P_r0)+ ; en decharge elle ne peut que croitre
+        vers e0 (1 - P/(r P_r0))+ avec r = engagement_unload_ratio (r = 1 :
+        reversible ; r < 1 : la section reste ronde plus longtemps en decharge,
+        d'ou une branche de descente au-dessus de la montee — hysteresis du
+        seuil, rapport 7.5.4). La fraction e/e0 de la pression travaille en
+        flexion de paroi (sans force axiale) : P_eff = P (1 - e/e0), soit un
+        demarrage quadratique P^2/P_r0 puis P_eff = P des que la section est
+        ronde — aucune perte de gain en haut de course.
+        """
+        e0 = self.engagement_ovality_e0
+        if e0 <= 0.0:
+            return 0.0, float(pressure_new)
+        P_r0 = self._engagement_reform_pressure()
+        if pressure_new >= self.helix.pressure:
+            e_eq = e0 * max(0.0, 1.0 - pressure_new / P_r0)
+            e_new = min(self.ovality, e_eq)
+        else:
+            e_eq = e0 * max(0.0, 1.0 - pressure_new / (self.engagement_unload_ratio * P_r0))
+            e_new = max(self.ovality, e_eq)
+        e_new = float(np.clip(e_new, 0.0, e0))
+        return e_new, float(pressure_new * (1.0 - e_new / e0))
+
+    # ----- Alpha V4-2 : frottement de Coulomb sur la pression motrice -----
+    @property
+    def friction_enabled(self) -> bool:
+        return self.friction_pressure_coulomb > 0.0
+
+    def _drive_pressure_state(self, pressure_new: float) -> Tuple[float, float, float, float]:
+        """Etat de la transmission de pression : (ovalite, P engagee, P_f, P_eff).
+
+        Element de Jenkins dans le domaine de la pression : P_f^trial = P_f +
+        dP_eng, ecrete a +/- P_c ; P_eff = max(0, P_eng - P_f). En charge la
+        pression effective retarde de P_c (seuil rate-independant), en decharge
+        elle avance de P_c : descente au-dessus de la montee, force residuelle
+        a P = 0 (« seuil de descente negatif », rapport 7.5.4), aire de boucle
+        ~ 2 P_c x pente. Pourquoi la pression et non un patin interne : en mode
+        bloque, tout element de Coulomb sur dw, dv ou dkappa est re-absorbe par
+        l'equilibre geometrique et n'ouvre aucune boucle (verifie sur les six
+        couplages) — seule la transmission pression -> paroi peut porter la
+        dissipation independante de la vitesse. Mecanisme candidat :
+        frottement radial paroi/nylon et spire-spire lors de l'inflation.
+        Calibration : hysteresis du seuil mesuree 0,038 MPa ~ 2 P_c.
+        """
+        ovality_new, p_engaged = self._engagement_state(pressure_new)
+        p_c = self.friction_pressure_coulomb
+        if p_c <= 0.0:
+            return ovality_new, p_engaged, 0.0, p_engaged
+        p_f = float(np.clip(self.p_friction + (p_engaged - self.p_engaged), -p_c, p_c))
+        return ovality_new, p_engaged, p_f, float(max(0.0, p_engaged - p_f))
+
+    # ----- Alpha V4-4 : viscosite activee par la contrainte (Eyring) -----
+    def _branch_rates_per_layer(self) -> np.ndarray:
+        """Taux 1/tau par (couche, branche), forme (n_layers, n_maxwell).
+
+        Sans Eyring (sigma* = 0) : les taux nominaux, identiques pour toutes
+        les couches (moteur alpha V3). Avec Eyring : eta_eff = eta x g(s) avec
+        g(x) = x / sinh(x), x = s/sigma*, s = moyenne sur phi de la norme de
+        la contrainte de branche sigma_i dans la couche — la relaxation
+        s'accelere la ou la branche est chargee (grande amplitude), reste
+        nominale a petite amplitude (actionnement). Evalue sur l'etat commis en
+        debut de pas, donc coherent entre tangente et mise a jour.
+        """
+        rates = _maxwell_rates(self.mat.maxwell)
+        table = np.tile(rates, (self.disc.n_layers, 1))
+        if self.eyring_sigma_star <= 0.0 or self._building_reference_state:
+            return table
+        for ib in range(self.n_maxwell):
+            if rates[ib] <= 0.0:
+                continue
+            for j in range(self.disc.n_layers):
+                s_norm = float(np.mean(np.linalg.norm(self.sigma_i[ib, j, :, :], axis=1)))
+                x = s_norm / self.eyring_sigma_star
+                if x > 1.0e-8:
+                    g = x / np.sinh(min(x, 700.0))
+                    table[j, ib] = rates[ib] / max(g, 1.0e-12)
+        return table
+
+    # ----- Alpha V4-5 : fluage d'ancrage logarithmique en serie -----
+    @property
+    def anchor_creep_enabled(self) -> bool:
+        return self.anchor_creep_c_mm > 0.0
+
+    def _anchor_creep_at(self, time_s: float) -> float:
+        """Extension d'ancrage delta = c ln(1 + (t - t_lock)/t0) depuis le
+        verrouillage de la reference serie (loi logarithmique : seule forme
+        qui produit une relaxation a partir de l'etat de reference)."""
+        if not self.anchor_creep_enabled or self.anchor_lock_time is None:
+            return 0.0
+        elapsed = max(0.0, float(time_s) - float(self.anchor_lock_time))
+        return float(self.anchor_creep_c_mm * np.log1p(elapsed / self.anchor_creep_t0_s))
+
     def _uncoiled_section_rigidities(self) -> Tuple[float, float]:
         tube_area = np.pi * (self.geom.Rout**2 - self.geom.Rin**2)
         nylon_area = np.pi * self.geom.r_nylon**2
@@ -534,6 +721,10 @@ class TCPAMaxwellBlockedModel:
         self.series_reference_h = float(self.helix.h)
         self.series_reference_active_length_mm = 2.0 * np.pi * self.turns * self.series_reference_h
         self.series_reference_locked = True
+        # Alpha V4-5 : le fluage d'ancrage court a partir de ce verrouillage.
+        self.anchor_lock_time = float(self.helix.time)
+        self.anchor_creep_mm = 0.0
+        self._pending_anchor_creep_mm = 0.0
 
     def _series_length_residual(self, trial: Dict[str, object], h_target: float) -> float:
         if not self.series_reference_locked or not self.series_compliance_enabled:
@@ -542,7 +733,8 @@ class TCPAMaxwellBlockedModel:
         end_extension = self.uncoiled_compliance_mm_per_N * (
             float(trial["Ft"]) - self.series_reference_force_N
         )
-        return float(active_length_change + end_extension)
+        # Alpha V4-5 : extension d'ancrage gelee pendant l'iteration du pas.
+        return float(active_length_change + end_extension + self._pending_anchor_creep_mm)
 
     def _rebuild_section_properties(self) -> None:
         Etotal = _maxwell_E_total(self.mat.maxwell)
@@ -666,21 +858,43 @@ class TCPAMaxwellBlockedModel:
                 history -= dt * rates[ib] * self.sigma_i[ib]
             return [C.copy() for C in self.C_total], history
 
-        factors = np.ones(self.n_maxwell, dtype=float)
-        decays = np.ones(self.n_maxwell, dtype=float)
-        for ib, rate in enumerate(rates):
-            if rate > 0.0 and dt > 0.0:
-                decays[ib] = np.exp(-dt * rate)
-                factors[ib] = (1.0 - decays[ib]) / (dt * rate)
-            history += (decays[ib] - 1.0) * self.sigma_i[ib]
-        tangents = [
-            self.C0[j] + sum((factors[ib] * self.Ci[j][ib] for ib in range(self.n_maxwell)), np.zeros((6, 6)))
-            for j in range(self.disc.n_layers)
-        ]
+        if self.eyring_sigma_star <= 0.0:
+            factors = np.ones(self.n_maxwell, dtype=float)
+            decays = np.ones(self.n_maxwell, dtype=float)
+            for ib, rate in enumerate(rates):
+                if rate > 0.0 and dt > 0.0:
+                    decays[ib] = np.exp(-dt * rate)
+                    factors[ib] = (1.0 - decays[ib]) / (dt * rate)
+                history += (decays[ib] - 1.0) * self.sigma_i[ib]
+            tangents = [
+                self.C0[j] + sum((factors[ib] * self.Ci[j][ib] for ib in range(self.n_maxwell)), np.zeros((6, 6)))
+                for j in range(self.disc.n_layers)
+            ]
+            return tangents, history
+
+        # Alpha V4-4 : taux par couche (Eyring) — tangente et decroissance
+        # evaluees couche par couche ; la tangente reste uniforme par couche
+        # comme l'exige la solution radiale de Lekhnitskii.
+        rates_layers = self._branch_rates_per_layer()
+        tangents = []
+        for j in range(self.disc.n_layers):
+            tangent = self.C0[j].copy()
+            for ib in range(self.n_maxwell):
+                rate = float(rates_layers[j, ib])
+                decay, factor = 1.0, 1.0
+                if rate > 0.0 and dt > 0.0:
+                    decay = float(np.exp(-dt * rate))
+                    factor = (1.0 - decay) / (dt * rate)
+                history[j] += (decay - 1.0) * self.sigma_i[ib, j]
+                tangent = tangent + factor * self.Ci[j][ib]
+            tangents.append(tangent)
         return tangents, history
 
-    def _update_maxwell_branches(self, j: int, k: int, de: np.ndarray, dt: float) -> np.ndarray:
-        rates = _maxwell_rates(self.mat.maxwell)
+    def _update_maxwell_branches(
+        self, j: int, k: int, de: np.ndarray, dt: float, rates: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        if rates is None:
+            rates = _maxwell_rates(self.mat.maxwell)
         sigma_i_point = np.empty_like(self.sigma_i[:, j, k])
         for ib in range(self.n_maxwell):
             if self.integration == "paper_explicit":
@@ -904,6 +1118,7 @@ class TCPAMaxwellBlockedModel:
         sigma_i_new = np.empty_like(self.sigma_i)
         sigma_total_new = np.empty_like(self.sigma_total)
         K_old = (np.cos(self.helix.alpha) ** 2) / self.helix.rho
+        rates_layers = self._branch_rates_per_layer() if self.eyring_sigma_star > 0.0 else None
 
         for j, R in enumerate(self.R_centers):
             C0 = self.C0[j]
@@ -916,6 +1131,7 @@ class TCPAMaxwellBlockedModel:
                 v12b, v13b = v13b, v12b
             R_eval = R if eval_centers is None else float(eval_centers[j])
             u, du = self._u_du_layer(j, R_eval, coeffs, dv, dw, C_algorithmic)
+            layer_rates = None if rates_layers is None else rates_layers[j]
             for k, Phi in enumerate(self.phi):
                 denom = 1.0 + K_old * R_eval * np.cos(Phi)
                 curv = (dkappa * R_eval * np.cos(Phi) + u * K_old * np.cos(Phi)) / denom
@@ -931,7 +1147,7 @@ class TCPAMaxwellBlockedModel:
                 else:
                     sigma_reference_new[j, k] = self.sigma_reference[j, k]
                     sigma0_new[j, k] = self.sigma0[j, k] + C0 @ de
-                    sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt)
+                    sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt, layer_rates)
                 sigma_total_new[j, k] = (
                     sigma_reference_new[j, k] + sigma0_new[j, k] + sigma_i_new[:, j, k].sum(axis=0)
                 )
@@ -1028,6 +1244,7 @@ class TCPAMaxwellBlockedModel:
         sigma_i_new = np.empty_like(self.sigma_i)
         sigma_total_new = np.empty_like(self.sigma_total)
         K_old = (np.cos(self.helix.alpha) ** 2) / self.helix.rho
+        rates_layers = self._branch_rates_per_layer() if self.eyring_sigma_star > 0.0 else None
 
         for j, R in enumerate(self.R_centers):
             C0 = self.C0[j]
@@ -1040,6 +1257,7 @@ class TCPAMaxwellBlockedModel:
                 v12b, v13b = v13b, v12b
             R_eval = R if eval_centers is None else float(eval_centers[j])
             u, du = self._u_du_layer(j, R_eval, coeffs, dv, dw, C_algorithmic)
+            layer_rates = None if rates_layers is None else rates_layers[j]
             for k, Phi in enumerate(self.phi):
                 denom = 1.0 + K_old * R_eval * np.cos(Phi)
                 curv = (dkappa * R_eval * np.cos(Phi) + u * K_old * np.cos(Phi)) / denom
@@ -1055,7 +1273,7 @@ class TCPAMaxwellBlockedModel:
                 else:
                     sigma_reference_new[j, k] = self.sigma_reference[j, k]
                     sigma0_new[j, k] = self.sigma0[j, k] + C0 @ de
-                    sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt)
+                    sigma_i_new[:, j, k] = self._update_maxwell_branches(j, k, de, dt, layer_rates)
                 sigma_total_new[j, k] = (
                     sigma_reference_new[j, k] + sigma0_new[j, k] + sigma_i_new[:, j, k].sum(axis=0)
                 )
@@ -1288,7 +1506,10 @@ class TCPAMaxwellBlockedModel:
             raise ValueError("pressure must be finite and non-negative.")
         if h_target is None:
             h_target = self.h_blocked
-        dP = pressure_new - self.helix.pressure
+        # Alpha V4-1 : la pression qui pilote le BVP est la pression effective
+        # (identique a la pression appliquee quand l'engagement est off).
+        ovality_new, p_eng_new, p_fric_new, p_eff_new = self._drive_pressure_state(pressure_new)
+        dP = p_eff_new - self.p_effective
         dw = self._find_dw(dP, dt, h_target)
         trial = self._trial_state(dw, dP, dt, h_target)
         residual = float(trial["residual"])
@@ -1301,6 +1522,10 @@ class TCPAMaxwellBlockedModel:
             )
 
         self._commit_trial(trial)
+        self.ovality = ovality_new
+        self.p_engaged = p_eng_new
+        self.p_friction = p_fric_new
+        self.p_effective = p_eff_new
         self.helix = HelixState(
             rho=float(trial["rho_new"]),
             alpha=float(trial["alpha_new"]),
@@ -1329,6 +1554,10 @@ class TCPAMaxwellBlockedModel:
             axial_stretch=self.axial_stretch,
             Rin=float(self.R_edges[0]),
             Rout=float(self.R_edges[-1]),
+            pressure_effective=float(p_eff_new),
+            ovality=float(ovality_new),
+            pressure_friction=float(p_fric_new),
+            anchor_creep=float(self.anchor_creep_mm),
         )
         self.history.append(out)
         return out
@@ -1337,10 +1566,19 @@ class TCPAMaxwellBlockedModel:
         self._validate_time_step(dt)
         if not np.isfinite(pressure_new) or pressure_new < 0.0:
             raise ValueError("pressure must be finite and non-negative.")
-        dP = pressure_new - self.helix.pressure
+        ovality_new, p_eng_new, p_fric_new, p_eff_new = self._drive_pressure_state(pressure_new)
+        dP = p_eff_new - self.p_effective
+        # Alpha V4-5 : extension d'ancrage evaluee a la fin du pas, gelee
+        # pendant l'iteration (0 quand le mecanisme est off).
+        self._pending_anchor_creep_mm = self._anchor_creep_at(self.helix.time + dt)
         trial, h_target = self._find_blocked_series_trial(dP, dt)
 
         self._commit_trial(trial)
+        self.ovality = ovality_new
+        self.p_engaged = p_eng_new
+        self.p_friction = p_fric_new
+        self.p_effective = p_eff_new
+        self.anchor_creep_mm = self._pending_anchor_creep_mm
         self.helix = HelixState(
             rho=float(trial["rho_new"]),
             alpha=float(trial["alpha_new"]),
@@ -1368,6 +1606,10 @@ class TCPAMaxwellBlockedModel:
             axial_stretch=self.axial_stretch,
             Rin=float(self.R_edges[0]),
             Rout=float(self.R_edges[-1]),
+            pressure_effective=float(p_eff_new),
+            ovality=float(ovality_new),
+            pressure_friction=float(p_fric_new),
+            anchor_creep=float(self.anchor_creep_mm),
         )
         self.history.append(out)
         return out
@@ -1477,10 +1719,15 @@ class TCPAMaxwellBlockedModel:
             raise ValueError("load_N must be strictly positive for suspended-mass equilibrium.")
         if not np.isfinite(pressure_new) or pressure_new < 0.0:
             raise ValueError("pressure must be finite and non-negative.")
-        dP = pressure_new - self.helix.pressure
+        ovality_new, p_eng_new, p_fric_new, p_eff_new = self._drive_pressure_state(pressure_new)
+        dP = p_eff_new - self.p_effective
         trial = self._find_suspended_state(dP, dt, load_N)
 
         self._commit_trial(trial)
+        self.ovality = ovality_new
+        self.p_engaged = p_eng_new
+        self.p_friction = p_fric_new
+        self.p_effective = p_eff_new
         rho_new = float(trial["rho_new"])
         alpha_new = float(trial["alpha_new"])
         h_new = rho_new * np.tan(alpha_new)
@@ -1512,6 +1759,10 @@ class TCPAMaxwellBlockedModel:
             axial_stretch=self.axial_stretch,
             Rin=float(self.R_edges[0]),
             Rout=float(self.R_edges[-1]),
+            pressure_effective=float(p_eff_new),
+            ovality=float(ovality_new),
+            pressure_friction=float(p_fric_new),
+            anchor_creep=float(self.anchor_creep_mm),
         )
         self.history.append(out)
         return out
@@ -1525,6 +1776,11 @@ class TCPAMaxwellBlockedModel:
         if eps_tk == 0.0:
             self.h_blocked = h_end
             return
+        if self.prestretch_convention == "grip_to_grip" and self.uncoiled_length > 0.0:
+            # Alpha V4-3 : eps porte sur la longueur entre mors, les extremites
+            # desenroulees s'allongeant en serie pendant l'etirement.
+            self._prestretch_grip_to_grip(eps_tk, strain_rate_mm_min)
+            return
         L0 = 2.0 * np.pi * self.turns * self.h0
         total_time = 60.0 * eps_tk * L0 / strain_rate_mm_min
         dt = total_time / self.disc.pre_steps if self.disc.pre_steps > 0 else 1.0
@@ -1536,6 +1792,148 @@ class TCPAMaxwellBlockedModel:
             self._building_reference_state = False
         self.h_blocked = h_end
 
+    def _find_prestretch_series_trial(
+        self,
+        dt: float,
+        delta_length_mm: float,
+        compliance_mm_per_N: float,
+        force_prev_N: float,
+        h_prev: float,
+    ) -> Tuple[Dict[str, object], float]:
+        """Alpha V4-3 : un increment de pre-etirement entre mors.
+
+        Inconnues (dw, h) ; residus : equilibre des moments de l'helice et
+        compatibilite serie incrementale
+            2 pi N (h - h_prev) + C(alpha_prev) (Ft - F_prev) = delta_L,
+        la compliance C etant reevaluee a l'angle courant a chaque increment
+        (allongement d'extremite integre de facon incrementale, coherent avec
+        le chemin — contre-expertise, correction 2c).
+        """
+        dw_min, dw_max = map(float, self.disc.dw_bracket)
+        old_centerline_per_rad = self.helix.rho / np.cos(self.helix.alpha)
+        h_min = max(1.0e-7, 0.05 * self.h0)
+        h_max = 0.995 * (1.0 + dw_max) * old_centerline_per_rad
+        if h_max <= h_min:
+            raise RuntimeError("The grip-to-grip prestretch pitch bounds are inadmissible.")
+        moment_scale = max(
+            0.1,
+            abs(force_prev_N) * self.geom.rho0,
+            abs(self.history[-1].Tt) if self.history else 0.0,
+        )
+        length_scale = max(1.0e-3, abs(delta_length_mm))
+        turns_factor = 2.0 * np.pi * self.turns
+
+        def normalized_residuals(x: np.ndarray) -> np.ndarray:
+            dw = float(x[0])
+            h_target = float(x[1])
+            try:
+                trial = self._trial_state(dw, 0.0, dt, h_target)
+                force = float(trial["Ft"])
+                moment = float(trial["residual"])
+                length = (
+                    turns_factor * (h_target - h_prev)
+                    + compliance_mm_per_N * (force - force_prev_N)
+                    - delta_length_mm
+                )
+                if not np.isfinite(moment) or not np.isfinite(length):
+                    raise ValueError("inadmissible prestretch state")
+                return np.array([moment / moment_scale, length / length_scale], dtype=float)
+            except Exception:
+                return np.array([1.0e6, 1.0e6], dtype=float)
+
+        def solve_from(start: np.ndarray):
+            return least_squares(
+                normalized_residuals,
+                start,
+                bounds=([dw_min, h_min], [dw_max, h_max]),
+                x_scale=np.array([max(0.01, 0.25 * (dw_max - dw_min)), max(0.01, 0.1 * self.h0)]),
+                xtol=1.0e-11,
+                ftol=1.0e-11,
+                gtol=1.0e-11,
+                max_nfev=180,
+            )
+
+        coil_only_h = np.clip(h_prev + delta_length_mm / turns_factor, h_min, h_max)
+        best = solve_from(np.array([0.0, coil_only_h], dtype=float))
+        if not best.success or np.linalg.norm(best.fun, ord=np.inf) > 1.0e-7:
+            for start in (
+                np.array([0.0, np.clip(h_prev, h_min, h_max)], dtype=float),
+                np.array([0.0, np.clip(0.5 * (h_prev + coil_only_h), h_min, h_max)], dtype=float),
+            ):
+                result = solve_from(start)
+                if result.cost < best.cost:
+                    best = result
+        if best is None or not best.success or not np.all(np.isfinite(best.x)):
+            raise RuntimeError("Could not solve the grip-to-grip prestretch increment.")
+        h_target = float(best.x[1])
+        trial = self._trial_state(float(best.x[0]), 0.0, dt, h_target)
+        moment_residual = float(trial["residual"])
+        length_residual = (
+            turns_factor * (h_target - h_prev)
+            + compliance_mm_per_N * (float(trial["Ft"]) - force_prev_N)
+            - delta_length_mm
+        )
+        if abs(moment_residual) > 1.0e-5 or abs(length_residual) > 1.0e-6 * max(1.0, length_scale):
+            raise RuntimeError(
+                "Could not solve the grip-to-grip prestretch increment: "
+                f"moment residual={moment_residual:.3e} N mm, length residual={length_residual:.3e} mm."
+            )
+        return trial, h_target
+
+    def _prestretch_grip_to_grip(self, eps_tk: float, strain_rate_mm_min: float) -> None:
+        active_length0 = 2.0 * np.pi * self.turns * self.h0
+        total_length0 = active_length0 + self.uncoiled_length
+        total_time = 60.0 * eps_tk * total_length0 / strain_rate_mm_min
+        steps = max(1, int(self.disc.pre_steps))
+        dt = total_time / steps
+        delta_step = eps_tk * total_length0 / steps
+        self._building_reference_state = self.prestrain_reference_mode == "elastic_tk_reference"
+        try:
+            for _ in range(steps):
+                compliance = self._uncoiled_series_compliance(alpha=self.helix.alpha)
+                force_prev = float(self.history[-1].Ft) if self.history else 0.0
+                h_prev = float(self.helix.h)
+                trial, h_new = self._find_prestretch_series_trial(dt, delta_step, compliance, force_prev, h_prev)
+                self._commit_trial(trial)
+                self.prestretch_end_extension_mm += compliance * (float(trial["Ft"]) - force_prev)
+                self.helix = HelixState(
+                    rho=float(trial["rho_new"]),
+                    alpha=float(trial["alpha_new"]),
+                    h=h_new,
+                    pressure=0.0,
+                    time=self.helix.time + dt,
+                )
+                self.history.append(
+                    StepResult(
+                        time=self.helix.time,
+                        pressure=0.0,
+                        rho=float(trial["rho_new"]),
+                        alpha=float(trial["alpha_new"]),
+                        dw=float(trial["dw"]),
+                        dv=float(trial["dv"]),
+                        dkappa=float(trial["dkappa"]),
+                        Ft=float(trial["Ft"]),
+                        Tt=float(trial["Tt"]),
+                        residual=float(trial["residual"]),
+                        Ftube=float(trial["Ftube"]),
+                        Mtube=float(trial["Mtube"]),
+                        Ttube=float(trial["Ttube"]),
+                        Fnylon=float(trial["Fny"]),
+                        Mnylon=float(trial["Mny"]),
+                        Tnylon=float(trial["Tny"]),
+                        axial_stretch=self.axial_stretch,
+                        Rin=float(self.R_edges[0]),
+                        Rout=float(self.R_edges[-1]),
+                        pressure_effective=0.0,
+                        ovality=float(self.ovality),
+                        pressure_friction=0.0,
+                        anchor_creep=0.0,
+                    )
+                )
+        finally:
+            self._building_reference_state = False
+        self.h_blocked = float(self.helix.h)
+
     def run_pressure_history(self, time: np.ndarray, pressure: np.ndarray) -> List[StepResult]:
         if len(time) != len(pressure):
             raise ValueError("time and pressure must have the same length.")
@@ -1545,6 +1943,13 @@ class TCPAMaxwellBlockedModel:
                 raise ValueError("time must be strictly increasing.")
             if self.series_compliance_enabled:
                 self.step_blocked_series(float(pressure[k]), dt)
+            elif self.anchor_creep_enabled:
+                # Alpha V4-5 sans compliance serie : l'extension d'ancrage
+                # raccourcit directement la longueur active bloquee.
+                creep = self._anchor_creep_at(float(time[k]))
+                self._pending_anchor_creep_mm = creep
+                self.anchor_creep_mm = creep
+                self.step(float(pressure[k]), dt, h_target=self.h_blocked - creep / (2.0 * np.pi * self.turns))
             else:
                 self.step(float(pressure[k]), dt, h_target=self.h_blocked)
         return self.history
@@ -1578,7 +1983,13 @@ class TCPAMaxwellBlockedModel:
             "axial_stretch": np.array([x.axial_stretch for x in h], dtype=float),
             "Rin_mm": np.array([x.Rin for x in h], dtype=float),
             "Rout_mm": np.array([x.Rout for x in h], dtype=float),
+            # Alpha V4
+            "pressure_effective_MPa": np.array([x.pressure_effective for x in h], dtype=float),
+            "pressure_friction_MPa": np.array([x.pressure_friction for x in h], dtype=float),
+            "ovality": np.array([x.ovality for x in h], dtype=float),
+            "anchor_creep_mm": np.array([x.anchor_creep for x in h], dtype=float),
         }
+        anchor_creep = np.asarray(arr["anchor_creep_mm"], dtype=float)
 
         alpha = np.array([x.alpha for x in h], dtype=float)
         rho = np.array([x.rho for x in h], dtype=float)
@@ -1606,6 +2017,7 @@ class TCPAMaxwellBlockedModel:
                 active_axial_length_geometry
                 - self.series_reference_active_length_mm
                 + uncoiled_extension
+                + anchor_creep
             )
             blocked_reference_length = self.series_reference_active_length_mm + self.uncoiled_length
         else:
@@ -1630,6 +2042,7 @@ class TCPAMaxwellBlockedModel:
                 ),
                 "series_compatibility_residual_mm": series_compatibility_residual,
                 "blocked_reference_length_mm": np.full_like(axial_length, blocked_reference_length),
+                "prestretch_end_extension_mm": np.full_like(axial_length, self.prestretch_end_extension_mm),
             }
         )
         sin_a = np.sin(alpha)

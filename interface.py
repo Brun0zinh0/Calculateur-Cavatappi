@@ -50,6 +50,8 @@ from parametres import (
     INTEGRATION_LABELS,
     INTEGRATION_OPTIONS,
     PRESTRAIN_REFERENCE_LABELS,
+    PRESTRETCH_CONVENTION_LABELS,
+    PRESTRETCH_CONVENTION_OPTIONS,
     PRESTRAIN_REFERENCE_OPTIONS,
     MAXWELL_ANISOTROPY_LABELS,
     MAXWELL_ANISOTROPY_OPTIONS,
@@ -1130,6 +1132,17 @@ nylon_condition_mode = "bonded_linear"
 nylon_scale = 1.0
 nylon_axial_prestrain_coupling = 1.0
 nylon_axial_actuation_coupling = 1.0
+# Alpha V4 : mecanismes physiques optionnels (off par defaut)
+prestretch_convention = str(settings.get("prestretch_convention", "coil_only"))
+if prestretch_convention not in PRESTRETCH_CONVENTION_OPTIONS:
+    prestretch_convention = "coil_only"
+engagement_ovality_e0 = float(settings.get("engagement_ovality_e0", 0.0))
+engagement_ring_factor = float(settings.get("engagement_ring_factor", 1.0))
+engagement_unload_ratio = float(settings.get("engagement_unload_ratio", 1.0))
+friction_pressure_coulomb_mpa = float(settings.get("friction_pressure_coulomb_mpa", 0.0))
+eyring_sigma_star_mpa = float(settings.get("eyring_sigma_star_mpa", 0.0))
+anchor_creep_c_mm = float(settings.get("anchor_creep_c_mm", 0.0))
+anchor_creep_t0_s = float(settings.get("anchor_creep_t0_s", 10.0))
 dt = float(settings["dt"])
 n_layers = int(settings["n_layers"])
 n_phi = int(settings["n_phi"])
@@ -1197,6 +1210,50 @@ if show_advanced_settings:
         E_nylon_mpa = st.number_input("Module axial du nylon E_nylon (MPa)", 0.001, 100000.0, E_nylon_mpa, 10.0)
         G_nylon_mpa = st.number_input("Module de cisaillement du nylon G_nylon (MPa)", 0.001, 100000.0, G_nylon_mpa, 10.0)
         st.caption("Condition fixe : nylon linéaire bilatéral lié aux extrémités.")
+
+    with st.sidebar.expander("Mécanismes Alpha V4 (off par défaut)"):
+        sidebar_help(
+            [
+                "Cinq mécanismes physiques issus de la confrontation aux essais (chapitre 7 du rapport). Tous sont inactifs par défaut : le moteur est alors identique à l’alpha V3.",
+                "Pression d’engagement : le pré-étirement ovalise la section ; la pression commence par la reformer (peu de force) avant de travailler en membrane — seuil de démarrage et super-linéarité, sans perte de gain en haut de course.",
+                "Frottement sec : élément de Coulomb sur la transmission de la pression (frottement radial paroi/nylon et spire-spire) — seule dissipation indépendante de la vitesse : seuil de démarrage, descente au-dessus de la montée, force résiduelle à P = 0.",
+                "Convention de pré-étirement : appliquer ε à la longueur entre mors au lieu de la spire seule (extrémités en série pendant l’étirement).",
+                "Eyring : la viscosité chute avec la contrainte de branche — relaxation forte à la précontrainte, faible à l’actionnement (incompatibilité d’amplitude).",
+                "Fluage d’ancrage : extension logarithmique des fixations à partir du blocage (part minoritaire de la relaxation mesurée, essai E10).",
+            ]
+        )
+        prestretch_convention = st.selectbox(
+            "Convention de pré-étirement",
+            PRESTRETCH_CONVENTION_OPTIONS,
+            index=option_index(PRESTRETCH_CONVENTION_OPTIONS, prestretch_convention),
+            format_func=lambda value: PRESTRETCH_CONVENTION_LABELS.get(value, value),
+            help="Sans extrémités désenroulées, les deux conventions coïncident.",
+        )
+        engagement_ovality_e0 = st.number_input(
+            "Ovalité initiale de la section e0 (0 = off)", 0.0, 0.9, engagement_ovality_e0, 0.01,
+            help="Rapport (grand axe − petit axe)/rayon moyen après pré-étirement. Mesurable par imagerie latérale de la section.",
+        )
+        engagement_ring_factor = st.number_input(
+            "Facteur d’anneau k", 0.01, 100.0, engagement_ring_factor, 0.1,
+            help="P_r0 = k·E_radius·(t/R_m)³·e0 : pression qui referme la section (k ≈ 1 pour un anneau mince idéal).",
+        )
+        engagement_unload_ratio = st.number_input(
+            "Rapport de décharge r (1 = réversible)", 0.05, 1.0, engagement_unload_ratio, 0.05,
+            help="r < 1 : la section reste ronde plus longtemps à la décharge — hystérésis du seuil.",
+        )
+        friction_pressure_coulomb_mpa = st.number_input(
+            "Pression de Coulomb P_c (MPa, 0 = off)", 0.0, 1.0, friction_pressure_coulomb_mpa, 0.005, format="%.3f",
+            help="P_eff = P − P_f avec P_f élément de Jenkins écrêté à ±P_c : retard de P_c en charge, avance de P_c en décharge. En mode bloqué, un patin interne (dw, dv, dκ) n’ouvre aucune boucle — seule la transmission de la pression le peut. Calibration : hystérésis du seuil mesurée 0,038 MPa ≈ 2·P_c.",
+        )
+        eyring_sigma_star_mpa = st.number_input(
+            "Contrainte d’activation d’Eyring σ* (MPa, 0 = off)", 0.0, 1000.0, eyring_sigma_star_mpa, 0.01, format="%.3f",
+            help="η_eff = η·(s/σ*)/sinh(s/σ*) par couche et par branche, s = norme de la contrainte de branche. Dans ce modèle les contraintes de branche du tube valent ~0,01-0,05 MPa à la précontrainte : σ* doit être de cet ordre pour agir. Exige l’intégration exponentielle.",
+        )
+        anchor_creep_c_mm = st.number_input(
+            "Fluage d’ancrage c (mm, 0 = off)", 0.0, 50.0, anchor_creep_c_mm, 0.01,
+            help="δ(t) = c·ln(1 + t/t0) depuis le blocage, en série dans la longueur bloquée.",
+        )
+        anchor_creep_t0_s = st.number_input("Temps de référence du fluage t0 (s)", 0.01, 100000.0, anchor_creep_t0_s, 1.0)
 
     with st.sidebar.expander("Solveur"):
         sidebar_help(
@@ -1339,6 +1396,14 @@ current_settings = {
     "nylon_axial_actuation_coupling": float(nylon_axial_actuation_coupling),
     "nylon_condition_mode": str(nylon_condition_mode),
     "nylon_scale": float(nylon_scale),
+    "prestretch_convention": str(prestretch_convention),
+    "engagement_ovality_e0": float(engagement_ovality_e0),
+    "engagement_ring_factor": float(engagement_ring_factor),
+    "engagement_unload_ratio": float(engagement_unload_ratio),
+    "friction_pressure_coulomb_mpa": float(friction_pressure_coulomb_mpa),
+    "eyring_sigma_star_mpa": float(eyring_sigma_star_mpa),
+    "anchor_creep_c_mm": float(anchor_creep_c_mm),
+    "anchor_creep_t0_s": float(anchor_creep_t0_s),
     "n_layers": int(n_layers),
     "n_phi": int(n_phi),
     "parallel_workers": int(parallel_workers),
@@ -1431,6 +1496,19 @@ if section_update_mode == "updated":
     st.caption(
         "La section radiale évolutive actualise les rayons et l'orientation du matériau à chaque incrément."
     )
+active_v4 = [
+    label
+    for label, active in (
+        ("pré-étirement entre mors", prestretch_convention == "grip_to_grip"),
+        ("pression d'engagement", engagement_ovality_e0 > 0.0),
+        ("frottement sec", friction_pressure_coulomb_mpa > 0.0),
+        ("viscosité d'Eyring", eyring_sigma_star_mpa > 0.0),
+        ("fluage d'ancrage", anchor_creep_c_mm > 0.0),
+    )
+    if active
+]
+if active_v4:
+    st.caption("Mécanismes Alpha V4 actifs : " + ", ".join(active_v4) + ".")
 if str(integration) == "paper_explicit":
     active_tau = [
         eta / modulus

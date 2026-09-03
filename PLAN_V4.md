@@ -1,5 +1,14 @@
 # Plan V4 — prédire physiquement le retard initial de la force (dead-band)
 
+> **État au 02/09/2026 — alpha V4 livrée (moteur `2026.09.02-v4-15`).**
+> Les mécanismes retenus après contre-expertise adversariale sont
+> implémentés en options off par défaut (README, section « Alpha V4 ») :
+> pression d'engagement par ovalité (M-A), frottement sec torsionnel,
+> convention de pré-étirement entre mors, viscosité d'Eyring, fluage
+> d'ancrage, identification en boucle fermée. Les essais de discrimination
+> P1-P6 restent nécessaires pour **calibrer** e0(ε), k, T_c, σ*, c — le plan
+> ci-dessous garde toute sa valeur comme protocole de calibration.
+
 Objectif : que le modèle **prédise** le seuil de pression avant montée de la
 force (dead-band) et la super-linéarité F(P) qui l'accompagne, à partir de
 mécanismes physiques à paramètres **mesurables indépendamment** — jamais par
