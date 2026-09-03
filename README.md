@@ -251,6 +251,14 @@ contre-expertise) — sous pression le rayon interne augmente, le jeu
 s'ouvrirait au lieu de se fermer ; mécanisme incohérent avec le sens de la
 déformation radiale du moteur.
 
+Première démonstration sur un essai réel (muscle J, rampe lente « 1 O »,
+ε = 1,0, géométrie du Dataset, E_nylon 2 065 MPa) : avec e0 = 0,20,
+P_c = 0,02 MPa et r = 0,7, la corrélation de forme passe de 0,979 à 0,987
+sans perte de gain (0,52 contre 0,44 pour un simple décalage de pression), F0
+inchangé à 0,3 % près. Le déficit de gain résiduel (~×0,5) n'est pas
+touché : il relève de la pente pression→force du modèle (rapport § 7.9.2),
+pas du dead-band.
+
 Calibration attendue : e0(ε) et k par imagerie de la section sous pression
 (essai n° 2 du tableau 10.3) ; σ* conjointement avec le spectre sur les essais « 10 N » et l'essai E2 (tube
 nu) ; P_c sur l'hystérésis du seuil et l'aire de boucle des rampes lentes ;
