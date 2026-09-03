@@ -1933,6 +1933,17 @@ class TCPAMaxwellBlockedModel:
         finally:
             self._building_reference_state = False
         self.h_blocked = float(self.helix.h)
+        if self.prestretch_end_extension_mm > 0.2 * self.uncoiled_length:
+            # La compliance des extremites est une poutre tangente linearisee :
+            # au-dela de ~20 % d'allongement relatif, la prediction sort de son
+            # domaine (contre-expertise, garde-fou 3).
+            warnings.warn(
+                "grip_to_grip prestretch: the uncoiled ends extend by "
+                f"{self.prestretch_end_extension_mm:.2f} mm for {self.uncoiled_length:.2f} mm of ends "
+                "(> 20 %): the linearised tangent-beam compliance is outside its validity domain.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def run_pressure_history(self, time: np.ndarray, pressure: np.ndarray) -> List[StepResult]:
         if len(time) != len(pressure):
