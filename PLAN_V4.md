@@ -3,10 +3,10 @@
 > **État au 02/09/2026 — alpha V4 livrée (moteur `2026.09.02-v4-15`).**
 > Les mécanismes retenus après contre-expertise adversariale sont
 > implémentés en options off par défaut (README, section « Alpha V4 ») :
-> pression d'engagement par ovalité (M-A), frottement sec torsionnel,
+> pression d'engagement par ovalité (M-A), frottement de Coulomb sur la pression motrice,
 > convention de pré-étirement entre mors, viscosité d'Eyring, fluage
 > d'ancrage, identification en boucle fermée. Les essais de discrimination
-> P1-P6 restent nécessaires pour **calibrer** e0(ε), k, T_c, σ*, c — le plan
+> P1-P6 restent nécessaires pour **calibrer** P_r0(ε), P_c, σ*, c — le plan
 > ci-dessous garde toute sa valeur comme protocole de calibration.
 
 Objectif : que le modèle **prédise** le seuil de pression avant montée de la

@@ -778,8 +778,10 @@ def _v4_settings(**extra) -> dict:
 
 
 def _loop_area(data) -> float:
-    """Aire signee de la boucle force-pression (montee puis descente) :
-    positive quand la branche de descente est au-dessus de la montee."""
+    """Integrale signee de F dP sur la boucle (montee puis descente) :
+    NEGATIVE quand la branche de descente est au-dessus de la montee (boucle
+    dissipative de signe physique), positive dans le cas contraire (artefact
+    de relaxation de la reference)."""
     return float(np.trapezoid(np.asarray(data["force_act_mN"], dtype=float), np.asarray(data["pressure_MPa"], dtype=float)))
 
 
@@ -792,7 +794,7 @@ def test_v4_defaults_are_off() -> None:
     settings = _v4_settings()
     config = parametres.build_config(settings)
     assert config.geom.prestretch_convention == "coil_only"
-    assert config.mat.engagement_ovality_e0 == 0.0
+    assert config.mat.engagement_reform_pressure_mpa == 0.0
     assert config.mat.friction_pressure_coulomb_mpa == 0.0
     assert config.mat.eyring_sigma_star_mpa == 0.0
     assert config.mat.anchor_creep_c_mm == 0.0
@@ -802,7 +804,7 @@ def test_v4_defaults_are_off() -> None:
     assert np.all(data["anchor_creep_mm"] == 0.0)
     assert np.all(data["pressure_friction_MPa"] == 0.0)
     for key, bad in (
-        ("engagement_ovality_e0", 0.95),
+        ("engagement_reform_pressure_mpa", -1.0),
         ("engagement_unload_ratio", 0.0),
         ("friction_pressure_coulomb_mpa", -1.0),
         ("anchor_creep_t0_s", 0.0),
@@ -829,7 +831,7 @@ def test_v4_engagement_pressure_threshold() -> None:
     t = np.linspace(0.0, 120.0, 61)
     p = 1.2 * np.where(t <= 60.0, t / 60.0, (120.0 - t) / 60.0)
     reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()), pressure_time=t, pressure_MPa=p)[1]
-    config = parametres.build_config(_v4_settings(engagement_ovality_e0=0.05))
+    config = parametres.build_config(_v4_settings(engagement_reform_pressure_mpa=0.28))
     model, data = Base.run_blocked_actuation(config, pressure_time=t, pressure_MPa=p)
     P_r0 = model._engagement_reform_pressure()
     assert 0.0 < P_r0 < 1.2, f"P_r0 = {P_r0:.3f} MPa doit etre atteint par la rampe"
@@ -842,7 +844,7 @@ def test_v4_engagement_pressure_threshold() -> None:
     assert abs(data["pressure_effective_MPa"].max() - data["pressure_MPa"].max()) < 1.0e-9
     gain_ratio = float(data["force_act_mN"].max() / reference["force_act_mN"].max())
     assert 0.9 < gain_ratio < 1.05, f"gain conserve attendu, ratio {gain_ratio:.3f}"
-    hyst = Base.run_blocked_actuation(parametres.build_config(_v4_settings(engagement_ovality_e0=0.05, engagement_unload_ratio=0.5)), pressure_time=t, pressure_MPa=p)[1]
+    hyst = Base.run_blocked_actuation(parametres.build_config(_v4_settings(engagement_reform_pressure_mpa=0.28, engagement_unload_ratio=0.5)), pressure_time=t, pressure_MPa=p)[1]
     # descente au-dessus de la montee sous r P_r0 : integrale signee plus petite
     assert _loop_area(hyst) < _loop_area(data) - 1.0e-6, "r < 1 doit ouvrir une boucle de signe positif"
 
@@ -919,6 +921,72 @@ def test_v4_prestretch_convention() -> None:
     assert np.max(np.abs(grip["residual"])) < 1.0e-4
 
 
+def test_v4_settings_migration_keeps_v3_choices() -> None:
+    """C1 de la contre-expertise : un fichier de reglages de schema 16 (alpha V3)
+    avec des options non defaut doit survivre a load_settings (schema 17) —
+    seules les cles V4 sont completees a leur valeur neutre."""
+    import tempfile
+
+    legacy = dict(parametres.DEFAULT_SETTINGS)
+    for key in parametres.V4_MECHANISM_KEYS:
+        legacy.pop(key, None)
+    legacy.update({
+        "_settings_schema_version": 16,
+        "section_update_mode": "updated",
+        "prestrain_reference_mode": "viscoelastic_history",
+        "axial_modulus_mode": "paper_table",
+        "E_axial_mpa": 40.0,
+        "maxwell_anisotropy_mode": "axial_test_only",
+        "bias_angle_profile": "uniform_twist",
+        "integration": "paper_explicit",
+        "dt": 2.0,
+        "use_fixed_duration": True,
+        "nonlinear_pressure": True,
+        "p_max_mpa": 1.1,
+    })
+    original_path = parametres.SETTINGS_PATH
+    original_migrate = parametres._migrate_legacy_storage
+    with tempfile.TemporaryDirectory() as tmp:
+        parametres.SETTINGS_PATH = Path(tmp) / "settings.json"
+        parametres._migrate_legacy_storage = lambda: None
+        try:
+            parametres.SETTINGS_PATH.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = parametres.load_settings()
+        finally:
+            parametres.SETTINGS_PATH = original_path
+            parametres._migrate_legacy_storage = original_migrate
+    assert parametres.settings_error(dict(parametres.DEFAULT_SETTINGS, **{k: v for k, v in legacy.items() if k in parametres.DEFAULT_SETTINGS})) is None
+    for key in ("section_update_mode", "prestrain_reference_mode", "axial_modulus_mode", "E_axial_mpa", "maxwell_anisotropy_mode",
+                "bias_angle_profile", "integration", "dt", "use_fixed_duration", "nonlinear_pressure", "p_max_mpa"):
+        assert loaded[key] == legacy[key], f"{key} : {loaded[key]!r} != {legacy[key]!r} (migration destructive)"
+    assert loaded["_settings_schema_version"] == parametres.SETTINGS_SCHEMA_VERSION
+    for key in parametres.V4_MECHANISM_KEYS:
+        assert loaded[key] == parametres.DEFAULT_SETTINGS[key]
+
+
+def test_v4_mechanisms_over_cycles() -> None:
+    """Engagement + frottement + Eyring actifs ensemble sur trois cycles :
+    le solveur converge a chaque pas, la reponse reste finie et les cycles
+    2 et 3 se superposent (pas de derive de la boucle)."""
+    settings = _v4_settings(n_cycles=3, engagement_reform_pressure_mpa=0.28, engagement_unload_ratio=0.7,
+                            friction_pressure_coulomb_mpa=0.02, eyring_sigma_star_mpa=0.02)
+    model, data = Base.run_blocked_actuation(parametres.build_config(settings))
+    assert np.all(np.isfinite(data["force_total_mN"]))
+    assert np.max(np.abs(data["residual"])) < 1.0e-4
+    period = Base.default_simulation_config().volume_mL * 2.0 * 60.0 / Base.default_simulation_config().flow_rate_mL_min
+    t = np.asarray(data["time"])
+    F = np.asarray(data["force_act_mN"])
+    # amplitude d'actionnement (max - min) par cycle : le premier cycle porte
+    # les transitoires d'accrochage, les cycles 2 et 3 doivent se superposer
+    amplitudes = [
+        float(np.max(F[(t >= k * period) & (t < (k + 1) * period)]) - np.min(F[(t >= k * period) & (t < (k + 1) * period)]))
+        for k in range(3)
+    ]
+    assert amplitudes[1] > 1.0 and amplitudes[2] > 1.0, amplitudes
+    assert abs(amplitudes[2] - amplitudes[1]) < 0.10 * amplitudes[1], amplitudes
+    assert abs(np.max(data["ovality"]) - 1.0) < 1.0e-12 and np.min(data["ovality"]) >= 0.0
+
+
 def test_v4_closed_loop_identification_tool() -> None:
     """V4-6 : l'outil identification/identifier_spectre_moteur.py retrouve,
     sur un signal synthetique produit par le moteur, une relaxation de meme
@@ -970,6 +1038,8 @@ def main() -> None:
         test_v4_eyring_amplitude_dependence,
         test_v4_anchor_creep_series,
         test_v4_prestretch_convention,
+        test_v4_settings_migration_keeps_v3_choices,
+        test_v4_mechanisms_over_cycles,
         test_v4_closed_loop_identification_tool,
     )
     for test in tests:

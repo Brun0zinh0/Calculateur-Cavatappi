@@ -1,6 +1,10 @@
-# Interface Cavatappi Alpha V3
+# Interface Cavatappi Alpha V4
 
 Ce dossier contient tout le nécessaire pour lancer l'interface Streamlit du modèle Cavatappi.
+
+Alpha V4 = alpha V3 + cinq mécanismes physiques optionnels et un outil
+d'identification, tous **off par défaut** (moteur bit-identique à l'alpha V3
+sinon) — voir la section « Alpha V4 » plus bas et `PATCH_NOTES.md`.
 
 Alpha V3 est la copie consolidée d'Alpha V2 (moteur identique,
 `2026.07.30-series-compliant-ends-10`) issue de l'audit scientifique complet du
@@ -239,11 +243,11 @@ des réglages avancés.
 
 | Mécanisme | Réglage (0 = off) | Écart visé (rapport) | Ce que ça change |
 |---|---|---|---|
-| **V4-1 Pression d'engagement** (reformage de la section ovalisée, § 7.10.3) | `engagement_ovality_e0`, `engagement_ring_factor`, `engagement_unload_ratio` | Seuil de démarrage 1,7 bar vs 0 simulé ; super-linéarité sous 2 bar | Ovalité e comme variable d'état ; P_eff = P(1 − e/e0) — démarrage quadratique P²/P_r0, pleine pression une fois la section ronde (gain conservé). P_r0 = k·E_radius·(t/R_m)³·e0 sur la **section** du tube. r < 1 : hystérésis du seuil. |
+| **V4-1 Pression d'engagement** (reformage de la section ovalisée, § 7.10.3) | `engagement_reform_pressure_mpa` (P_r0), `engagement_unload_ratio` | Seuil de démarrage 1,7 bar vs 0 simulé ; super-linéarité sous 2 bar | Fraction d'ovalité e ∈ [0, 1] comme variable d'état ; P_eff = P(1 − e) — démarrage quadratique P²/P_r0, pleine pression une fois la section ronde (gain conservé). P_r0 est le **seul** paramètre (une ovalité e0 et un facteur d'anneau k n'agissent que par leur produit) ; ordre de grandeur k·E_radius·(t/R_m)³·e0 ≈ 1,3 MPa × k·e0 sur la **section** du tube de la campagne. r < 1 : hystérésis du seuil. **Convention** : P_eff pilote *tout* le BVP radial (condition limite σ_r(Rin) = −P_eff), donc aussi les rayons en mode `updated`, les contraintes de paroi et l'activation d'Eyring — la fraction e est supposée absorbée par le mode de flexion d'anneau, que le BVP axisymétrique ne représente pas. |
 | **V4-2 Frottement sec** (élément de Jenkins, § 7.5) | `friction_pressure_coulomb_mpa` | Aire d'hystérésis +62 mN·bar mesurée vs −6 simulée ; seuil de descente négatif (§ 7.5.4) | Élément de Coulomb sur la **transmission de la pression** : P_eff = P − P_f, P_f écrêté à ±P_c. Retard de P_c en charge, avance en décharge : descente au-dessus de la montée, force résiduelle à P = 0, indépendant de la vitesse. Établi par expérience numérique : en mode bloqué, tout patin interne (dw, dv, dκ, ±) est ré-absorbé par l'équilibre géométrique et n'ouvre aucune boucle. Calibration : hystérésis du seuil 0,038 MPa ≈ 2·P_c. |
 | **V4-3 Convention de pré-étirement** (item 2.11) | `prestretch_convention = grip_to_grip` | Dérive de F0 avec ε (×1,26 → ×1,76) | ε appliqué à la longueur entre mors ; les extrémités désenroulées s'allongent en série pendant l'étirement (résolution à deux inconnues par incrément). Sans extrémités : identique à `coil_only`. Peut **augmenter** F0 pour des extrémités courtes (physiquement correct). |
 | **V4-4 Viscosité d'Eyring** (§ 7.8.7) | `eyring_sigma_star_mpa` | Incompatibilité d'amplitude (relaxation ×0,07) | η_eff = η·(s/σ*)/sinh(s/σ*) par couche et par branche, s = norme de la contrainte de branche. Attention : dans ce modèle les contraintes de branche du tube valent ~0,01-0,05 MPa à la précontrainte (la grande déformation du muscle est géométrique) — σ* doit être de cet ordre. Exige l'intégration exponentielle. |
-| **V4-5 Fluage d'ancrage** (§ 7.10.4, essai E10) | `anchor_creep_c_mm`, `anchor_creep_t0_s` | Part d'ancrage de la relaxation (≥ 7 %) | δ(t) = c·ln(1 + t/t0) depuis le blocage, en série dans la longueur bloquée (avec ou sans compliance des extrémités). |
+| **V4-5 Fluage d'ancrage** (§ 7.10.4, essai E10) | `anchor_creep_c_mm`, `anchor_creep_t0_s` | Part d'ancrage de la relaxation (≥ 7 %) | δ(t) = c·ln(1 + t/t0) depuis le blocage, en série dans la longueur bloquée (avec ou sans compliance des extrémités). **Mode bloqué seulement** : en masse suspendue aucun verrou série n'est posé, le mécanisme est inactif (avertissement). |
 | **V4-6 Identification en boucle fermée** | `identification/identifier_spectre_moteur.py` | Spectre 7.6 dilué ×14 par la chaîne | Ajuste {E_i, τ_i} pour que la force **simulée** en maintien à P = 0 reproduise la mesure (forme normalisée, ΣE maintenu). |
 
 Rejetée à l'implémentation : le « jeu radial tube-nylon » (retenu par la
@@ -252,15 +256,16 @@ s'ouvrirait au lieu de se fermer ; mécanisme incohérent avec le sens de la
 déformation radiale du moteur.
 
 Première démonstration sur un essai réel (muscle J, rampe lente « 1 O »,
-ε = 1,0, géométrie du Dataset, E_nylon 2 065 MPa) : avec e0 = 0,20,
+ε = 1,0, géométrie du Dataset, E_nylon 2 065 MPa) : avec P_r0 = 0,257 MPa,
 P_c = 0,02 MPa et r = 0,7, la corrélation de forme passe de 0,979 à 0,987
 sans perte de gain (0,52 contre 0,44 pour un simple décalage de pression), F0
 inchangé à 0,3 % près. Le déficit de gain résiduel (~×0,5) n'est pas
 touché : il relève de la pente pression→force du modèle (rapport § 7.9.2),
 pas du dead-band.
 
-Calibration attendue : e0(ε) et k par imagerie de la section sous pression
-(essai n° 2 du tableau 10.3) ; σ* conjointement avec le spectre sur les essais « 10 N » et l'essai E2 (tube
+Calibration attendue : P_r0(ε) par imagerie de la section sous pression
+(essai n° 2 du tableau 10.3 — l'ovalité mesurée ne fixe P_r0 qu'à travers la
+raideur d'anneau, d'où un paramètre unique) ; σ* conjointement avec le spectre sur les essais « 10 N » et l'essai E2 (tube
 nu) ; P_c sur l'hystérésis du seuil et l'aire de boucle des rampes lentes ;
 c, t0 sur la part à-coups + continue des ancrages (E10, E2).
 

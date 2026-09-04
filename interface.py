@@ -1136,8 +1136,7 @@ nylon_axial_actuation_coupling = 1.0
 prestretch_convention = str(settings.get("prestretch_convention", "coil_only"))
 if prestretch_convention not in PRESTRETCH_CONVENTION_OPTIONS:
     prestretch_convention = "coil_only"
-engagement_ovality_e0 = float(settings.get("engagement_ovality_e0", 0.0))
-engagement_ring_factor = float(settings.get("engagement_ring_factor", 1.0))
+engagement_reform_pressure_mpa = float(settings.get("engagement_reform_pressure_mpa", 0.0))
 engagement_unload_ratio = float(settings.get("engagement_unload_ratio", 1.0))
 friction_pressure_coulomb_mpa = float(settings.get("friction_pressure_coulomb_mpa", 0.0))
 eyring_sigma_star_mpa = float(settings.get("eyring_sigma_star_mpa", 0.0))
@@ -1229,13 +1228,15 @@ if show_advanced_settings:
             format_func=lambda value: PRESTRETCH_CONVENTION_LABELS.get(value, value),
             help="Sans extrémités désenroulées, les deux conventions coïncident.",
         )
-        engagement_ovality_e0 = st.number_input(
-            "Ovalité initiale de la section e0 (0 = off)", 0.0, 0.9, engagement_ovality_e0, 0.01,
-            help="Rapport (grand axe − petit axe)/rayon moyen après pré-étirement. Mesurable par imagerie latérale de la section.",
-        )
-        engagement_ring_factor = st.number_input(
-            "Facteur d’anneau k", 0.01, 100.0, engagement_ring_factor, 0.1,
-            help="P_r0 = k·E_radius·(t/R_m)³·e0 : pression qui referme la section (k ≈ 1 pour un anneau mince idéal).",
+        engagement_reform_pressure_mpa = st.number_input(
+            "Pression de reformage de la section P_r0 (MPa, 0 = off)", 0.0, 5.0, engagement_reform_pressure_mpa, 0.01, format="%.3f",
+            help=(
+                "Pression qui referme complètement la section ovalisée par le pré-étirement. Seul paramètre du "
+                "mécanisme : une ovalité e0 et un facteur d’anneau k n’agissent que par leur produit (non "
+                "identifiables séparément). Ordre de grandeur k·E_radius·(t/R_m)³·e0 ≈ 1,3 MPa × k·e0 pour le tube "
+                "de la campagne ; le seuil médian mesuré (0,17 MPa) correspond à k·e0 ≈ 0,13. Convention : P_eff "
+                "pilote tout le BVP radial (rayons en mode réactualisé, contraintes de paroi, activation d’Eyring)."
+            ),
         )
         engagement_unload_ratio = st.number_input(
             "Rapport de décharge r (1 = réversible)", 0.05, 1.0, engagement_unload_ratio, 0.05,
@@ -1397,8 +1398,7 @@ current_settings = {
     "nylon_condition_mode": str(nylon_condition_mode),
     "nylon_scale": float(nylon_scale),
     "prestretch_convention": str(prestretch_convention),
-    "engagement_ovality_e0": float(engagement_ovality_e0),
-    "engagement_ring_factor": float(engagement_ring_factor),
+    "engagement_reform_pressure_mpa": float(engagement_reform_pressure_mpa),
     "engagement_unload_ratio": float(engagement_unload_ratio),
     "friction_pressure_coulomb_mpa": float(friction_pressure_coulomb_mpa),
     "eyring_sigma_star_mpa": float(eyring_sigma_star_mpa),
@@ -1500,7 +1500,7 @@ active_v4 = [
     label
     for label, active in (
         ("pré-étirement entre mors", prestretch_convention == "grip_to_grip"),
-        ("pression d'engagement", engagement_ovality_e0 > 0.0),
+        ("pression d'engagement", engagement_reform_pressure_mpa > 0.0),
         ("frottement sec", friction_pressure_coulomb_mpa > 0.0),
         ("viscosité d'Eyring", eyring_sigma_star_mpa > 0.0),
         ("fluage d'ancrage", anchor_creep_c_mm > 0.0),
@@ -2259,6 +2259,12 @@ with tabs[4]:
     )
 
 with tabs[5]:
+    if anchor_creep_c_mm > 0.0:
+        st.info(
+            "Le fluage d'ancrage (Alpha V4-5) ne s'applique qu'au mode bloqué : il court à partir du "
+            "verrouillage de la référence série, jamais établi en masse suspendue. Ici la réponse est "
+            "identique à c = 0."
+        )
     suspended_csv_payload = None
     load_N = float(suspended_mass_g) * 1.0e-3 * 9.80665
     suspended_ramp_time_s = float(p_max_mpa) / max(float(suspended_pressure_rate_mpa_s), 1e-12)

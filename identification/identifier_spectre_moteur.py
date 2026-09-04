@@ -48,13 +48,44 @@ import parametres  # noqa: E402
 
 
 def load_force_csv(path: str):
+    """Lit time_s et force_unfiltered_mN (ou force_mN). Délimiteur ',' ';' ou
+    tabulation détecté automatiquement, virgule décimale tolérée (export Excel
+    en locale française). Erreurs explicites sur fichier vide ou colonne absente
+    (contre-expertise C14)."""
+    import io
+
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if not raw.strip():
+        raise ValueError(f"CSV vide : {path}")
+    text = raw.decode("utf-8-sig", errors="replace")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    fields = [str(name).strip() for name in (reader.fieldnames or [])]
+    reader.fieldnames = fields
+    if "time_s" not in fields:
+        raise ValueError(f"colonne time_s absente ; colonnes disponibles : {fields}")
+    if "force_unfiltered_mN" in fields:
+        col = "force_unfiltered_mN"
+    elif "force_mN" in fields:
+        col = "force_mN"
+    else:
+        raise ValueError(f"colonne force_unfiltered_mN ou force_mN absente ; colonnes : {fields}")
+
+    def number(value) -> float:
+        return float(str(value).strip().replace(",", "."))
+
     t, f = [], []
-    with open(path, encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        col = "force_unfiltered_mN" if "force_unfiltered_mN" in reader.fieldnames else "force_mN"
-        for row in reader:
-            t.append(float(row["time_s"]))
-            f.append(float(row[col]))
+    for row in reader:
+        if not row.get("time_s") or not row.get(col):
+            continue
+        t.append(number(row["time_s"]))
+        f.append(number(row[col]))
+    if len(t) < 2:
+        raise ValueError(f"moins de deux lignes numériques exploitables dans {path}")
     return np.asarray(t), np.asarray(f)
 
 
@@ -94,13 +125,28 @@ def settings_with_spectrum(base: dict, fractions: np.ndarray, taus: np.ndarray, 
 
 def identify(
     t_meas, f_meas, base_settings: dict, n_branches: int = 2, hold_s: float = 600.0,
-    dt: float = 2.0, prestretch_rate_mm_min: float = 300.0, sigma_total: float | None = None,
-    verbose: bool = True,
+    dt: float = 2.0, prestretch_rate_mm_min: float = 20.0, sigma_total: float | None = None,
+    verbose: bool = True, t0: float | None = None, min_points: int = 10,
 ):
+    """t0 : instant (s, temps brut du CSV) du blocage — début de la fenêtre
+    ajustée [t0, t0 + hold_s] ; défaut : premier échantillon. Le spectre
+    identifié est conditionnel à prestretch_rate_mm_min (relaxation consommée
+    pendant la rampe) : défaut 20 mm/min = Base.prestretch_to (C12)."""
     if sigma_total is None:
         sigma_total = sum(float(base_settings[k]) for k in ("maxwell_E0_mpa", "maxwell_E1_mpa", "maxwell_E2_mpa", "maxwell_E3_mpa"))
-    mask = (t_meas >= 0.0) & (t_meas <= hold_s)
-    t_fit = t_meas[mask]
+    t_meas = np.asarray(t_meas, dtype=float)
+    f_meas = np.asarray(f_meas, dtype=float)
+    if t0 is None:
+        t0 = float(t_meas[0])
+    t_rel = t_meas - float(t0)
+    mask = (t_rel >= 0.0) & (t_rel <= hold_s)
+    n_in = int(np.sum(mask))
+    if n_in < min_points:
+        raise ValueError(
+            f"fenêtre de maintien [t0 = {t0:.1f} s, t0 + {hold_s:.0f} s] : {n_in} point(s) du CSV "
+            f"(temps brut de {t_meas[0]:.1f} à {t_meas[-1]:.1f} s) ; précisez --t0 ou --hold."
+        )
+    t_fit = t_rel[mask]
     n_ref = max(1, min(3, int(np.sum(t_fit <= t_fit[0] + 1.0))))
     y_meas = f_meas[mask] / float(np.mean(f_meas[mask][:n_ref]))
     # Paramètres : log-fractions et log-taus (positivité garantie)
@@ -143,6 +189,9 @@ def identify(
         "n_evaluations": len(evaluations),
         "elapsed_s": _time.time() - t0,
         "sigma_total_mpa": float(sigma_total),
+        "prestretch_rate_mm_min": float(prestretch_rate_mm_min),
+        "t0_s": float(t0),
+        "hold_s": float(hold_s),
         "E0_mpa": float(sigma_total - E.sum()),
         "E0_over_sigma": float(1.0 - fr.sum()),
         "branches": [
@@ -154,15 +203,23 @@ def identify(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Identification du spectre de Maxwell en boucle fermée à travers le moteur.")
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    ap = argparse.ArgumentParser(description="Identification du spectre de Maxwell en boucle fermee a travers le moteur.")
     ap.add_argument("csv", help="Essai de relaxation à P = 0 (time_s, force_unfiltered_mN)")
     ap.add_argument("--fiche", help="Fiche de réglages JSON (géométrie du muscle)")
     ap.add_argument("--eps", type=float, default=None, help="Pré-étirement (surcharge la fiche)")
     ap.add_argument("--branches", type=int, default=2, choices=(1, 2, 3))
     ap.add_argument("--hold", type=float, default=600.0, help="Durée ajustée (s)")
     ap.add_argument("--dt", type=float, default=2.0)
-    ap.add_argument("--rate", type=float, default=300.0, help="Vitesse de pré-étirement (mm/min)")
-    ap.add_argument("--sigma-total", type=float, default=None, help="ΣE maintenu (MPa) ; défaut : somme des modules de la fiche")
+    ap.add_argument("--rate", type=float, default=20.0,
+                    help="Vitesse de pre-etirement de l'essai (mm/min) ; defaut 20 = Base.prestretch_to. "
+                         "Le spectre identifie est conditionnel a cette vitesse (relaxation consommee en rampe).")
+    ap.add_argument("--t0", type=float, default=None,
+                    help="Instant du blocage dans le temps brut du CSV (s) ; defaut : premier echantillon")
+    ap.add_argument("--sigma-total", type=float, default=None,
+                    help="Somme des modules E maintenue (MPa) ; defaut : somme des modules de la fiche")
     ap.add_argument("--out", default=None, help="Fichier JSON de sortie")
     args = ap.parse_args()
 
@@ -178,7 +235,7 @@ def main():
     t, f = load_force_csv(args.csv)
     print(f"Base {Base.MODEL_VERSION} — {len(t)} points, {t[-1]:.0f} s ; eps {settings['eps']} ; {args.branches} branche(s)")
     out = identify(t, f, settings, n_branches=args.branches, hold_s=args.hold, dt=args.dt,
-                   prestretch_rate_mm_min=args.rate, sigma_total=args.sigma_total)
+                   prestretch_rate_mm_min=args.rate, sigma_total=args.sigma_total, t0=args.t0)
     print(json.dumps(out, indent=1, ensure_ascii=False))
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:

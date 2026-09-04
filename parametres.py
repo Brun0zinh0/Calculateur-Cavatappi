@@ -137,8 +137,7 @@ PRESTRETCH_CONVENTION_LABELS = {
 # Alpha V4 : cles des mecanismes physiques optionnels (tous off par defaut).
 V4_MECHANISM_KEYS = (
     "prestretch_convention",
-    "engagement_ovality_e0",
-    "engagement_ring_factor",
+    "engagement_reform_pressure_mpa",
     "engagement_unload_ratio",
     "friction_pressure_coulomb_mpa",
     "eyring_sigma_star_mpa",
@@ -226,8 +225,7 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "view_azim_deg": -58.0,
     # --- Alpha V4 : mecanismes physiques optionnels (off par defaut) ---
     "prestretch_convention": "coil_only",
-    "engagement_ovality_e0": 0.0,
-    "engagement_ring_factor": 1.0,
+    "engagement_reform_pressure_mpa": 0.0,
     "engagement_unload_ratio": 1.0,
     "friction_pressure_coulomb_mpa": 0.0,
     "eyring_sigma_star_mpa": 0.0,
@@ -275,8 +273,7 @@ class MaterialParams:
     nylon_axial_prestrain_coupling: float = 1.0
     nylon_axial_actuation_coupling: float = 1.0
     # Alpha V4 (off par defaut)
-    engagement_ovality_e0: float = 0.0
-    engagement_ring_factor: float = 1.0
+    engagement_reform_pressure_mpa: float = 0.0
     engagement_unload_ratio: float = 1.0
     friction_pressure_coulomb_mpa: float = 0.0
     eyring_sigma_star_mpa: float = 0.0
@@ -457,8 +454,7 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
         "view_elev_deg": (0.0, 90.0),
         "view_azim_deg": (-180.0, 180.0),
         # Alpha V4
-        "engagement_ovality_e0": (0.0, 0.9),
-        "engagement_ring_factor": (0.01, 100.0),
+        "engagement_reform_pressure_mpa": (0.0, 5.0),
         "engagement_unload_ratio": (0.05, 1.0),
         "friction_pressure_coulomb_mpa": (0.0, 1.0),
         "eyring_sigma_star_mpa": (0.0, 1000.0),
@@ -517,8 +513,12 @@ def load_settings() -> dict[str, SettingValue]:
         saved_version = int(saved.get("_settings_schema_version", 1))
     except (TypeError, ValueError, AttributeError):
         saved_version = 1
-    if saved_version < SETTINGS_SCHEMA_VERSION:
-        saved = dict(saved)
+    saved = dict(saved)
+    if saved_version < 16:
+        # Migration historique (schemas <= 15) : remises a zero des options dont
+        # la semantique a change avant l'alpha V3. NE PAS rejouer ce bloc pour
+        # un fichier de schema 16 (alpha V3) : il ecraserait silencieusement les
+        # reglages non defaut de l'utilisateur (contre-expertise V4, C1).
         try:
             if abs(float(saved.get("dt", DEFAULT_SETTINGS["dt"])) - 2.0) < 1e-12:
                 saved["dt"] = DEFAULT_SETTINGS["dt"]
@@ -542,6 +542,11 @@ def load_settings() -> dict[str, SettingValue]:
         saved["nylon_axial_prestrain_coupling"] = 1.0
         saved["nylon_axial_actuation_coupling"] = 1.0
         saved.setdefault("pressure_input_mode", DEFAULT_SETTINGS["pressure_input_mode"])
+    if saved_version < SETTINGS_SCHEMA_VERSION:
+        # Schema 17 (alpha V4) : les cles des mecanismes optionnels prennent
+        # leur valeur neutre ; tout le reste est conserve tel quel.
+        for key in V4_MECHANISM_KEYS:
+            saved.setdefault(key, DEFAULT_SETTINGS[key])
         saved["_settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
     try:
@@ -714,6 +719,42 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
         return "La convention de pré-étirement est inconnue."
     if float(settings.get("eyring_sigma_star_mpa", 0.0)) > 0.0 and str(settings["integration"]) != "exponential":
         return "La viscosité activée par la contrainte (Eyring) exige l'intégration exponentielle."
+    sigma_star = float(settings.get("eyring_sigma_star_mpa", 0.0))
+    if 0.0 < sigma_star < 1.0e-6:
+        return "La contrainte d'activation d'Eyring doit être nulle (off) ou d'au moins 1e-6 MPa."
+    creep_c = float(settings.get("anchor_creep_c_mm", 0.0))
+    if creep_c > 0.0:
+        creep_t0 = float(settings.get("anchor_creep_t0_s", 10.0))
+        if bool(settings.get("use_fixed_duration", False)):
+            cyclic_horizon = float(settings.get("duration_s", 0.0))
+        else:
+            cyclic_horizon = (
+                float(settings["n_cycles"]) * 2.0 * 60.0 * float(settings["volume_mL"]) / float(settings["flow_rate_mL_min"])
+            )
+        horizon_s = max(
+            cyclic_horizon,
+            float(settings.get("relaxation_ramp_time_s", 0.0)) + float(settings.get("relaxation_hold_time_s", 0.0)),
+            float(settings.get("suspended_duration_s", 0.0)),
+            float(settings["dt"]),
+        )
+        blocked_length = (1.0 + float(settings["eps"])) * float(settings["initial_length_mm"])
+        creep_end = creep_c * float(np.log1p(horizon_s / creep_t0))
+        if creep_end > 0.10 * blocked_length:
+            return (
+                f"Le fluage d'ancrage atteindrait {creep_end:.1f} mm sur {horizon_s:.0f} s, soit plus de 10 % de la "
+                f"longueur active bloquée ({blocked_length:.1f} mm) : réduisez c ou augmentez t0."
+            )
+    p_c = float(settings.get("friction_pressure_coulomb_mpa", 0.0))
+    if (
+        p_c > 0.0
+        and str(settings.get("pressure_input_mode", "generated")) == "generated"
+        and 2.0 * p_c >= float(settings["p_max_mpa"])
+    ):
+        return (
+            f"Frottement sec V4-2 : 2·P_c = {2.0 * p_c:.3g} MPa ≥ P_max = {float(settings['p_max_mpa']):.3g} MPa, "
+            "la boucle de Jenkins ne peut pas se refermer (actionneur bloqué à la décharge, ou jamais démarré "
+            "si P_c ≥ P_max). Réduisez P_c ou augmentez P_max."
+        )
     for key in ("nylon_axial_prestrain_coupling", "nylon_axial_actuation_coupling"):
         if not 0.0 <= float(settings[key]) <= 1.0:
             return "Les coefficients de couplage du nylon doivent rester entre 0 et 1."
@@ -875,8 +916,7 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
         nylon_condition_mode="bonded_linear",
         nylon_axial_prestrain_coupling=1.0,
         nylon_axial_actuation_coupling=1.0,
-        engagement_ovality_e0=float(settings.get("engagement_ovality_e0", 0.0)),
-        engagement_ring_factor=float(settings.get("engagement_ring_factor", 1.0)),
+        engagement_reform_pressure_mpa=float(settings.get("engagement_reform_pressure_mpa", 0.0)),
         engagement_unload_ratio=float(settings.get("engagement_unload_ratio", 1.0)),
         friction_pressure_coulomb_mpa=float(settings.get("friction_pressure_coulomb_mpa", 0.0)),
         eyring_sigma_star_mpa=float(settings.get("eyring_sigma_star_mpa", 0.0)),
