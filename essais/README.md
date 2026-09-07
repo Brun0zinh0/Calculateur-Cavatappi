@@ -10,6 +10,8 @@ et se relancent en plaçant le dossier de données à côté.
 |---|---|
 | `ANALYSE_PRELIMINAIRE.md` | Dead-band mesuré, spectre de Maxwell identifié sur les « 10 N », déconvolution PVC seul, effet du référencement pression, stabilité de la cellule (StabCell) et revue de la chaîne d'acquisition |
 | `MODELISATION_QUANTITATIVE.md` | Confrontation modèle/essai sans facteur d'échelle libre : niveaux absolus ±13 %, corrélations 0,94-0,98, incompatibilité d'amplitude, configuration recommandée par usage |
+| `CONFRONTATION_VITESSE.md` | Vitesses de pression réellement appliquées (0,01-0,06 MPa/s), réponse mesurée et simulée rampe par rampe selon la vitesse : gain, aire de boucle, retard force/pression ; balayage synthétique du moteur ; figures dans `vitesse/` |
+| `confrontation_vitesse.py` | Segmentation en rampes, métriques par cycle, simulations sous pression mesurée et balayage à vitesse imposée (moteur alpha V4 ≥ v4-16) |
 | `identifier_spectre.py` | Ajustement du spectre de Maxwell sur les relaxations « 10 N » |
 | `recalcul_analyse.py` | Reconstruction de l'échelle de pression depuis les comptes ADC |
 | `recalcul_correlations.py` | Corrélations modèle/mesure sous les deux échelles de pression |
