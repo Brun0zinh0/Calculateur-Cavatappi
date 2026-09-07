@@ -18,7 +18,10 @@ NCYC = 11
 PMAX = 1.4
 DT = 0.5
 
-cfg = Base.default_simulation_config(eps=EPS, n_cycles=NCYC, Pmax=PMAX, dt=DT)
+# v4-16 : profil par vitesse de pression ; le couple debit/volume historique
+# est passe explicitement pour conserver la demi-periode de 9 s de ce script.
+cfg = Base.default_simulation_config(eps=EPS, n_cycles=NCYC, Pmax=PMAX, dt=DT,
+                                     flow_rate_mL_min=10.0, volume_mL=1.5)
 
 # ---------- estimation analytique (rampe a taux constant, duree T) ----------
 mw = cfg.mat.maxwell
@@ -62,7 +65,7 @@ sig_i_tk = float(np.max(np.abs(m.sigma_i)))
 F_tk_B = float(m.history[-1].Ft)
 t_start = m.helix.time
 t_local, pressure = Base._prepare_actuation_history(cfg.n_cycles, cfg.Pmax, cfg.dt, None, None,
-                                                    cfg.flow_rate_mL_min, cfg.volume_mL,
+                                                    Base._config_half_period(cfg),
                                                     cfg.nonlinear_pressure)
 m.step(float(pressure[0]), 0.0, h_target=m.h_blocked)
 m.lock_blocked_series_reference()
@@ -76,7 +79,7 @@ print("\n=== Variante B : precontrainte viscoelastique (schema article, branches
 print("max|sigma_i| a t_k = %.4f MPa ; force a t_k = %.1f mN" % (sig_i_tk, 1000 * F_tk_B))
 
 # ---------- comparaison ----------
-period = 2.0 * 60.0 * cfg.volume_mL / cfg.flow_rate_mL_min  # 18 s
+period = 2.0 * Base._config_half_period(cfg)  # 18 s
 
 
 def cycle_stats(arr):

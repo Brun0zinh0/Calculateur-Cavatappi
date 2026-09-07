@@ -33,10 +33,17 @@ def test_pressure_histories() -> None:
     assert pressure[-1] == 1.5
     assert np.all(np.diff(time) > 0.0)
 
-    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.5, dt=7.0)
+    # v4-16 : le profil est defini par une vitesse de pression ; a vitesse
+    # Pmax/9 s la demi-periode vaut 9 s (protocole de l'article).
+    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.5, dt=7.0, pressure_rate_mpa_s=1.5 / 9.0)
     assert time[-1] == 36.0
     assert pressure[-1] == 0.0
     assert np.isclose(np.max(pressure), 1.5)
+    # vitesse par defaut (1,3 MPa / 9 s) : la duree depend desormais de Pmax
+    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.3, dt=7.0)
+    assert time[-1] == 36.0
+    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.5, dt=7.0)
+    assert np.isclose(time[-1], 4.0 * 1.5 / (1.3 / 9.0))
 
 
 def test_blocked_equilibrium() -> None:
@@ -485,9 +492,7 @@ def test_pressure_history_defaults_linear() -> None:
     """Item 2.4 de l'audit : profil linéaire par défaut sur tous les points d'entrée."""
     import inspect
 
-    time, pressure = Base.cyclic_pressure_history(
-        n_cycles=1, Pmax=1.0, flow_rate_mL_min=10.0, volume_mL=1.5, dt=0.5
-    )
+    time, pressure = Base.cyclic_pressure_history(n_cycles=1, Pmax=1.0, pressure_rate_mpa_s=1.0 / 9.0, dt=0.5)
     assert np.isclose(np.interp(4.5, time, pressure), 0.5), "cyclic : mi-rampe = Pmax/2 (linéaire)"
     time, pressure = Base.ramp_hold_pressure_history(P_hold=1.0, ramp_time=8.0, hold_time=10.0, dt=1.0)
     assert np.isclose(np.interp(4.0, time, pressure), 0.5), "ramp_hold : mi-rampe = P_hold/2 (linéaire)"
@@ -973,7 +978,9 @@ def test_v4_mechanisms_over_cycles() -> None:
     model, data = Base.run_blocked_actuation(parametres.build_config(settings))
     assert np.all(np.isfinite(data["force_total_mN"]))
     assert np.max(np.abs(data["residual"])) < 1.0e-4
-    period = Base.default_simulation_config().volume_mL * 2.0 * 60.0 / Base.default_simulation_config().flow_rate_mL_min
+    # v4-16 : la periode depend de p_max (vitesse de pression constante), elle
+    # se lit sur la config construite et non sur la config par defaut de l'API.
+    period = parametres.cycle_period_seconds(parametres.build_config(settings))
     t = np.asarray(data["time"])
     F = np.asarray(data["force_act_mN"])
     # amplitude d'actionnement (max - min) par cycle : le premier cycle porte
@@ -985,6 +992,133 @@ def test_v4_mechanisms_over_cycles() -> None:
     assert amplitudes[1] > 1.0 and amplitudes[2] > 1.0, amplitudes
     assert abs(amplitudes[2] - amplitudes[1]) < 0.10 * amplitudes[1], amplitudes
     assert abs(np.max(data["ovality"]) - 1.0) < 1.0e-12 and np.min(data["ovality"]) >= 0.0
+
+
+def test_pressure_rate_profile() -> None:
+    """Le profil genere est defini par une vitesse de pression (MPa/s) :
+    demi-periode = Pmax / vitesse ; les mots-cles historiques debit/volume
+    donnent un profil bit-identique ; a Pmax = 0 la duree historique est
+    conservee ; une vitesse aberrante (debit passe par position) est refusee."""
+    t, p = Base.cyclic_pressure_history(n_cycles=2, Pmax=0.45, pressure_rate_mpa_s=0.03, dt=0.5)
+    assert np.isclose(t[np.argmax(p)], 15.0), "demi-periode = 0,45 / 0,03 = 15 s"
+    assert np.isclose(p.max(), 0.45) and np.isclose(t[-1], 60.0)
+    assert np.isclose(np.interp(7.5, t, p), 0.225), "rampe lineaire a la vitesse demandee"
+    t_new, p_new = Base.cyclic_pressure_history(n_cycles=3, Pmax=1.3, pressure_rate_mpa_s=1.3 / 9.0, dt=0.25)
+    t_old, p_old = Base.cyclic_pressure_history(n_cycles=3, Pmax=1.3, flow_rate_mL_min=10.0, volume_mL=1.5, dt=0.25)
+    t_def, p_def = Base.cyclic_pressure_history(n_cycles=3, Pmax=1.3, dt=0.25)
+    assert np.array_equal(t_new, t_old) and np.array_equal(p_new, p_old), "debit/volume historique bit-identique"
+    assert np.array_equal(t_def, t_old) and np.array_equal(p_def, p_old), "vitesse par defaut = 9 s a 1,3 MPa"
+    assert Base.resolve_half_period(1.655, flow_rate_mL_min=10.0, volume_mL=1.5) == 9.0
+    assert Base.resolve_half_period(1.655, pressure_rate_mpa_s=1.655 * 10.0 / 90.0) == 9.0, "arrondi nanoseconde"
+    t0, p0 = Base.cyclic_pressure_history(n_cycles=1, Pmax=0.0, pressure_rate_mpa_s=0.1, dt=1.0)
+    assert np.all(p0 == 0.0) and np.isclose(t0[-1], 18.0), "Pmax = 0 : profil nul, duree historique"
+    # les arguments positionnels historiques (debit, volume) restent interpretes
+    # comme tels (scripts d'audit anterieurs), bit-identiques au mot-cle
+    t_pos, p_pos = Base.cyclic_pressure_history(1, 1.3, 10.0, 1.5, 0.25, False)
+    t_kw, p_kw = Base.cyclic_pressure_history(n_cycles=1, Pmax=1.3, flow_rate_mL_min=10.0, volume_mL=1.5, dt=0.25)
+    assert np.array_equal(t_pos, t_kw) and np.array_equal(p_pos, p_kw)
+    try:
+        Base.cyclic_pressure_history(n_cycles=1, Pmax=1.3, dt=0.25, pressure_rate_mpa_s=10.0)
+        raise AssertionError("une vitesse aberrante (debit en mL/min) doit etre refusee")
+    except ValueError as exc:
+        assert "mL/min" in str(exc)
+    cfg = Base.default_simulation_config(Pmax=1.0, pressure_rate_mpa_s=0.1)
+    assert Base._config_half_period(cfg) == 10.0
+    legacy_cfg = Base.default_simulation_config(Pmax=1.0, flow_rate_mL_min=10.0, volume_mL=1.5)
+    assert Base._config_half_period(legacy_cfg) == 9.0, "attributs historiques prioritaires sur une config"
+
+
+def test_settings_pressure_rate_migration() -> None:
+    """Schema 18 : un fichier de schema 17 avec debit/volume est migre vers la
+    vitesse equivalente (p_max·Q/(60·V)), sans toucher aux autres reglages, et
+    le profil construit est bit-identique a l'ancien ; un export ancien est
+    migre de meme ; les cles historiques restent honorees par build_config."""
+    import tempfile
+
+    legacy = dict(parametres.DEFAULT_SETTINGS)
+    legacy.pop("pressure_rate_mpa_s", None)
+    legacy.update({"_settings_schema_version": 17, "flow_rate_mL_min": 10.0, "volume_mL": 1.5, "p_max_mpa": 1.2,
+                   "n_cycles": 4, "section_update_mode": "updated", "dt": 0.5})
+    original_path = parametres.SETTINGS_PATH
+    original_migrate = parametres._migrate_legacy_storage
+    with tempfile.TemporaryDirectory() as tmp:
+        parametres.SETTINGS_PATH = Path(tmp) / "settings.json"
+        parametres._migrate_legacy_storage = lambda: None
+        try:
+            parametres.SETTINGS_PATH.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = parametres.load_settings()
+        finally:
+            parametres.SETTINGS_PATH = original_path
+            parametres._migrate_legacy_storage = original_migrate
+    assert np.isclose(loaded["pressure_rate_mpa_s"], 1.2 / 9.0), loaded["pressure_rate_mpa_s"]
+    assert loaded["section_update_mode"] == "updated" and loaded["n_cycles"] == 4 and loaded["dt"] == 0.5
+    assert "flow_rate_mL_min" not in loaded and "volume_mL" not in loaded
+    assert loaded["_settings_schema_version"] == parametres.SETTINGS_SCHEMA_VERSION
+    cfg_new = parametres.build_config(loaded)
+    cfg_legacy = parametres.build_config(legacy)
+    assert cfg_new.pressure_rate_mpa_s == cfg_legacy.pressure_rate_mpa_s
+    assert np.isclose(parametres.cycle_period_seconds(cfg_new), 18.0)
+    assert np.isclose(parametres.effective_pressure_rate_mpa_s(cfg_new), 1.2 / 9.0)
+    t_new, p_new = Base.cyclic_pressure_history(cfg_new.n_cycles, cfg_new.Pmax, dt=cfg_new.dt,
+                                                pressure_rate_mpa_s=cfg_new.pressure_rate_mpa_s)
+    t_old, p_old = Base.cyclic_pressure_history(cfg_new.n_cycles, cfg_new.Pmax, flow_rate_mL_min=10.0, volume_mL=1.5,
+                                                dt=cfg_new.dt)
+    assert np.array_equal(t_new, t_old) and np.array_equal(p_new, p_old)
+    export = json.dumps({"format": parametres.SETTINGS_EXPORT_FORMAT, "settings": legacy})
+    imported = parametres.parse_settings_export(export)
+    assert np.isclose(imported["pressure_rate_mpa_s"], 1.2 / 9.0)
+    fixed = dict(loaded)
+    fixed.update({"use_fixed_duration": True, "duration_s": 120.0, "n_cycles": 3})
+    cfg_fixed = parametres.build_config(fixed)
+    assert np.isclose(parametres.cycle_period_seconds(cfg_fixed), 40.0)
+    assert np.isclose(parametres.effective_pressure_rate_mpa_s(cfg_fixed), 1.2 / 20.0)
+    bad = dict(loaded)
+    bad["pressure_rate_mpa_s"] = 10.0
+    assert parametres.settings_error(bad) is not None and "vitesse" in parametres.settings_error(bad)
+    # demi-periode historique EXACTE transportee par half_period_s, meme non
+    # representable sur 9 decimales, et meme a p_max = 0
+    seven = dict(parametres.DEFAULT_SETTINGS)
+    seven.update({"flow_rate_mL_min": 7.0, "volume_mL": 1.5, "p_max_mpa": 1.3, "n_cycles": 2})
+    cfg7 = parametres.build_config(seven)
+    assert cfg7.half_period_s == 60.0 * 1.5 / 7.0 and Base._config_half_period(cfg7) == 60.0 * 1.5 / 7.0
+    assert parametres.cycle_period_seconds(cfg7) == 2.0 * 60.0 * 1.5 / 7.0
+    assert np.isclose(parametres.normalize_settings(seven)["pressure_rate_mpa_s"], 1.3 * 7.0 / 90.0)
+    zero = dict(seven)
+    zero["p_max_mpa"] = 0.0
+    assert Base._config_half_period(parametres.build_config(zero)) == 60.0 * 1.5 / 7.0
+    # contradiction vitesse explicite / cles historiques : refusee par
+    # build_config, signalee par settings_error, tranchee (avec avertissement)
+    # par la migration au profit de la vitesse explicite
+    contradictory = dict(seven)
+    contradictory["pressure_rate_mpa_s"] = 0.03
+    import warnings as _warnings
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        normalized = parametres.normalize_settings(contradictory)
+    assert normalized["pressure_rate_mpa_s"] == 0.03, "normalize tranche au profit de la vitesse explicite"
+    assert any("contradictoires" in str(w.message) for w in caught)
+    try:
+        parametres.build_config(contradictory)
+        raise AssertionError("contradiction non detectee")
+    except ValueError as exc:
+        assert "contradictoires" in str(exc)
+    assert "contradictoires" in (parametres.settings_error(contradictory) or "")
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        migrated = dict(contradictory)
+        parametres._migrate_flow_to_pressure_rate(migrated)
+    assert migrated["pressure_rate_mpa_s"] == 0.03 and "flow_rate_mL_min" not in migrated
+    assert any("contradictoires" in str(w.message) for w in caught)
+    # vitesse equivalente hors bornes : ecretee avec avertissement
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        extreme = dict(parametres.DEFAULT_SETTINGS)
+        extreme.update({"flow_rate_mL_min": 200.0, "volume_mL": 0.01, "p_max_mpa": 1.5})
+        extreme.pop("pressure_rate_mpa_s")
+        rate_ext = parametres._settings_pressure_rate(extreme)
+    assert rate_ext == parametres.PRESSURE_RATE_BOUNDS[1]
+    assert any("écrêtée" in str(w.message) for w in caught)
 
 
 def test_v4_closed_loop_identification_tool() -> None:
@@ -1040,6 +1174,8 @@ def main() -> None:
         test_v4_prestretch_convention,
         test_v4_settings_migration_keeps_v3_choices,
         test_v4_mechanisms_over_cycles,
+        test_pressure_rate_profile,
+        test_settings_pressure_rate_migration,
         test_v4_closed_loop_identification_tool,
     )
     for test in tests:

@@ -224,7 +224,7 @@ référence non chargée est exportée en `reference_unloaded_length_mm`.
 - Le module axial par défaut est la somme `E0 + E1 + E2 + E3`, comme indiqué dans l'annexe A.
 - (audit 2026-08) La précontrainte construit un état élastique de référence `t_k` **avec des branches de Maxwell vierges** (σᵢ = 0), là où l'article applique la loi viscoélastique dès la phase d'élongation (loi A.4 sur les deux phases ; relaxation post-étirement de la fig. 11 d'EXP). Conséquences mesurées : niveaux absolus de force environ −18 à −22 % en suivant le schéma de l'article ; sur l'atténuation de « training » des 10 premiers cycles (−10,3 % dans l'article), ce schéma n'en reproduit que ~17 % (un schéma viscoélastique en récupère ~2/3) ; le dead-band d'origine fluage et la fig. 11 d'EXP ne sont pas simulables. Les amplitudes pic-vallée d'actionnement restent quasi insensibles (< 5 %). L'option de précontrainte viscoélastique est **disponible** depuis l'item 3.2 (voir « Comparaison avec la figure 7 »).
 - L'anisotropie identique de l'article reste le mode par défaut. Le mode `relaxation axiale identifiée` limite les branches Maxwell à la direction caractérisée par l'essai de traction.
-- Le profil débit/volume linéaire est utilisé par défaut. Le profil non linéaire est phénoménologique. Depuis la Phase 2 de l'audit 2026-08, ce défaut linéaire vaut aussi pour les fonctions de l'API `Base` (`cyclic_pressure_history`, `ramp_hold_pressure_history`, `run_hold_relaxation`) — auparavant ces points d'entrée imposaient silencieusement le profil non linéaire γ = 3,5 ; les exposants sont centralisés dans `Base.NONLINEAR_GAMMA_LOAD/UNLOAD`.
+- Le profil généré est défini par une **vitesse de pression en MPa/s** (demi-cycle = Pmax / vitesse). L'ancien couple débit/volume de l'article (10 mL/min, 1,5 mL) correspond à une demi-période de 9 s, soit Pmax / 9 s ; il reste accepté en mots-clés historiques par `Base.cyclic_pressure_history(flow_rate_mL_min=, volume_mL=)` et par les dictionnaires de réglages qui portent encore ces clés (bit-identique). Le profil linéaire est utilisé par défaut. Le profil non linéaire est phénoménologique. Depuis la Phase 2 de l'audit 2026-08, ce défaut linéaire vaut aussi pour les fonctions de l'API `Base` (`cyclic_pressure_history`, `ramp_hold_pressure_history`, `run_hold_relaxation`) — auparavant ces points d'entrée imposaient silencieusement le profil non linéaire γ = 3,5 ; les exposants sont centralisés dans `Base.NONLINEAR_GAMMA_LOAD/UNLOAD`.
 - Les coefficients du nylon doivent rester égaux à 1 pour reproduire sa loi élastique linéaire complète.
 - (audit 2026-08, item 3.4) L'appariement des coefficients de Poisson effectifs suit par défaut la **lettre des articles** (`poisson_pairing = paper_crossed` : ν̄(s→φ) appliqué sur ε_r et ν̄(s→r) sur ε_φ — écriture probablement coquillée, identique dans BLOCKED éq. 18-19 et EXP éq. 19-20). L'option `physical` échange l'appariement ; impact mesuré ≤ 1,5 % sur le couple, < 1 % sur la force. Question à poser aux auteurs pour trancher définitivement.
 - Les résultats servent à l'étude et à la comparaison. Un dimensionnement de sécurité nécessite une validation expérimentale du spécimen réel.
@@ -268,6 +268,41 @@ Calibration attendue : P_r0(ε) par imagerie de la section sous pression
 raideur d'anneau, d'où un paramètre unique) ; σ* conjointement avec le spectre sur les essais « 10 N » et l'essai E2 (tube
 nu) ; P_c sur l'hystérésis du seuil et l'aire de boucle des rampes lentes ;
 c, t0 sur la part à-coups + continue des ancrages (E10, E2).
+
+## Vitesse de pression (MPa/s)
+
+Depuis le moteur `2026.09.07-v4-16` (schéma de réglages 18), le profil de
+pression généré n'est plus paramétré par un débit de seringue (mL/min) et un
+volume de commande (mL) mais par la **vitesse de pression** des rampes, en
+MPa/s : demi-cycle = Pmax / vitesse, cycle = 2·Pmax / vitesse. Motifs :
+
+- le banc de la campagne n'a pas de pompe (seringue comprimée à la main), le
+  débit n'y est pas une consigne ; la grandeur mesurable est la pente des
+  rampes de pression, 0,01 à 0,06 MPa/s sur les essais 1 O, 3 C et 3 P ;
+- la comparaison d'hystérésis à plusieurs vitesses et le mode suspendu
+  étaient déjà exprimés en MPa/s ; l'actionnement bloqué l'est désormais aussi ;
+- le protocole de l'article (10 mL/min, 1,5 mL, demi-période 9 s) se retrouve
+  avec vitesse = Pmax / 9 s (0,167 MPa/s à 1,5 MPa, 0,144 MPa/s à 1,3 MPa),
+  valeur par défaut : la figure 7 de référence est inchangée.
+
+Migration : un fichier de réglages ou un export de schéma ≤ 17 reçoit la
+vitesse équivalente p_max·Q/(60·V) et perd les deux clés historiques ; rien
+d'autre n'est modifié. Si cette vitesse sort des bornes [0,0005 ; 5] MPa/s
+(demi-périodes historiques extrêmes) elle est écrêtée et un avertissement
+l'indique. Les scripts qui appellent encore `Base.cyclic_pressure_history(
+flow_rate_mL_min=…, volume_mL=…)`, qui passent ces mots-clés à
+`run_blocked_actuation` / `run_suspended_actuation`, ou qui construisent des
+dictionnaires de réglages avec ces clés obtiennent exactement l'ancienne
+demi-période 60·V/Q : les clés historiques priment sur tous les chemins
+(`build_config`, `normalize_settings`, `settings_error`) et la demi-période
+exacte est transportée par `SimulationParams.half_period_s`. Un dictionnaire
+qui porte à la fois les clés historiques et une vitesse explicite différente
+est refusé comme contradictoire. Les arguments
+positionnels historiques (débit, volume) restent interprétés comme tels ; une
+vitesse aberrante (> 5 MPa/s, typiquement un débit en mL/min) passée par le
+mot-clé `pressure_rate_mpa_s` est refusée avec un message explicite. À Pmax = 0 (relaxation à pression nulle) la demi-période
+historique de 9 s est conservée, seule la durée totale comptant. En durée
+totale fixe, la vitesse effective vaut 2·Pmax·n_cycles / durée.
 
 ## Cache des réglages
 

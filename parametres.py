@@ -5,6 +5,7 @@ import os
 import pickle
 import shutil
 import tempfile
+import warnings
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,12 @@ SettingValue = float | int | str | bool
 
 PSI_TO_MPA = 0.006894757293168361
 P_MAX_MPA = 1.50
+# Vitesse de pression du profil genere (MPa/s) : demi-cycle = Pmax / vitesse.
+# La valeur par defaut reproduit la demi-periode historique de 9 s
+# (debit 10 mL/min, volume 1,5 mL de l'article) a la pression maximale par
+# defaut. Les rampes du banc valent en pratique 0,01 a 0,06 MPa/s.
+DEFAULT_PRESSURE_RATE_MPA_S = P_MAX_MPA / 9.0
+PRESSURE_RATE_BOUNDS = (0.0005, 5.0)
 P_MAX_PSI = P_MAX_MPA / PSI_TO_MPA
 DEFAULT_PARALLEL_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
 
@@ -61,7 +68,7 @@ RESULT_CACHE_PATHS = (
     SUSPENDED_RESULT_PATH,
     HYSTERESIS_RESULT_PATH,
 )
-SETTINGS_SCHEMA_VERSION = 17
+SETTINGS_SCHEMA_VERSION = 18
 SETTINGS_EXPORT_FORMAT = "cavatappi-alpha-v2-settings"
 
 INTEGRATION_OPTIONS = ["exponential", "paper_explicit"]
@@ -172,8 +179,7 @@ DEFAULT_SETTINGS: dict[str, SettingValue] = {
     "hysteresis_pressure_rates_mpa_s": "0.05, 0.10, 0.20",
     "use_fixed_duration": False,
     "duration_s": 500.0,
-    "flow_rate_mL_min": 10.0,
-    "volume_mL": 1.50,
+    "pressure_rate_mpa_s": DEFAULT_PRESSURE_RATE_MPA_S,
     "nonlinear_pressure": False,
     "show_temporal_torque": True,
     "overlay_temporal_pressure": False,
@@ -311,8 +317,11 @@ class SimulationParams:
     prestrain_reference_mode: str = "elastic_tk_reference"
     constitutive_mode: str = "generalized_maxwell"
     axial_modulus_mode: str = "maxwell_sum"
-    flow_rate_mL_min: float = 10.0
-    volume_mL: float = 1.50
+    pressure_rate_mpa_s: float = DEFAULT_PRESSURE_RATE_MPA_S
+    # Demi-periode historique exacte (60·V/Q) quand le dictionnaire de reglages
+    # porte encore les cles debit/volume ; None sinon. Champ interne, pas une
+    # cle de reglage : garantit la bit-identite des anciens scripts.
+    half_period_s: float | None = None
     # Defaut lineaire, aligne sur DEFAULT_SETTINGS et le README (l'ancien
     # defaut True de cette dataclass contredisait les autres points d'entree).
     # (audit 2026-08, item 2.4)
@@ -395,6 +404,8 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
     if not isinstance(saved, dict):
         raise ValueError("Le contenu des paramètres doit être un objet JSON.")
 
+    saved = dict(saved)
+    _migrate_flow_to_pressure_rate(saved)  # cles historiques debit/volume -> vitesse
     settings = dict(DEFAULT_SETTINGS)
     for key in settings.keys() & saved.keys():
         settings[key] = _coerce_setting(key, saved[key])
@@ -425,8 +436,7 @@ def normalize_settings(saved: dict[str, Any]) -> dict[str, SettingValue]:
         "uncoiled_length_mm": (0.0, 500.0),
         "n_cycles": (1.0, 60.0),
         "duration_s": (1.0, 5000.0),
-        "flow_rate_mL_min": (0.01, 200.0),
-        "volume_mL": (0.001, 100.0),
+        "pressure_rate_mpa_s": PRESSURE_RATE_BOUNDS,
         "relaxation_ramp_time_s": (0.01, 1000.0),
         "relaxation_hold_time_s": (0.0, 5000.0),
         "suspended_mass_g": (0.1, 5000.0),
@@ -498,7 +508,93 @@ def parse_settings_export(payload: bytes | str) -> dict[str, SettingValue]:
         if document.get("format") != SETTINGS_EXPORT_FORMAT:
             raise ValueError("Ce fichier n'est pas un export de paramètres Cavatappi Alpha V2.")
         document = document["settings"]
+    if isinstance(document, dict):
+        document = dict(document)
+        _migrate_flow_to_pressure_rate(document)  # exports de schema <= 17
     return normalize_settings(document)
+
+
+def _legacy_half_period_s(settings: dict[str, Any]) -> float | None:
+    """Demi-periode historique EXACTE 60·V/Q (s) si le dictionnaire porte
+    encore les cles debit/volume (fichiers de schema <= 17, exports anciens,
+    scripts qui construisent leurs reglages avec ces cles), sinon None."""
+    if "flow_rate_mL_min" not in settings or "volume_mL" not in settings:
+        return None
+    try:
+        flow = float(settings["flow_rate_mL_min"])
+        volume = float(settings["volume_mL"])
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(flow) and np.isfinite(volume)) or flow <= 0.0 or volume <= 0.0:
+        return None
+    return 60.0 * volume / flow
+
+
+def _legacy_flow_pressure_rate(settings: dict[str, Any]) -> float | None:
+    """Vitesse (MPa/s) equivalente au couple debit/volume historique :
+    p_max / (60·V/Q), ecretee aux bornes PRESSURE_RATE_BOUNDS avec un
+    avertissement ; vitesse par defaut si p_max <= 0 (profil nul) ; None si
+    les cles historiques sont absentes."""
+    half = _legacy_half_period_s(settings)
+    if half is None:
+        return None
+    try:
+        p_max = float(settings.get("p_max_mpa", P_MAX_MPA))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(p_max) or p_max <= 0.0:
+        return DEFAULT_PRESSURE_RATE_MPA_S
+    rate = p_max / half
+    clipped = float(min(max(rate, PRESSURE_RATE_BOUNDS[0]), PRESSURE_RATE_BOUNDS[1]))
+    if clipped != rate:
+        warnings.warn(
+            f"Vitesse de pression équivalente au couple débit/volume ({rate:.3g} MPa/s) écrêtée à "
+            f"{clipped:g} MPa/s : hors des clés historiques, la demi-période ne sera plus {half:g} s mais "
+            f"{p_max / clipped:g} s.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return clipped
+
+
+def _settings_pressure_rate(settings: dict[str, Any]) -> float:
+    """Vitesse de pression d'un dictionnaire de reglages. Regle unique, valable
+    pour build_config, normalize_settings, la migration et settings_error :
+    les cles historiques debit/volume priment quand elles sont presentes
+    (l'ancien profil est reproduit exactement) ; une vitesse explicite qui
+    differe a la fois de la valeur par defaut et de la vitesse equivalente est
+    une contradiction et leve ValueError."""
+    legacy = _legacy_flow_pressure_rate(settings)
+    explicit = settings.get("pressure_rate_mpa_s")
+    if legacy is None:
+        return DEFAULT_PRESSURE_RATE_MPA_S if explicit is None else float(explicit)
+    if explicit is not None:
+        explicit = float(explicit)
+        if not np.isclose(explicit, legacy, rtol=1.0e-9, atol=0.0) and not np.isclose(
+            explicit, DEFAULT_PRESSURE_RATE_MPA_S, rtol=1.0e-9, atol=0.0
+        ):
+            raise ValueError(
+                f"Réglages contradictoires : pressure_rate_mpa_s = {explicit:g} MPa/s alors que les clés historiques "
+                f"flow_rate_mL_min / volume_mL imposent {legacy:g} MPa/s. Retirez les clés historiques ou la vitesse "
+                "explicite."
+            )
+    return legacy
+
+
+def _migrate_flow_to_pressure_rate(saved: dict[str, Any]) -> None:
+    """Schema 18 : remplace, en place, le couple debit/volume par la vitesse de
+    pression equivalente (meme regle de priorite que build_config) et retire
+    les cles historiques ; aucune autre cle n'est touchee. Une contradiction
+    avec une vitesse explicite deja presente est signalee et la vitesse
+    explicite, plus recente, est conservee."""
+    if _legacy_half_period_s(saved) is None:
+        return
+    try:
+        saved["pressure_rate_mpa_s"] = _settings_pressure_rate(saved)
+    except ValueError as exc:
+        warnings.warn(f"{exc} La vitesse explicite est conservée.", RuntimeWarning, stacklevel=2)
+    saved.pop("flow_rate_mL_min", None)
+    saved.pop("volume_mL", None)
 
 
 def load_settings() -> dict[str, SettingValue]:
@@ -547,6 +643,8 @@ def load_settings() -> dict[str, SettingValue]:
         # leur valeur neutre ; tout le reste est conserve tel quel.
         for key in V4_MECHANISM_KEYS:
             saved.setdefault(key, DEFAULT_SETTINGS[key])
+        # Schema 18 : vitesse de pression (MPa/s) a la place de debit/volume.
+        _migrate_flow_to_pressure_rate(saved)
         saved["_settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
     try:
@@ -693,6 +791,15 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
     pressure = float(settings["p_max_mpa"])
     if not 0.0 <= pressure <= P_MAX_MPA:
         return f"La pression doit rester comprise entre 0 et {P_MAX_MPA:g} MPa pour ce modèle."
+    try:
+        pressure_rate = _settings_pressure_rate(settings)
+    except ValueError as exc:
+        return str(exc)
+    if not np.isfinite(pressure_rate) or not PRESSURE_RATE_BOUNDS[0] <= pressure_rate <= PRESSURE_RATE_BOUNDS[1]:
+        return (
+            f"La vitesse de pression doit être comprise entre {PRESSURE_RATE_BOUNDS[0]:g} et "
+            f"{PRESSURE_RATE_BOUNDS[1]:g} MPa/s."
+        )
     if float(settings["eps"]) < 0.0:
         return "La précontrainte initiale ne peut pas être négative."
     if int(settings["n_cycles"]) < 1 or int(settings["n_layers"]) < 1 or int(settings["n_phi"]) < 4:
@@ -728,9 +835,7 @@ def numerical_error(settings: dict[str, SettingValue]) -> str | None:
         if bool(settings.get("use_fixed_duration", False)):
             cyclic_horizon = float(settings.get("duration_s", 0.0))
         else:
-            cyclic_horizon = (
-                float(settings["n_cycles"]) * 2.0 * 60.0 * float(settings["volume_mL"]) / float(settings["flow_rate_mL_min"])
-            )
+            cyclic_horizon = float(settings["n_cycles"]) * 2.0 * _half_period_from_settings(settings)
         horizon_s = max(
             cyclic_horizon,
             float(settings.get("relaxation_ramp_time_s", 0.0)) + float(settings.get("relaxation_hold_time_s", 0.0)),
@@ -956,8 +1061,8 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
             prestrain_reference_mode=prestrain_reference_mode,
             constitutive_mode=constitutive_mode,
             axial_modulus_mode=axial_modulus_mode,
-            flow_rate_mL_min=float(settings["flow_rate_mL_min"]),
-            volume_mL=float(settings["volume_mL"]),
+            pressure_rate_mpa_s=_settings_pressure_rate(settings),
+            half_period_s=_legacy_half_period_s(settings),
             nonlinear_pressure=bool(settings["nonlinear_pressure"]),
             nylon_stiffness_scale=float(settings["nylon_scale"]),
             mat=mat,
@@ -966,15 +1071,33 @@ def build_config(settings: dict[str, SettingValue]) -> SimulationParams:
     )
 
 
+def _half_period_from_settings(settings: dict[str, Any]) -> float:
+    from Base import resolve_half_period
+
+    return resolve_half_period(
+        float(settings["p_max_mpa"]),
+        pressure_rate_mpa_s=_settings_pressure_rate(settings),
+        half_period_s=_legacy_half_period_s(settings),
+    )
+
+
 def cycle_period_seconds(config: SimulationParams) -> float:
     if config.duration_s is not None:
         return config.duration_s / config.n_cycles
-    return 2.0 * 60.0 * config.volume_mL / config.flow_rate_mL_min
+    from Base import resolve_half_period
+
+    return 2.0 * resolve_half_period(
+        config.Pmax,
+        pressure_rate_mpa_s=config.pressure_rate_mpa_s,
+        half_period_s=getattr(config, "half_period_s", None),
+    )
 
 
-def effective_flow_rate_mL_min(config: SimulationParams) -> float:
-    period = cycle_period_seconds(config)
-    return 2.0 * 60.0 * config.volume_mL / period
+def effective_pressure_rate_mpa_s(config: SimulationParams) -> float:
+    """Vitesse de pression effectivement appliquee (MPa/s) : celle demandee,
+    ou, en duree totale fixe, Pmax rapporte a la demi-periode deduite de la
+    duree et du nombre de cycles."""
+    return 2.0 * config.Pmax / cycle_period_seconds(config)
 
 
 def make_pressure_history(config: SimulationParams) -> tuple[np.ndarray | None, np.ndarray | None]:

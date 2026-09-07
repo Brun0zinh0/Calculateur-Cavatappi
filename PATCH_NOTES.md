@@ -1,5 +1,34 @@
 # Notes de version
 
+## 2026.09.07 — Vitesse de pression en MPa/s (moteur `2026.09.07-v4-16`)
+
+- Le profil de pression généré est défini par la vitesse de pression des
+  rampes (`pressure_rate_mpa_s`, MPa/s ; demi-cycle = Pmax / vitesse) et non
+  plus par le couple débit (mL/min) / volume (mL) de seringue, qui n'est pas
+  une consigne du banc (seringue manuelle). Valeur par défaut Pmax / 9 s :
+  profil de l'article et figure 7 inchangés.
+- Réglages : schéma 18 ; migration non destructive débit/volume → vitesse
+  équivalente p_max·Q/(60·V), fichiers et exports ; clés historiques encore
+  honorées (prioritaires) par `build_config` et `Base.cyclic_pressure_history`.
+- Interface : champ « Vitesse de pression (MPa/s) », demi-cycle et cycle
+  affichés, durée estimée recalculée, vitesse effective affichée en durée
+  fixe. API `parametres` : `effective_pressure_rate_mpa_s` remplace
+  `effective_flow_rate_mL_min`.
+- Revue (07/09) : priorité unique des clés historiques débit/volume sur tous
+  les chemins, demi-période exacte 60·V/Q transportée par
+  `SimulationParams.half_period_s` (bit-identité même à p_max = 0 ou pour une
+  demi-période non représentable), contradiction vitesse explicite / clés
+  historiques refusée, écrêtage aux bornes signalé, vitesse contrôlée par
+  `settings_error` (message, pas d'exception) ; scripts d'audit
+  `contre_pretension`, `diag_31_instrument`, `audit_stiffness_rotation`,
+  `ce_minors_check2` remis en cohérence (demi-période historique conservée) ;
+  `audit/code_map.md` mis à jour.
+- Sémantique : la vitesse étant constante, la durée d'un demi-cycle suit
+  désormais Pmax (Pmax / vitesse) au lieu d'être fixée à 9 s. À la pression
+  maximale par défaut le profil est bit-identique à l'alpha V3 ; à une autre
+  Pmax, retrouver exactement l'ancien profil demande vitesse = Pmax / 9 s.
+- Tests : 2 tests ajoutés (37 au total), baseline figure 7 inchangée.
+
 ## 2026.09.02 — Alpha V4 (moteur `2026.09.02-v4-15`)
 
 - Six mécanismes physiques optionnels, off par défaut, moteur bit-identique

@@ -42,6 +42,9 @@ def build(settings_extra):
             "n_phi": PHI,
             "pre_steps": 24,
             "nonlinear_pressure": False,
+            # v4-16 : cles historiques conservees -> demi-periode exacte de 9 s
+            "flow_rate_mL_min": 10.0,
+            "volume_mL": 1.5,
         }
     )
     s.update(settings_extra)
@@ -59,8 +62,8 @@ def run_instrumented(tag, settings_extra):
     )
     model.prestretch_to(cfg.eps)
     t, p = Base.cyclic_pressure_history(
-        n_cycles=cfg.n_cycles, Pmax=cfg.Pmax, flow_rate_mL_min=cfg.flow_rate_mL_min,
-        volume_mL=cfg.volume_mL, dt=cfg.dt, nonlinear=False,
+        n_cycles=cfg.n_cycles, Pmax=cfg.Pmax, dt=cfg.dt, nonlinear=False,
+        half_period_s=Base._config_half_period(cfg),
     )
     model.step(float(p[0]), 0.0, h_target=model.h_blocked)
     model.lock_blocked_series_reference()

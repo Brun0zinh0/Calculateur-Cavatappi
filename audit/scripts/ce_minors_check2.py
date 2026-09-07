@@ -23,6 +23,7 @@ print("=== (a) Mode suspendu : axial_length_geometry_mm vs axial_length_mm ===")
 model, arr = A.run_suspended_actuation(
     load_N=1.0, eps=0.8, n_cycles=1, Pmax=1.2, dt=1.0,
     n_layers=2, n_phi=8, pre_steps=6,
+    flow_rate_mL_min=10.0, volume_mL=1.5,  # v4-16 : demi-periode historique 9 s
 )
 geomL = np.asarray(arr["axial_length_geometry_mm"], float)
 actL = np.asarray(arr["axial_length_mm"], float)
@@ -34,7 +35,8 @@ print(f"contraction max = {np.max(arr['free_contraction_mm']):.3f} mm")
 
 print("--- meme comparaison en bloque ---")
 model_b, arr_b = A.run_blocked_actuation(eps=0.8, n_cycles=1, Pmax=1.2, dt=1.0,
-                                         n_layers=2, n_phi=8, pre_steps=6)
+                                         n_layers=2, n_phi=8, pre_steps=6,
+                                         flow_rate_mL_min=10.0, volume_mL=1.5)
 geomLb = np.asarray(arr_b["axial_length_geometry_mm"], float)
 actLb = np.asarray(arr_b["axial_length_mm"], float)
 print(f"bloque : max|L_geom - L| = {np.abs(geomLb-actLb).max():.2e} mm")

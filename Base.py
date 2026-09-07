@@ -26,7 +26,7 @@ import numpy as np
 from scipy.optimize import brentq, least_squares, minimize_scalar
 
 
-MODEL_VERSION = "2026.09.02-v4-15"
+MODEL_VERSION = "2026.09.07-v4-16"
 
 # Exposants du profil de pression phenomenologique non lineaire (uniques pour
 # tout le projet ; parametres.make_pressure_history les importe aussi).
@@ -126,6 +126,75 @@ def default_discretization(**overrides):
     return SimpleNamespace(**values)
 
 
+# Vitesse de pression du profil genere (MPa/s). Historiquement, le profil
+# etait defini par un debit (10 mL/min) et un volume de seringue (1,5 mL),
+# soit une demi-periode de 60·V/Q = 9 s quelle que soit Pmax. La vitesse de
+# pression est desormais LE parametre (demi-periode = Pmax / vitesse) ; la
+# valeur par defaut reproduit exactement la demi-periode de 9 s pour la
+# config par defaut de l'API (Pmax = 1,3 MPa). Le couple debit/volume reste
+# accepte en mots-cles historiques (bit-identique) par cyclic_pressure_history.
+DEFAULT_PRESSURE_RATE_MPA_S = 1.3 / 9.0
+MAX_PRESSURE_RATE_MPA_S = 5.0
+LEGACY_HALF_PERIOD_S = 9.0
+
+
+def resolve_half_period(
+    Pmax: float,
+    pressure_rate_mpa_s: Optional[float] = None,
+    flow_rate_mL_min: Optional[float] = None,
+    volume_mL: Optional[float] = None,
+    half_period_s: Optional[float] = None,
+) -> float:
+    """Demi-periode (s) du profil triangulaire.
+
+    Priorite : demi-periode explicite > couple debit/volume historique
+    (60·V/Q, bit-identique aux versions precedentes) > vitesse de pression
+    (Pmax / vitesse, arrondie a la nanoseconde pour que Pmax/(Pmax/T) rende
+    exactement T). A Pmax = 0 la vitesse n'a pas de sens : le profil est
+    identiquement nul et l'on conserve la demi-periode historique de 9 s
+    (seule la duree totale compte, ex. relaxation a P = 0).
+    """
+    if half_period_s is not None:
+        if not np.isfinite(half_period_s) or half_period_s <= 0.0:
+            raise ValueError("half_period_s must be positive.")
+        return float(half_period_s)
+    if flow_rate_mL_min is not None or volume_mL is not None:
+        if flow_rate_mL_min is None or volume_mL is None:
+            raise ValueError("flow_rate_mL_min and volume_mL must be given together (legacy keywords).")
+        if flow_rate_mL_min <= 0.0 or volume_mL <= 0.0:
+            raise ValueError("flow_rate_mL_min and volume_mL must be positive.")
+        return 60.0 * float(volume_mL) / float(flow_rate_mL_min)
+    rate = DEFAULT_PRESSURE_RATE_MPA_S if pressure_rate_mpa_s is None else float(pressure_rate_mpa_s)
+    if not np.isfinite(rate) or rate <= 0.0:
+        raise ValueError("pressure_rate_mpa_s must be positive.")
+    if rate > MAX_PRESSURE_RATE_MPA_S:
+        raise ValueError(
+            f"pressure_rate_mpa_s = {rate:g} MPa/s exceeds {MAX_PRESSURE_RATE_MPA_S:g} MPa/s (was a flow rate in "
+            "mL/min passed as a pressure rate? use the keywords flow_rate_mL_min= and volume_mL= instead)."
+        )
+    if not np.isfinite(Pmax) or Pmax < 0.0:
+        raise ValueError("Pmax must be finite and non-negative.")
+    if Pmax == 0.0:
+        return LEGACY_HALF_PERIOD_S
+    return float(round(float(Pmax) / rate, 9))
+
+
+def _config_half_period(cfg) -> float:
+    """Demi-periode d'une config (dataclass ou SimpleNamespace) : une
+    demi-periode explicite half_period_s (posee par parametres.build_config
+    quand un dictionnaire de reglages porte encore debit/volume) prime, puis
+    les attributs historiques flow_rate_mL_min / volume_mL (scripts
+    anterieurs), sinon pressure_rate_mpa_s."""
+    half = getattr(cfg, "half_period_s", None)
+    if half is not None:
+        return resolve_half_period(cfg.Pmax, half_period_s=float(half))
+    flow = getattr(cfg, "flow_rate_mL_min", None)
+    volume = getattr(cfg, "volume_mL", None)
+    if flow is not None and volume is not None:
+        return resolve_half_period(cfg.Pmax, flow_rate_mL_min=float(flow), volume_mL=float(volume))
+    return resolve_half_period(cfg.Pmax, pressure_rate_mpa_s=getattr(cfg, "pressure_rate_mpa_s", None))
+
+
 def default_simulation_config(**overrides):
     values = {
         "eps": 0.8,
@@ -137,8 +206,7 @@ def default_simulation_config(**overrides):
         "pre_steps": 24,
         "integration": "exponential",
         "prestrain_reference_mode": "elastic_tk_reference",
-        "flow_rate_mL_min": 10.0,
-        "volume_mL": 1.50,
+        "pressure_rate_mpa_s": DEFAULT_PRESSURE_RATE_MPA_S,
         "nonlinear_pressure": False,
         "mat": default_material_params(),
         "geom": default_geometry_params(),
@@ -2145,18 +2213,35 @@ class TCPAMaxwellBlockedModel:
 def cyclic_pressure_history(
     n_cycles: int = 3,
     Pmax: float = 1.3,
-    flow_rate_mL_min: float = 10.0,
-    volume_mL: float = 1.50,
+    flow_rate_mL_min: Optional[float] = None,
+    volume_mL: Optional[float] = None,
     dt: float = 0.15,
     nonlinear: bool = False,
     gamma_load: float = NONLINEAR_GAMMA_LOAD,
     gamma_unload: float = NONLINEAR_GAMMA_UNLOAD,
+    *,
+    pressure_rate_mpa_s: Optional[float] = None,
+    half_period_s: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    if int(n_cycles) < 1 or flow_rate_mL_min <= 0.0 or volume_mL <= 0.0 or dt <= 0.0:
-        raise ValueError("n_cycles, flow_rate_mL_min, volume_mL, and dt must be positive.")
+    """Profil triangulaire (montee-descente lineaires par defaut).
+
+    Le profil est defini par la vitesse de pression ``pressure_rate_mpa_s``
+    (MPa/s) : demi-periode = Pmax / vitesse. Les mots-cles historiques
+    ``flow_rate_mL_min`` / ``volume_mL`` (demi-periode 60·V/Q) restent
+    acceptes et priment s'ils sont fournis, pour les scripts anterieurs.
+    Sans aucun des deux : vitesse par defaut DEFAULT_PRESSURE_RATE_MPA_S.
+    """
+    if int(n_cycles) < 1 or dt <= 0.0:
+        raise ValueError("n_cycles and dt must be positive.")
     if Pmax < 0.0 or not np.isfinite(Pmax):
         raise ValueError("Pmax must be finite and non-negative.")
-    half_period = 60.0 * volume_mL / flow_rate_mL_min
+    half_period = resolve_half_period(
+        Pmax,
+        pressure_rate_mpa_s=pressure_rate_mpa_s,
+        flow_rate_mL_min=flow_rate_mL_min,
+        volume_mL=volume_mL,
+        half_period_s=half_period_s,
+    )
     period = 2.0 * half_period
     total_time = int(n_cycles) * period
     transitions = np.arange(0.0, total_time + 0.5 * half_period, half_period)
@@ -2246,12 +2331,11 @@ def _prepare_actuation_history(
     dt: float,
     pressure_time: Optional[np.ndarray],
     pressure_MPa: Optional[np.ndarray],
-    flow_rate_mL_min: float,
-    volume_mL: float,
+    half_period_s: float,
     nonlinear_pressure: bool,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if pressure_time is None and pressure_MPa is None:
-        return cyclic_pressure_history(n_cycles, Pmax, flow_rate_mL_min, volume_mL, dt, nonlinear_pressure)
+        return cyclic_pressure_history(n_cycles, Pmax, dt=dt, nonlinear=nonlinear_pressure, half_period_s=half_period_s)
     if pressure_time is None or pressure_MPa is None:
         raise ValueError("pressure_time and pressure_MPa must be provided together.")
     t = np.asarray(pressure_time, dtype=float)
@@ -2315,8 +2399,7 @@ def run_blocked_actuation(
         cfg.dt,
         pressure_time,
         pressure_MPa,
-        cfg.flow_rate_mL_min,
-        cfg.volume_mL,
+        _config_half_period(cfg),
         cfg.nonlinear_pressure,
     )
     if model.friction_enabled and 2.0 * model.friction_pressure_coulomb >= float(np.max(pressure)):
@@ -2455,8 +2538,7 @@ def run_suspended_actuation(
         cfg.dt,
         pressure_time,
         pressure_MPa,
-        cfg.flow_rate_mL_min,
-        cfg.volume_mL,
+        _config_half_period(cfg),
         cfg.nonlinear_pressure,
     )
     model.step_suspended(float(pressure[0]), 0.0, float(load_N))

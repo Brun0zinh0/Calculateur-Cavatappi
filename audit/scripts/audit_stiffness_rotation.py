@@ -170,6 +170,7 @@ for profile in ("paper_linear", "uniform_twist"):
         eps=0.8, n_cycles=1, Pmax=1.4, dt=0.5,
         n_layers=8, n_phi=24, pre_steps=24,
         integration="exponential", geom=geom,
+        flow_rate_mL_min=10.0, volume_mL=1.5,  # v4-16 : demi-periode historique 9 s
     )
     fpk = float(np.max(arr["force_mN"]))
     tpk = float(np.max(arr["torque_microNm"]))

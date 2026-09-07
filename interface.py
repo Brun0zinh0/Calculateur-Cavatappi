@@ -244,8 +244,7 @@ RELAXATION_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "n_cycles",
     "use_fixed_duration",
     "duration_s",
-    "flow_rate_mL_min",
-    "volume_mL",
+    "pressure_rate_mpa_s",
     "suspended_mass_g",
     "suspended_duration_s",
     "suspended_pressure_rate_mpa_s",
@@ -289,8 +288,7 @@ SUSPENDED_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "n_cycles",
     "use_fixed_duration",
     "duration_s",
-    "flow_rate_mL_min",
-    "volume_mL",
+    "pressure_rate_mpa_s",
     "nonlinear_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
@@ -894,7 +892,7 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
             "Ces paramètres définissent le chargement appliqué pendant l'actionnement bloqué.",
             "La précontrainte initiale étire l'actionneur avant l'injection de pression.",
             "La pression maximale fixe l'amplitude du cycle de pression.",
-            "Le débit et le volume définissent uniquement la durée d'un demi-cycle : ils ne constituent pas un modèle hydraulique pression-volume.",
+            "La vitesse de pression (MPa/s) fixe la pente des rampes du profil généré : demi-cycle = Pmax / vitesse. Le banc n'étant pas asservi en pression, c'est la vitesse mesurée sur les rampes des essais (0,01 à 0,06 MPa/s en pratique) qu'il faut reporter ici.",
         ]
     )
     pressure_input_mode = st.selectbox(
@@ -908,8 +906,24 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
     n_cycles = st.slider("Cycles", 1, 60, int(settings["n_cycles"]), 1)
     use_fixed_duration = st.checkbox("Utiliser une durée totale fixe", bool(settings["use_fixed_duration"]))
     duration_s = st.number_input("Durée totale (s)", 1.0, 5000.0, float(settings["duration_s"]), 10.0)
-    flow_rate_mL_min = st.number_input("Débit (mL/min)", 0.01, 200.0, float(settings["flow_rate_mL_min"]), 0.5)
-    volume_mL = st.number_input("Volume de commande par demi-cycle (mL)", 0.001, 100.0, float(settings["volume_mL"]), 0.05)
+    pressure_rate_mpa_s = st.number_input(
+        "Vitesse de pression (MPa/s)",
+        0.0005,
+        5.0,
+        float(settings["pressure_rate_mpa_s"]),
+        0.005,
+        format="%.4f",
+        help=(
+            "Pente des rampes de montée et de descente du profil généré ; demi-cycle = Pmax / vitesse. "
+            "Les rampes du banc valent 0,01 à 0,06 MPa/s ; le protocole de l'article (10 mL/min, 1,5 mL) "
+            "correspond à Pmax / 9 s, soit 0,167 MPa/s à 1,5 MPa."
+        ),
+    )
+    if not use_fixed_duration and float(p_max_mpa) > 0.0:
+        st.caption(
+            f"Demi-cycle {float(p_max_mpa) / float(pressure_rate_mpa_s):.1f} s, "
+            f"cycle {2.0 * float(p_max_mpa) / float(pressure_rate_mpa_s):.1f} s."
+        )
     nonlinear_pressure = st.checkbox(
         "Profil de pression phénoménologique non linéaire",
         bool(settings["nonlinear_pressure"]),
@@ -937,7 +951,10 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
         ),
     )
     if use_fixed_duration:
-        st.caption("La durée fixe remplace le débit demandé par un débit effectif calculé à partir du nombre de cycles.")
+        st.caption(
+            "La durée fixe remplace la vitesse demandée par une vitesse effective de "
+            f"{2.0 * float(p_max_mpa) * int(n_cycles) / float(duration_s):.4f} MPa/s (2·Pmax·cycles / durée)."
+        )
     if pressure_input_mode == "measured_csv":
         uploaded_pressure_file = st.file_uploader(
             "Historique de pression mesuré",
@@ -1352,8 +1369,7 @@ current_settings = {
     "hysteresis_pressure_rates_mpa_s": str(hysteresis_pressure_rates_mpa_s),
     "use_fixed_duration": bool(use_fixed_duration),
     "duration_s": float(duration_s),
-    "flow_rate_mL_min": float(flow_rate_mL_min),
-    "volume_mL": float(volume_mL),
+    "pressure_rate_mpa_s": float(pressure_rate_mpa_s),
     "nonlinear_pressure": bool(nonlinear_pressure),
     "show_temporal_torque": bool(show_temporal_torque),
     "overlay_temporal_pressure": bool(overlay_temporal_pressure),
@@ -1532,7 +1548,7 @@ elif bool(use_fixed_duration):
     estimated_duration_s = float(duration_s)
     estimated_steps = int(np.ceil(estimated_duration_s / dt))
 else:
-    estimated_duration_s = int(n_cycles) * 2.0 * 60.0 * float(volume_mL) / float(flow_rate_mL_min)
+    estimated_duration_s = int(n_cycles) * 2.0 * modele.resolve_half_period(float(p_max_mpa), pressure_rate_mpa_s=float(pressure_rate_mpa_s))
     estimated_steps = int(np.ceil(estimated_duration_s / dt))
 estimated_cost = model_cost_index(estimated_steps, n_layers, n_phi, pre_steps)
 estimated_relaxation_steps = int(np.ceil((relaxation_ramp_time_s + relaxation_hold_time_s) / dt))

@@ -49,7 +49,7 @@ Les unités ne sont **pas déclarées** dans Base.py ; elles le sont via les suf
 `n_layers=18`, `n_phi=72`, `pre_steps=120`, `dw_bracket=(-0.08, 0.08)` (sans unité, borne de la déformation incrémentale dw). **Jamais utilisés par les runners** : `run_blocked_actuation` (l.1671-1676) et `run_suspended_actuation` (l.1755-1760) reconstruisent la discrétisation depuis la config avec `dw_bracket=(-0.05, 0.05)`.
 
 ### 1.5 `default_simulation_config` (Base.py l.98-116) / `SimulationParams` (parametres.py l.254-273)
-Divergences notables : Base.py → `n_cycles=3`, `Pmax=1.3` MPa, `dt=0.25` s, `n_layers=4`, `nonlinear_pressure=False` ; parametres.py → `n_cycles=11`, `Pmax=1.5` (`P_MAX_MPA`), `dt=0.5`, `n_layers=8`, `nonlinear_pressure=True`. `flow_rate_mL_min=10.0` (mL/min), `volume_mL=1.5` (mL) identiques. `DEFAULT_SETTINGS` de l'interface (parametres.py l.122-197) : `dt=0.5`, `n_layers=4`, `n_phi=16`, `nonlinear_pressure=False`.
+Divergences notables : Base.py → `n_cycles=3`, `Pmax=1.3` MPa, `dt=0.25` s, `n_layers=4`, `nonlinear_pressure=False` ; parametres.py → `n_cycles=11`, `Pmax=1.5` (`P_MAX_MPA`), `dt=0.5`, `n_layers=8`, `nonlinear_pressure=True`. Depuis v4-16 le profil est défini par `pressure_rate_mpa_s` (MPa/s, demi-période = Pmax/vitesse ; défaut 1,3/9 côté Base, 1,5/9 côté `DEFAULT_SETTINGS`) ; les mots-clés historiques `flow_rate_mL_min`/`volume_mL` restent acceptés par `Base.cyclic_pressure_history` et par les dictionnaires de réglages (demi-période exacte 60·V/Q transportée par `SimulationParams.half_period_s`). `DEFAULT_SETTINGS` de l'interface (parametres.py l.122-197) : `dt=0.5`, `n_layers=4`, `n_phi=16`, `nonlinear_pressure=False`.
 
 ### 1.6 États et résultats
 - `HelixState` (Base.py l.145-151) : `rho` [mm], `alpha` [rad], `h` [mm/rad — hauteur par radian, pas = 2πh], `pressure` [MPa], `time` [s].
@@ -57,7 +57,7 @@ Divergences notables : Base.py → `n_cycles=3`, `Pmax=1.3` MPa, `dt=0.25` s, `n
 - Champs de contrainte : tableaux `(n_layers, n_phi, 6)` en composantes de Voigt **[s, φ, r, rφ?, sr?, sφ]** — seules les positions 0,1,2,5 sont peuplées (l.807) : `sigma_reference` (base élastique de précontrainte), `sigma0` (branche E0), `sigma_i` (branches de Maxwell, dim. supplémentaire n_maxwell), `sigma_total` (l.386-390), en MPa.
 
 ### 1.7 `DEFAULT_SETTINGS` et validation (parametres.py)
-Clés suffixées par l'unité (`rout_mm`, `p_max_mpa`, `maxwell_eta1_mpa_s`, `suspended_mass_g`, `flow_rate_mL_min`, `alpha0_deg`…). Bornes dures dans `normalize_settings` (l.362-410), p.ex. `p_max_mpa ∈ [0, 1.5]`. Verrouillages Alpha V2 (l.354-359) : mode constitutif, référence de précontrainte, nylon, couplages = 1. Validations physiques : `geometry_error` l.525, `material_error` l.549 (reconstruit la matrice C et vérifie sa positivité — duplication du code de `ti_stiffness_from_paper`), `numerical_error` l.621 (dont stabilité d'Euler explicite l.651-675). `derived_geometry` (l.685-761) : grandeurs dérivées en mm/mm²/mm⁴, volume interne en mL via `× 1.0e-3` (l.729, mm³→mL).
+Clés suffixées par l'unité (`rout_mm`, `p_max_mpa`, `maxwell_eta1_mpa_s`, `suspended_mass_g`, `pressure_rate_mpa_s`, `alpha0_deg`…). Bornes dures dans `normalize_settings` (l.362-410), p.ex. `p_max_mpa ∈ [0, 1.5]`. Verrouillages Alpha V2 (l.354-359) : mode constitutif, référence de précontrainte, nylon, couplages = 1. Validations physiques : `geometry_error` l.525, `material_error` l.549 (reconstruit la matrice C et vérifie sa positivité — duplication du code de `ti_stiffness_from_paper`), `numerical_error` l.621 (dont stabilité d'Euler explicite l.651-675). `derived_geometry` (l.685-761) : grandeurs dérivées en mm/mm²/mm⁴, volume interne en mL via `× 1.0e-3` (l.729, mm³→mL).
 
 ---
 
@@ -129,7 +129,7 @@ Clés suffixées par l'unité (`rout_mm`, `p_max_mpa`, `maxwell_eta1_mpa_s`, `su
 - **Forces** : internes en N (`Ft`, `Ftube`…) ; sorties `force_N` et `force_mN = 1000·Ft` (l.1415-1416). Décomposition tube/nylon en mN (l.1503-1504).
 - **Couples** : internes en N·mm ; sorties `torque_Nmm` et `torque_microNm = 1000·Tt` (l.1417-1418) — correct car 1 N·mm = 1000 µN·m. Le résidu reste en N·mm (`max_abs_residual_Nmm`, l.2061).
 - **dv** : rad/mm (torsion linéique) ; **dkappa** : 1/mm ; **dw** : adimensionnel.
-- **Temps** : s. Débit `flow_rate_mL_min` en mL/min, converti par `60·volume/flow` (demi-période en s, l.1533 ; parametres.py l.850) ; vitesse de précontrainte en mm/min convertie l.1371 (`60·eps·L0/rate`).
+- **Temps** : s. Vitesse de pression `pressure_rate_mpa_s` en MPa/s, demi-période `Pmax/vitesse` (`Base.resolve_half_period`) ; l'ancien couple débit/volume donne `60·volume/flow` ; vitesse de précontrainte en mm/min convertie l.1371 (`60·eps·L0/rate`).
 - **Volume** : mL ; mm³→mL par ×1.0e-3 (parametres.py l.729).
 - **Masse suspendue** : g côté interface, convertie en N par `masse_g × 1.0e-3 × 9.80665` (interface.py **l.536 et l.2104**). Le moteur ne reçoit que `load_N`.
 - **Conversions de pression CSV** (pression.py l.106/142) : vers MPa — MPa×1, bar×0.1, kPa×0.001, psi×0.006894757293168361 ; plafond 1.5 MPa vérifié (pression.py l.149-150). `PSI_TO_MPA` aussi dans parametres.py l.17.
