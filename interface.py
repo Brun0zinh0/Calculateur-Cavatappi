@@ -50,6 +50,8 @@ from parametres import (
     INTEGRATION_LABELS,
     INTEGRATION_OPTIONS,
     PRESTRAIN_REFERENCE_LABELS,
+    PRESTRETCH_CONVENTION_LABELS,
+    PRESTRETCH_CONVENTION_OPTIONS,
     PRESTRAIN_REFERENCE_OPTIONS,
     MAXWELL_ANISOTROPY_LABELS,
     MAXWELL_ANISOTROPY_OPTIONS,
@@ -242,8 +244,7 @@ RELAXATION_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "n_cycles",
     "use_fixed_duration",
     "duration_s",
-    "flow_rate_mL_min",
-    "volume_mL",
+    "pressure_rate_mpa_s",
     "suspended_mass_g",
     "suspended_duration_s",
     "suspended_pressure_rate_mpa_s",
@@ -287,8 +288,7 @@ SUSPENDED_RESULT_IGNORE_KEYS = TEMPORAL_DISPLAY_SETTING_KEYS | {
     "n_cycles",
     "use_fixed_duration",
     "duration_s",
-    "flow_rate_mL_min",
-    "volume_mL",
+    "pressure_rate_mpa_s",
     "nonlinear_pressure",
     "suspended_show_geometry_plot",
     "parallel_workers",
@@ -892,7 +892,7 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
             "Ces paramètres définissent le chargement appliqué pendant l'actionnement bloqué.",
             "La précontrainte initiale étire l'actionneur avant l'injection de pression.",
             "La pression maximale fixe l'amplitude du cycle de pression.",
-            "Le débit et le volume définissent uniquement la durée d'un demi-cycle : ils ne constituent pas un modèle hydraulique pression-volume.",
+            "La vitesse de pression (MPa/s) fixe la pente des rampes du profil généré : demi-cycle = Pmax / vitesse. Le banc n'étant pas asservi en pression, c'est la vitesse mesurée sur les rampes des essais (0,01 à 0,06 MPa/s en pratique) qu'il faut reporter ici.",
         ]
     )
     pressure_input_mode = st.selectbox(
@@ -906,8 +906,24 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
     n_cycles = st.slider("Cycles", 1, 60, int(settings["n_cycles"]), 1)
     use_fixed_duration = st.checkbox("Utiliser une durée totale fixe", bool(settings["use_fixed_duration"]))
     duration_s = st.number_input("Durée totale (s)", 1.0, 5000.0, float(settings["duration_s"]), 10.0)
-    flow_rate_mL_min = st.number_input("Débit (mL/min)", 0.01, 200.0, float(settings["flow_rate_mL_min"]), 0.5)
-    volume_mL = st.number_input("Volume de commande par demi-cycle (mL)", 0.001, 100.0, float(settings["volume_mL"]), 0.05)
+    pressure_rate_mpa_s = st.number_input(
+        "Vitesse de pression (MPa/s)",
+        0.0005,
+        5.0,
+        float(settings["pressure_rate_mpa_s"]),
+        0.005,
+        format="%.4f",
+        help=(
+            "Pente des rampes de montée et de descente du profil généré ; demi-cycle = Pmax / vitesse. "
+            "Les rampes du banc valent 0,01 à 0,06 MPa/s ; le protocole de l'article (10 mL/min, 1,5 mL) "
+            "correspond à Pmax / 9 s, soit 0,167 MPa/s à 1,5 MPa."
+        ),
+    )
+    if not use_fixed_duration and float(p_max_mpa) > 0.0:
+        st.caption(
+            f"Demi-cycle {float(p_max_mpa) / float(pressure_rate_mpa_s):.1f} s, "
+            f"cycle {2.0 * float(p_max_mpa) / float(pressure_rate_mpa_s):.1f} s."
+        )
     nonlinear_pressure = st.checkbox(
         "Profil de pression phénoménologique non linéaire",
         bool(settings["nonlinear_pressure"]),
@@ -935,7 +951,10 @@ with st.sidebar.expander("Pression et actionnement", expanded=True):
         ),
     )
     if use_fixed_duration:
-        st.caption("La durée fixe remplace le débit demandé par un débit effectif calculé à partir du nombre de cycles.")
+        st.caption(
+            "La durée fixe remplace la vitesse demandée par une vitesse effective de "
+            f"{2.0 * float(p_max_mpa) * int(n_cycles) / float(duration_s):.4f} MPa/s (2·Pmax·cycles / durée)."
+        )
     if pressure_input_mode == "measured_csv":
         uploaded_pressure_file = st.file_uploader(
             "Historique de pression mesuré",
@@ -1130,6 +1149,16 @@ nylon_condition_mode = "bonded_linear"
 nylon_scale = 1.0
 nylon_axial_prestrain_coupling = 1.0
 nylon_axial_actuation_coupling = 1.0
+# Alpha V4 : mecanismes physiques optionnels (off par defaut)
+prestretch_convention = str(settings.get("prestretch_convention", "coil_only"))
+if prestretch_convention not in PRESTRETCH_CONVENTION_OPTIONS:
+    prestretch_convention = "coil_only"
+engagement_reform_pressure_mpa = float(settings.get("engagement_reform_pressure_mpa", 0.0))
+engagement_unload_ratio = float(settings.get("engagement_unload_ratio", 1.0))
+friction_pressure_coulomb_mpa = float(settings.get("friction_pressure_coulomb_mpa", 0.0))
+eyring_sigma_star_mpa = float(settings.get("eyring_sigma_star_mpa", 0.0))
+anchor_creep_c_mm = float(settings.get("anchor_creep_c_mm", 0.0))
+anchor_creep_t0_s = float(settings.get("anchor_creep_t0_s", 10.0))
 dt = float(settings["dt"])
 n_layers = int(settings["n_layers"])
 n_phi = int(settings["n_phi"])
@@ -1197,6 +1226,52 @@ if show_advanced_settings:
         E_nylon_mpa = st.number_input("Module axial du nylon E_nylon (MPa)", 0.001, 100000.0, E_nylon_mpa, 10.0)
         G_nylon_mpa = st.number_input("Module de cisaillement du nylon G_nylon (MPa)", 0.001, 100000.0, G_nylon_mpa, 10.0)
         st.caption("Condition fixe : nylon linéaire bilatéral lié aux extrémités.")
+
+    with st.sidebar.expander("Mécanismes Alpha V4 (off par défaut)"):
+        sidebar_help(
+            [
+                "Cinq mécanismes physiques issus de la confrontation aux essais (chapitre 7 du rapport). Tous sont inactifs par défaut : le moteur est alors identique à l’alpha V3.",
+                "Pression d’engagement : le pré-étirement ovalise la section ; la pression commence par la reformer (peu de force) avant de travailler en membrane — seuil de démarrage et super-linéarité, sans perte de gain en haut de course.",
+                "Frottement sec : élément de Coulomb sur la transmission de la pression (frottement radial paroi/nylon et spire-spire) — seule dissipation indépendante de la vitesse : seuil de démarrage, descente au-dessus de la montée, force résiduelle à P = 0.",
+                "Convention de pré-étirement : appliquer ε à la longueur entre mors au lieu de la spire seule (extrémités en série pendant l’étirement).",
+                "Eyring : la viscosité chute avec la contrainte de branche — relaxation forte à la précontrainte, faible à l’actionnement (incompatibilité d’amplitude).",
+                "Fluage d’ancrage : extension logarithmique des fixations à partir du blocage (part minoritaire de la relaxation mesurée, essai E10).",
+            ]
+        )
+        prestretch_convention = st.selectbox(
+            "Convention de pré-étirement",
+            PRESTRETCH_CONVENTION_OPTIONS,
+            index=option_index(PRESTRETCH_CONVENTION_OPTIONS, prestretch_convention),
+            format_func=lambda value: PRESTRETCH_CONVENTION_LABELS.get(value, value),
+            help="Sans extrémités désenroulées, les deux conventions coïncident.",
+        )
+        engagement_reform_pressure_mpa = st.number_input(
+            "Pression de reformage de la section P_r0 (MPa, 0 = off)", 0.0, 5.0, engagement_reform_pressure_mpa, 0.01, format="%.3f",
+            help=(
+                "Pression qui referme complètement la section ovalisée par le pré-étirement. Seul paramètre du "
+                "mécanisme : une ovalité e0 et un facteur d’anneau k n’agissent que par leur produit (non "
+                "identifiables séparément). Ordre de grandeur k·E_radius·(t/R_m)³·e0 ≈ 1,3 MPa × k·e0 pour le tube "
+                "de la campagne ; le seuil médian mesuré (0,17 MPa) correspond à k·e0 ≈ 0,13. Convention : P_eff "
+                "pilote tout le BVP radial (rayons en mode réactualisé, contraintes de paroi, activation d’Eyring)."
+            ),
+        )
+        engagement_unload_ratio = st.number_input(
+            "Rapport de décharge r (1 = réversible)", 0.05, 1.0, engagement_unload_ratio, 0.05,
+            help="r < 1 : la section reste ronde plus longtemps à la décharge — hystérésis du seuil.",
+        )
+        friction_pressure_coulomb_mpa = st.number_input(
+            "Pression de Coulomb P_c (MPa, 0 = off)", 0.0, 1.0, friction_pressure_coulomb_mpa, 0.005, format="%.3f",
+            help="P_eff = P − P_f avec P_f élément de Jenkins écrêté à ±P_c : retard de P_c en charge, avance de P_c en décharge. En mode bloqué, un patin interne (dw, dv, dκ) n’ouvre aucune boucle — seule la transmission de la pression le peut. Calibration : hystérésis du seuil mesurée 0,038 MPa ≈ 2·P_c.",
+        )
+        eyring_sigma_star_mpa = st.number_input(
+            "Contrainte d’activation d’Eyring σ* (MPa, 0 = off)", 0.0, 1000.0, eyring_sigma_star_mpa, 0.01, format="%.3f",
+            help="η_eff = η·(s/σ*)/sinh(s/σ*) par couche et par branche, s = norme de la contrainte de branche. Dans ce modèle les contraintes de branche du tube valent ~0,01-0,05 MPa à la précontrainte : σ* doit être de cet ordre pour agir. Exige l’intégration exponentielle.",
+        )
+        anchor_creep_c_mm = st.number_input(
+            "Fluage d’ancrage c (mm, 0 = off)", 0.0, 50.0, anchor_creep_c_mm, 0.01,
+            help="δ(t) = c·ln(1 + t/t0) depuis le blocage, en série dans la longueur bloquée.",
+        )
+        anchor_creep_t0_s = st.number_input("Temps de référence du fluage t0 (s)", 0.01, 100000.0, anchor_creep_t0_s, 1.0)
 
     with st.sidebar.expander("Solveur"):
         sidebar_help(
@@ -1294,8 +1369,7 @@ current_settings = {
     "hysteresis_pressure_rates_mpa_s": str(hysteresis_pressure_rates_mpa_s),
     "use_fixed_duration": bool(use_fixed_duration),
     "duration_s": float(duration_s),
-    "flow_rate_mL_min": float(flow_rate_mL_min),
-    "volume_mL": float(volume_mL),
+    "pressure_rate_mpa_s": float(pressure_rate_mpa_s),
     "nonlinear_pressure": bool(nonlinear_pressure),
     "show_temporal_torque": bool(show_temporal_torque),
     "overlay_temporal_pressure": bool(overlay_temporal_pressure),
@@ -1339,6 +1413,13 @@ current_settings = {
     "nylon_axial_actuation_coupling": float(nylon_axial_actuation_coupling),
     "nylon_condition_mode": str(nylon_condition_mode),
     "nylon_scale": float(nylon_scale),
+    "prestretch_convention": str(prestretch_convention),
+    "engagement_reform_pressure_mpa": float(engagement_reform_pressure_mpa),
+    "engagement_unload_ratio": float(engagement_unload_ratio),
+    "friction_pressure_coulomb_mpa": float(friction_pressure_coulomb_mpa),
+    "eyring_sigma_star_mpa": float(eyring_sigma_star_mpa),
+    "anchor_creep_c_mm": float(anchor_creep_c_mm),
+    "anchor_creep_t0_s": float(anchor_creep_t0_s),
     "n_layers": int(n_layers),
     "n_phi": int(n_phi),
     "parallel_workers": int(parallel_workers),
@@ -1431,6 +1512,19 @@ if section_update_mode == "updated":
     st.caption(
         "La section radiale évolutive actualise les rayons et l'orientation du matériau à chaque incrément."
     )
+active_v4 = [
+    label
+    for label, active in (
+        ("pré-étirement entre mors", prestretch_convention == "grip_to_grip"),
+        ("pression d'engagement", engagement_reform_pressure_mpa > 0.0),
+        ("frottement sec", friction_pressure_coulomb_mpa > 0.0),
+        ("viscosité d'Eyring", eyring_sigma_star_mpa > 0.0),
+        ("fluage d'ancrage", anchor_creep_c_mm > 0.0),
+    )
+    if active
+]
+if active_v4:
+    st.caption("Mécanismes Alpha V4 actifs : " + ", ".join(active_v4) + ".")
 if str(integration) == "paper_explicit":
     active_tau = [
         eta / modulus
@@ -1454,7 +1548,7 @@ elif bool(use_fixed_duration):
     estimated_duration_s = float(duration_s)
     estimated_steps = int(np.ceil(estimated_duration_s / dt))
 else:
-    estimated_duration_s = int(n_cycles) * 2.0 * 60.0 * float(volume_mL) / float(flow_rate_mL_min)
+    estimated_duration_s = int(n_cycles) * 2.0 * modele.resolve_half_period(float(p_max_mpa), pressure_rate_mpa_s=float(pressure_rate_mpa_s))
     estimated_steps = int(np.ceil(estimated_duration_s / dt))
 estimated_cost = model_cost_index(estimated_steps, n_layers, n_phi, pre_steps)
 estimated_relaxation_steps = int(np.ceil((relaxation_ramp_time_s + relaxation_hold_time_s) / dt))
@@ -2181,6 +2275,12 @@ with tabs[4]:
     )
 
 with tabs[5]:
+    if anchor_creep_c_mm > 0.0:
+        st.info(
+            "Le fluage d'ancrage (Alpha V4-5) ne s'applique qu'au mode bloqué : il court à partir du "
+            "verrouillage de la référence série, jamais établi en masse suspendue. Ici la réponse est "
+            "identique à c = 0."
+        )
     suspended_csv_payload = None
     load_N = float(suspended_mass_g) * 1.0e-3 * 9.80665
     suspended_ramp_time_s = float(p_max_mpa) / max(float(suspended_pressure_rate_mpa_s), 1e-12)

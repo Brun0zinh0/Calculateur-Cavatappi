@@ -1,4 +1,4 @@
-"""Tests numériques autonomes de l'interface Cavatappi Alpha V2.
+"""Tests numériques autonomes de l'interface Cavatappi (Alpha V4).
 
 Exécution : python test_scientifique.py
 """
@@ -33,10 +33,17 @@ def test_pressure_histories() -> None:
     assert pressure[-1] == 1.5
     assert np.all(np.diff(time) > 0.0)
 
-    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.5, dt=7.0)
+    # v4-16 : le profil est defini par une vitesse de pression ; a vitesse
+    # Pmax/9 s la demi-periode vaut 9 s (protocole de l'article).
+    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.5, dt=7.0, pressure_rate_mpa_s=1.5 / 9.0)
     assert time[-1] == 36.0
     assert pressure[-1] == 0.0
     assert np.isclose(np.max(pressure), 1.5)
+    # vitesse par defaut (1,3 MPa / 9 s) : la duree depend desormais de Pmax
+    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.3, dt=7.0)
+    assert time[-1] == 36.0
+    time, pressure = Base.cyclic_pressure_history(n_cycles=2, Pmax=1.5, dt=7.0)
+    assert np.isclose(time[-1], 4.0 * 1.5 / (1.3 / 9.0))
 
 
 def test_blocked_equilibrium() -> None:
@@ -485,9 +492,7 @@ def test_pressure_history_defaults_linear() -> None:
     """Item 2.4 de l'audit : profil linéaire par défaut sur tous les points d'entrée."""
     import inspect
 
-    time, pressure = Base.cyclic_pressure_history(
-        n_cycles=1, Pmax=1.0, flow_rate_mL_min=10.0, volume_mL=1.5, dt=0.5
-    )
+    time, pressure = Base.cyclic_pressure_history(n_cycles=1, Pmax=1.0, pressure_rate_mpa_s=1.0 / 9.0, dt=0.5)
     assert np.isclose(np.interp(4.5, time, pressure), 0.5), "cyclic : mi-rampe = Pmax/2 (linéaire)"
     time, pressure = Base.ramp_hold_pressure_history(P_hold=1.0, ramp_time=8.0, hold_time=10.0, dt=1.0)
     assert np.isclose(np.interp(4.0, time, pressure), 0.5), "ramp_hold : mi-rampe = P_hold/2 (linéaire)"
@@ -765,6 +770,374 @@ def test_validation_figure7_non_regression() -> None:
             )
 
 
+# ---------------------------------------------------------------------------
+# Alpha V4 : mecanismes physiques optionnels (off par defaut)
+# ---------------------------------------------------------------------------
+
+
+def _v4_settings(**extra) -> dict:
+    settings = dict(parametres.DEFAULT_SETTINGS)
+    settings.update({"eps": 0.8, "n_cycles": 1, "dt": 2.0, "n_layers": 2, "n_phi": 8, "pre_steps": 4, "p_max_mpa": 1.2})
+    settings.update(extra)
+    return settings
+
+
+def _loop_area(data) -> float:
+    """Integrale signee de F dP sur la boucle (montee puis descente) :
+    NEGATIVE quand la branche de descente est au-dessus de la montee (boucle
+    dissipative de signe physique), positive dans le cas contraire (artefact
+    de relaxation de la reference)."""
+    return float(np.trapezoid(np.asarray(data["force_act_mN"], dtype=float), np.asarray(data["pressure_MPa"], dtype=float)))
+
+
+def test_v4_defaults_are_off() -> None:
+    """Toutes les cles V4 sont a leur valeur neutre par defaut, et la config
+    construite les transmet au moteur ; un moteur avec ces valeurs expose des
+    sorties V4 nulles (pression effective = pression, frottement nul)."""
+    for key in parametres.V4_MECHANISM_KEYS:
+        assert key in parametres.DEFAULT_SETTINGS, key
+    settings = _v4_settings()
+    config = parametres.build_config(settings)
+    assert config.geom.prestretch_convention == "coil_only"
+    assert config.mat.engagement_reform_pressure_mpa == 0.0
+    assert config.mat.friction_pressure_coulomb_mpa == 0.0
+    assert config.mat.eyring_sigma_star_mpa == 0.0
+    assert config.mat.anchor_creep_c_mm == 0.0
+    _, data = Base.run_blocked_actuation(config)
+    assert np.allclose(data["pressure_effective_MPa"], data["pressure_MPa"])
+    assert np.all(data["ovality"] == 0.0)
+    assert np.all(data["anchor_creep_mm"] == 0.0)
+    assert np.all(data["pressure_friction_MPa"] == 0.0)
+    for key, bad in (
+        ("engagement_reform_pressure_mpa", -1.0),
+        ("engagement_unload_ratio", 0.0),
+        ("friction_pressure_coulomb_mpa", -1.0),
+        ("anchor_creep_t0_s", 0.0),
+        ("prestretch_convention", "inconnu"),
+    ):
+        wrong = _v4_settings(**{key: bad})
+        assert parametres.settings_error(wrong) is not None or _raises_value_error(wrong), key
+    wrong = _v4_settings(eyring_sigma_star_mpa=0.5, integration="paper_explicit", dt=0.1)
+    assert parametres.settings_error(wrong) is not None
+
+
+def _raises_value_error(settings) -> bool:
+    try:
+        parametres.normalize_settings(settings)
+    except ValueError:
+        return True
+    return False
+
+
+def test_v4_engagement_pressure_threshold() -> None:
+    """V4-1 : la pression d'engagement produit un demarrage quadratique
+    (moins de force sous P_r0), rend la pleine pression en haut de course
+    (gain conserve) et, avec r < 1, une boucle d'hysteresis de signe positif."""
+    t = np.linspace(0.0, 120.0, 61)
+    p = 1.2 * np.where(t <= 60.0, t / 60.0, (120.0 - t) / 60.0)
+    reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()), pressure_time=t, pressure_MPa=p)[1]
+    config = parametres.build_config(_v4_settings(engagement_reform_pressure_mpa=0.28))
+    model, data = Base.run_blocked_actuation(config, pressure_time=t, pressure_MPa=p)
+    P_r0 = model._engagement_reform_pressure()
+    assert 0.0 < P_r0 < 1.2, f"P_r0 = {P_r0:.3f} MPa doit etre atteint par la rampe"
+    P = np.asarray(reference["pressure_MPa"])
+    half = len(P) // 2
+    i_low = int(np.argmin(np.abs(P[:half] - 0.4 * P_r0)))
+    # sous P_r0 la pression effective vaut P^2/P_r0 : a 0,4 P_r0 la force
+    # d'actionnement doit etre nettement en dessous de la reference
+    assert data["force_act_mN"][i_low] < 0.7 * reference["force_act_mN"][i_low], "demarrage retarde attendu sous P_r0"
+    assert abs(data["pressure_effective_MPa"].max() - data["pressure_MPa"].max()) < 1.0e-9
+    gain_ratio = float(data["force_act_mN"].max() / reference["force_act_mN"].max())
+    assert 0.9 < gain_ratio < 1.05, f"gain conserve attendu, ratio {gain_ratio:.3f}"
+    hyst = Base.run_blocked_actuation(parametres.build_config(_v4_settings(engagement_reform_pressure_mpa=0.28, engagement_unload_ratio=0.5)), pressure_time=t, pressure_MPa=p)[1]
+    # descente au-dessus de la montee sous r P_r0 : integrale signee plus petite
+    assert _loop_area(hyst) < _loop_area(data) - 1.0e-6, "r < 1 doit ouvrir une boucle de signe positif"
+
+
+def test_v4_dry_friction_hysteresis() -> None:
+    """V4-2 : l'element de Coulomb sur la pression motrice ouvre une boucle
+    de signe positif (descente au-dessus de la montee), retarde le demarrage
+    de P_c, laisse une force residuelle a P = 0, ne change pas la
+    precontrainte et garde le gain a mieux que 10 %."""
+    t = np.linspace(0.0, 120.0, 61)
+    p = 1.2 * np.where(t <= 60.0, t / 60.0, (120.0 - t) / 60.0)
+    reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()), pressure_time=t, pressure_MPa=p)[1]
+    data = Base.run_blocked_actuation(parametres.build_config(_v4_settings(friction_pressure_coulomb_mpa=0.02)), pressure_time=t, pressure_MPa=p)[1]
+    assert abs(data["force_total_mN"][0] - reference["force_total_mN"][0]) < 1.0e-9
+    # integrale signee (montee puis descente) plus petite = descente au-dessus
+    assert _loop_area(data) < _loop_area(reference) - 1.0e-3
+    assert abs(data["force_act_mN"].max() / reference["force_act_mN"].max() - 1.0) < 0.10
+    assert abs(float(np.max(data["pressure_friction_MPa"])) - 0.02) < 1.0e-12
+    assert abs(float(np.min(data["pressure_friction_MPa"])) + 0.02) < 1.0e-12
+    up = np.asarray(data["force_act_mN"])[:31]
+    down = np.asarray(data["force_act_mN"])[30:][::-1]
+    up_ref = np.asarray(reference["force_act_mN"])[:31]
+    down_ref = np.asarray(reference["force_act_mN"])[30:][::-1]
+    assert float(np.mean(down - up)) > float(np.mean(down_ref - up_ref)) + 1.0
+    assert data["force_act_mN"][-1] > reference["force_act_mN"][-1] + 0.5, "force residuelle a P = 0 attendue"
+    decomposition = np.nanmax(np.abs(data["force_total_mN"] - data["force_tube_mN"] - data["force_nylon_mN"]))
+    assert decomposition < 1.0e-8
+
+
+def test_v4_eyring_amplitude_dependence() -> None:
+    """V4-4 : la viscosite activee par la contrainte accelere la relaxation de
+    la precontrainte (grande amplitude) par rapport aux viscosites constantes."""
+    t = np.arange(0.0, 121.0, 4.0)
+    p = np.zeros_like(t)
+    base = parametres.build_config(_v4_settings(prestrain_reference_mode="viscoelastic_history"))
+    eyring = parametres.build_config(_v4_settings(prestrain_reference_mode="viscoelastic_history", eyring_sigma_star_mpa=0.02))
+    _, d0 = Base.run_blocked_actuation(base, pressure_time=t, pressure_MPa=p)
+    _, d1 = Base.run_blocked_actuation(eyring, pressure_time=t, pressure_MPa=p)
+    relax0 = (d0["force_total_mN"][-1] - d0["force_total_mN"][0]) / d0["force_total_mN"][0]
+    relax1 = (d1["force_total_mN"][-1] - d1["force_total_mN"][0]) / d1["force_total_mN"][0]
+    assert relax0 < 0.0 and relax1 < relax0, f"relaxation Eyring {relax1:.4f} doit depasser {relax0:.4f}"
+
+
+def test_v4_anchor_creep_series() -> None:
+    """V4-5 : le fluage d'ancrage logarithmique relache la force a P = 0,
+    avec et sans compliance serie ; la compatibilite serie reste satisfaite."""
+    t = np.arange(0.0, 121.0, 4.0)
+    p = np.zeros_like(t)
+    for uncoiled in (0.0, 15.0):
+        cfg0 = parametres.build_config(_v4_settings(uncoiled_length_mm=uncoiled))
+        cfg1 = parametres.build_config(_v4_settings(uncoiled_length_mm=uncoiled, anchor_creep_c_mm=0.5, anchor_creep_t0_s=10.0))
+        _, d0 = Base.run_blocked_actuation(cfg0, pressure_time=t, pressure_MPa=p)
+        _, d1 = Base.run_blocked_actuation(cfg1, pressure_time=t, pressure_MPa=p)
+        assert d1["force_total_mN"][-1] < d0["force_total_mN"][-1] - 1.0, f"uncoiled={uncoiled}"
+        creep = np.asarray(d1["anchor_creep_mm"])
+        assert creep[-1] > creep[len(creep) // 2] > 0.0
+        expected = 0.5 * np.log1p(float(t[-1]) / 10.0)
+        assert abs(creep[-1] - expected) < 1.0e-6
+        if uncoiled > 0.0:
+            assert np.max(np.abs(d1["series_compatibility_residual_mm"])) < 1.0e-5
+
+
+def test_v4_prestretch_convention() -> None:
+    """V4-3 : la convention entre mors coincide avec la convention spire seule
+    sans extremites, et en differe (extremites allongees pendant l'etirement)
+    avec des extremites desenroulees."""
+    same = Base.run_blocked_actuation(parametres.build_config(_v4_settings(prestretch_convention="grip_to_grip")))[1]
+    reference = Base.run_blocked_actuation(parametres.build_config(_v4_settings()))[1]
+    assert np.allclose(same["force_total_mN"], reference["force_total_mN"])
+    coil = Base.run_blocked_actuation(parametres.build_config(_v4_settings(uncoiled_length_mm=20.0)))[1]
+    grip = Base.run_blocked_actuation(parametres.build_config(_v4_settings(uncoiled_length_mm=20.0, prestretch_convention="grip_to_grip")))[1]
+    assert grip["prestretch_end_extension_mm"][0] > 0.0
+    assert abs(grip["force_total_mN"][0] - coil["force_total_mN"][0]) > 1.0e-3 * coil["force_total_mN"][0]
+    assert np.max(np.abs(grip["residual"])) < 1.0e-4
+
+
+def test_v4_settings_migration_keeps_v3_choices() -> None:
+    """C1 de la contre-expertise : un fichier de reglages de schema 16 (alpha V3)
+    avec des options non defaut doit survivre a load_settings (schema 17) —
+    seules les cles V4 sont completees a leur valeur neutre."""
+    import tempfile
+
+    legacy = dict(parametres.DEFAULT_SETTINGS)
+    for key in parametres.V4_MECHANISM_KEYS:
+        legacy.pop(key, None)
+    legacy.update({
+        "_settings_schema_version": 16,
+        "section_update_mode": "updated",
+        "prestrain_reference_mode": "viscoelastic_history",
+        "axial_modulus_mode": "paper_table",
+        "E_axial_mpa": 40.0,
+        "maxwell_anisotropy_mode": "axial_test_only",
+        "bias_angle_profile": "uniform_twist",
+        "integration": "paper_explicit",
+        "dt": 2.0,
+        "use_fixed_duration": True,
+        "nonlinear_pressure": True,
+        "p_max_mpa": 1.1,
+    })
+    original_path = parametres.SETTINGS_PATH
+    original_migrate = parametres._migrate_legacy_storage
+    with tempfile.TemporaryDirectory() as tmp:
+        parametres.SETTINGS_PATH = Path(tmp) / "settings.json"
+        parametres._migrate_legacy_storage = lambda: None
+        try:
+            parametres.SETTINGS_PATH.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = parametres.load_settings()
+        finally:
+            parametres.SETTINGS_PATH = original_path
+            parametres._migrate_legacy_storage = original_migrate
+    assert parametres.settings_error(dict(parametres.DEFAULT_SETTINGS, **{k: v for k, v in legacy.items() if k in parametres.DEFAULT_SETTINGS})) is None
+    for key in ("section_update_mode", "prestrain_reference_mode", "axial_modulus_mode", "E_axial_mpa", "maxwell_anisotropy_mode",
+                "bias_angle_profile", "integration", "dt", "use_fixed_duration", "nonlinear_pressure", "p_max_mpa"):
+        assert loaded[key] == legacy[key], f"{key} : {loaded[key]!r} != {legacy[key]!r} (migration destructive)"
+    assert loaded["_settings_schema_version"] == parametres.SETTINGS_SCHEMA_VERSION
+    for key in parametres.V4_MECHANISM_KEYS:
+        assert loaded[key] == parametres.DEFAULT_SETTINGS[key]
+
+
+def test_v4_mechanisms_over_cycles() -> None:
+    """Engagement + frottement + Eyring actifs ensemble sur trois cycles :
+    le solveur converge a chaque pas, la reponse reste finie et les cycles
+    2 et 3 se superposent (pas de derive de la boucle)."""
+    settings = _v4_settings(n_cycles=3, engagement_reform_pressure_mpa=0.28, engagement_unload_ratio=0.7,
+                            friction_pressure_coulomb_mpa=0.02, eyring_sigma_star_mpa=0.02)
+    model, data = Base.run_blocked_actuation(parametres.build_config(settings))
+    assert np.all(np.isfinite(data["force_total_mN"]))
+    assert np.max(np.abs(data["residual"])) < 1.0e-4
+    # v4-16 : la periode depend de p_max (vitesse de pression constante), elle
+    # se lit sur la config construite et non sur la config par defaut de l'API.
+    period = parametres.cycle_period_seconds(parametres.build_config(settings))
+    t = np.asarray(data["time"])
+    F = np.asarray(data["force_act_mN"])
+    # amplitude d'actionnement (max - min) par cycle : le premier cycle porte
+    # les transitoires d'accrochage, les cycles 2 et 3 doivent se superposer
+    amplitudes = [
+        float(np.max(F[(t >= k * period) & (t < (k + 1) * period)]) - np.min(F[(t >= k * period) & (t < (k + 1) * period)]))
+        for k in range(3)
+    ]
+    assert amplitudes[1] > 1.0 and amplitudes[2] > 1.0, amplitudes
+    assert abs(amplitudes[2] - amplitudes[1]) < 0.10 * amplitudes[1], amplitudes
+    assert abs(np.max(data["ovality"]) - 1.0) < 1.0e-12 and np.min(data["ovality"]) >= 0.0
+
+
+def test_pressure_rate_profile() -> None:
+    """Le profil genere est defini par une vitesse de pression (MPa/s) :
+    demi-periode = Pmax / vitesse ; les mots-cles historiques debit/volume
+    donnent un profil bit-identique ; a Pmax = 0 la duree historique est
+    conservee ; une vitesse aberrante (debit passe par position) est refusee."""
+    t, p = Base.cyclic_pressure_history(n_cycles=2, Pmax=0.45, pressure_rate_mpa_s=0.03, dt=0.5)
+    assert np.isclose(t[np.argmax(p)], 15.0), "demi-periode = 0,45 / 0,03 = 15 s"
+    assert np.isclose(p.max(), 0.45) and np.isclose(t[-1], 60.0)
+    assert np.isclose(np.interp(7.5, t, p), 0.225), "rampe lineaire a la vitesse demandee"
+    t_new, p_new = Base.cyclic_pressure_history(n_cycles=3, Pmax=1.3, pressure_rate_mpa_s=1.3 / 9.0, dt=0.25)
+    t_old, p_old = Base.cyclic_pressure_history(n_cycles=3, Pmax=1.3, flow_rate_mL_min=10.0, volume_mL=1.5, dt=0.25)
+    t_def, p_def = Base.cyclic_pressure_history(n_cycles=3, Pmax=1.3, dt=0.25)
+    assert np.array_equal(t_new, t_old) and np.array_equal(p_new, p_old), "debit/volume historique bit-identique"
+    assert np.array_equal(t_def, t_old) and np.array_equal(p_def, p_old), "vitesse par defaut = 9 s a 1,3 MPa"
+    assert Base.resolve_half_period(1.655, flow_rate_mL_min=10.0, volume_mL=1.5) == 9.0
+    assert Base.resolve_half_period(1.655, pressure_rate_mpa_s=1.655 * 10.0 / 90.0) == 9.0, "arrondi nanoseconde"
+    t0, p0 = Base.cyclic_pressure_history(n_cycles=1, Pmax=0.0, pressure_rate_mpa_s=0.1, dt=1.0)
+    assert np.all(p0 == 0.0) and np.isclose(t0[-1], 18.0), "Pmax = 0 : profil nul, duree historique"
+    # les arguments positionnels historiques (debit, volume) restent interpretes
+    # comme tels (scripts d'audit anterieurs), bit-identiques au mot-cle
+    t_pos, p_pos = Base.cyclic_pressure_history(1, 1.3, 10.0, 1.5, 0.25, False)
+    t_kw, p_kw = Base.cyclic_pressure_history(n_cycles=1, Pmax=1.3, flow_rate_mL_min=10.0, volume_mL=1.5, dt=0.25)
+    assert np.array_equal(t_pos, t_kw) and np.array_equal(p_pos, p_kw)
+    try:
+        Base.cyclic_pressure_history(n_cycles=1, Pmax=1.3, dt=0.25, pressure_rate_mpa_s=10.0)
+        raise AssertionError("une vitesse aberrante (debit en mL/min) doit etre refusee")
+    except ValueError as exc:
+        assert "mL/min" in str(exc)
+    cfg = Base.default_simulation_config(Pmax=1.0, pressure_rate_mpa_s=0.1)
+    assert Base._config_half_period(cfg) == 10.0
+    legacy_cfg = Base.default_simulation_config(Pmax=1.0, flow_rate_mL_min=10.0, volume_mL=1.5)
+    assert Base._config_half_period(legacy_cfg) == 9.0, "attributs historiques prioritaires sur une config"
+
+
+def test_settings_pressure_rate_migration() -> None:
+    """Schema 18 : un fichier de schema 17 avec debit/volume est migre vers la
+    vitesse equivalente (p_max·Q/(60·V)), sans toucher aux autres reglages, et
+    le profil construit est bit-identique a l'ancien ; un export ancien est
+    migre de meme ; les cles historiques restent honorees par build_config."""
+    import tempfile
+
+    legacy = dict(parametres.DEFAULT_SETTINGS)
+    legacy.pop("pressure_rate_mpa_s", None)
+    legacy.update({"_settings_schema_version": 17, "flow_rate_mL_min": 10.0, "volume_mL": 1.5, "p_max_mpa": 1.2,
+                   "n_cycles": 4, "section_update_mode": "updated", "dt": 0.5})
+    original_path = parametres.SETTINGS_PATH
+    original_migrate = parametres._migrate_legacy_storage
+    with tempfile.TemporaryDirectory() as tmp:
+        parametres.SETTINGS_PATH = Path(tmp) / "settings.json"
+        parametres._migrate_legacy_storage = lambda: None
+        try:
+            parametres.SETTINGS_PATH.write_text(json.dumps(legacy), encoding="utf-8")
+            loaded = parametres.load_settings()
+        finally:
+            parametres.SETTINGS_PATH = original_path
+            parametres._migrate_legacy_storage = original_migrate
+    assert np.isclose(loaded["pressure_rate_mpa_s"], 1.2 / 9.0), loaded["pressure_rate_mpa_s"]
+    assert loaded["section_update_mode"] == "updated" and loaded["n_cycles"] == 4 and loaded["dt"] == 0.5
+    assert "flow_rate_mL_min" not in loaded and "volume_mL" not in loaded
+    assert loaded["_settings_schema_version"] == parametres.SETTINGS_SCHEMA_VERSION
+    cfg_new = parametres.build_config(loaded)
+    cfg_legacy = parametres.build_config(legacy)
+    assert cfg_new.pressure_rate_mpa_s == cfg_legacy.pressure_rate_mpa_s
+    assert np.isclose(parametres.cycle_period_seconds(cfg_new), 18.0)
+    assert np.isclose(parametres.effective_pressure_rate_mpa_s(cfg_new), 1.2 / 9.0)
+    t_new, p_new = Base.cyclic_pressure_history(cfg_new.n_cycles, cfg_new.Pmax, dt=cfg_new.dt,
+                                                pressure_rate_mpa_s=cfg_new.pressure_rate_mpa_s)
+    t_old, p_old = Base.cyclic_pressure_history(cfg_new.n_cycles, cfg_new.Pmax, flow_rate_mL_min=10.0, volume_mL=1.5,
+                                                dt=cfg_new.dt)
+    assert np.array_equal(t_new, t_old) and np.array_equal(p_new, p_old)
+    export = json.dumps({"format": parametres.SETTINGS_EXPORT_FORMAT, "settings": legacy})
+    imported = parametres.parse_settings_export(export)
+    assert np.isclose(imported["pressure_rate_mpa_s"], 1.2 / 9.0)
+    fixed = dict(loaded)
+    fixed.update({"use_fixed_duration": True, "duration_s": 120.0, "n_cycles": 3})
+    cfg_fixed = parametres.build_config(fixed)
+    assert np.isclose(parametres.cycle_period_seconds(cfg_fixed), 40.0)
+    assert np.isclose(parametres.effective_pressure_rate_mpa_s(cfg_fixed), 1.2 / 20.0)
+    bad = dict(loaded)
+    bad["pressure_rate_mpa_s"] = 10.0
+    assert parametres.settings_error(bad) is not None and "vitesse" in parametres.settings_error(bad)
+    # demi-periode historique EXACTE transportee par half_period_s, meme non
+    # representable sur 9 decimales, et meme a p_max = 0
+    seven = dict(parametres.DEFAULT_SETTINGS)
+    seven.update({"flow_rate_mL_min": 7.0, "volume_mL": 1.5, "p_max_mpa": 1.3, "n_cycles": 2})
+    cfg7 = parametres.build_config(seven)
+    assert cfg7.half_period_s == 60.0 * 1.5 / 7.0 and Base._config_half_period(cfg7) == 60.0 * 1.5 / 7.0
+    assert parametres.cycle_period_seconds(cfg7) == 2.0 * 60.0 * 1.5 / 7.0
+    assert np.isclose(parametres.normalize_settings(seven)["pressure_rate_mpa_s"], 1.3 * 7.0 / 90.0)
+    zero = dict(seven)
+    zero["p_max_mpa"] = 0.0
+    assert Base._config_half_period(parametres.build_config(zero)) == 60.0 * 1.5 / 7.0
+    # contradiction vitesse explicite / cles historiques : refusee par
+    # build_config, signalee par settings_error, tranchee (avec avertissement)
+    # par la migration au profit de la vitesse explicite
+    contradictory = dict(seven)
+    contradictory["pressure_rate_mpa_s"] = 0.03
+    import warnings as _warnings
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        normalized = parametres.normalize_settings(contradictory)
+    assert normalized["pressure_rate_mpa_s"] == 0.03, "normalize tranche au profit de la vitesse explicite"
+    assert any("contradictoires" in str(w.message) for w in caught)
+    try:
+        parametres.build_config(contradictory)
+        raise AssertionError("contradiction non detectee")
+    except ValueError as exc:
+        assert "contradictoires" in str(exc)
+    assert "contradictoires" in (parametres.settings_error(contradictory) or "")
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        migrated = dict(contradictory)
+        parametres._migrate_flow_to_pressure_rate(migrated)
+    assert migrated["pressure_rate_mpa_s"] == 0.03 and "flow_rate_mL_min" not in migrated
+    assert any("contradictoires" in str(w.message) for w in caught)
+    # vitesse equivalente hors bornes : ecretee avec avertissement
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        extreme = dict(parametres.DEFAULT_SETTINGS)
+        extreme.update({"flow_rate_mL_min": 200.0, "volume_mL": 0.01, "p_max_mpa": 1.5})
+        extreme.pop("pressure_rate_mpa_s")
+        rate_ext = parametres._settings_pressure_rate(extreme)
+    assert rate_ext == parametres.PRESSURE_RATE_BOUNDS[1]
+    assert any("écrêtée" in str(w.message) for w in caught)
+
+
+def test_v4_closed_loop_identification_tool() -> None:
+    """V4-6 : l'outil identification/identifier_spectre_moteur.py retrouve,
+    sur un signal synthetique produit par le moteur, une relaxation de meme
+    amplitude (verification de la boucle fermee, maillage minimal)."""
+    module_path = APP_DIR / "identification" / "identifier_spectre_moteur.py"
+    spec = importlib.util.spec_from_file_location("identifier_spectre_moteur", module_path)
+    ident = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ident)
+    base = _v4_settings(n_layers=1, n_phi=4, pre_steps=3, prestrain_reference_mode="viscoelastic_history", maxwell_anisotropy_mode="axial_test_only")
+    truth = ident.settings_with_spectrum(base, np.array([0.12]), np.array([15.0]), 37.76)
+    truth["dt"] = 4.0
+    t_sim, F_sim = ident.simulate_hold(truth, 60.0, 4.0, 300.0)
+    result = ident.identify(t_sim, F_sim, base, n_branches=1, hold_s=60.0, dt=4.0, prestretch_rate_mm_min=300.0, sigma_total=37.76, verbose=False)
+    assert result["rms_normalized"] < 5.0e-3, result
+    assert abs(result["branches"][0]["fraction"] - 0.12) < 0.04, result
+
+
 def main() -> None:
     tests = (
         test_pressure_histories,
@@ -793,6 +1166,17 @@ def main() -> None:
         test_suspended_normalization_LT0,
         test_identification_tools,
         test_validation_figure7_non_regression,
+        test_v4_defaults_are_off,
+        test_v4_engagement_pressure_threshold,
+        test_v4_dry_friction_hysteresis,
+        test_v4_eyring_amplitude_dependence,
+        test_v4_anchor_creep_series,
+        test_v4_prestretch_convention,
+        test_v4_settings_migration_keeps_v3_choices,
+        test_v4_mechanisms_over_cycles,
+        test_pressure_rate_profile,
+        test_settings_pressure_rate_migration,
+        test_v4_closed_loop_identification_tool,
     )
     for test in tests:
         test()

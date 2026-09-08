@@ -1426,7 +1426,9 @@ def plot_hysteresis_with_arrows(data, cycle: int = 1, period: float | None = Non
     if cycle < 1:
         raise ValueError("cycle must be 1-based.")
     if period is None:
-        period = 2.0 * 60.0 * 1.50 / 10.0
+        # Repli historique : demi-periode de 9 s (10 mL/min, 1,5 mL). L'interface
+        # passe toujours la periode reelle (result_cycle_period).
+        period = 18.0
 
     time = np.asarray(data["time"], dtype=float)
     mask = (time >= (cycle - 1) * period) & (time <= cycle * period)
