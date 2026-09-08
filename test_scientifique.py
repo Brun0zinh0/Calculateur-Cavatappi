@@ -704,7 +704,7 @@ def test_validation_figure7_non_regression() -> None:
     """Non-régression quantitative contre la figure 7 (audit 2026-08, item 0.2).
 
     Compare les pics de force et de couple du protocole figure 7 à la baseline
-    enregistrée dans audit/baseline/baseline_figure7.json (tolérance ±2 %).
+    enregistrée dans validation/baseline_figure7.json (tolérance ±2 %).
     Par défaut, seule la discrétisation réduite est exécutée (~2-3 min) ;
     TCPA_SLOW_VALIDATION=1 ajoute la discrétisation de production (6 couches).
     TCPA_SKIP_VALIDATION=1 saute entièrement ce test. Le test est aussi ignoré
@@ -713,7 +713,7 @@ def test_validation_figure7_non_regression() -> None:
     if os.environ.get("TCPA_SKIP_VALIDATION", "") == "1":
         print("  (ignoré : TCPA_SKIP_VALIDATION=1)")
         return
-    baseline_path = APP_DIR / "audit" / "baseline" / "baseline_figure7.json"
+    baseline_path = APP_DIR / "validation" / "baseline_figure7.json"
     if not baseline_path.exists():
         print(f"  (ignoré : baseline absente, {baseline_path})")
         return

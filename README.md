@@ -8,10 +8,10 @@ sinon) — voir la section « Alpha V4 » plus bas et `PATCH_NOTES.md`.
 
 Alpha V3 est la copie consolidée d'Alpha V2 (moteur identique,
 `2026.07.30-series-compliant-ends-10`) issue de l'audit scientifique complet du
-17-18/08/2026. Elle ajoute : le dossier `validation/` (validation quantitative
-contre la figure 7 de l'article, avec baseline de non-régression), le dossier
-`audit/` (rapport et résultats bruts de l'audit), et `PLAN_DE_CORRECTION.md`
-(feuille de route des corrections, phases 0-4). Le présent README a été corrigé
+17-18/08/2026. Elle ajoute le dossier `validation/` (validation quantitative
+contre la figure 7 de l'article, avec baseline de non-régression). Le rapport
+d'audit et le plan de correction ont été retirés du dépôt et restent
+consultables dans l'historique git. Le présent README a été corrigé
 en Phase 1 du plan : les paragraphes marqués « (audit 2026-08) » documentent
 les écarts réels entre le logiciel et les articles.
 
@@ -29,9 +29,7 @@ les écarts réels entre le logiciel et les articles.
 - `lancer_interface.bat` : lancement de l'interface sous Windows.
 - `test_installation.py` : vérification rapide des imports et du modèle.
 - `test_scientifique.py` : tests numériques des équilibres, historiques de pression et du mode suspendu, plus le test de non-régression contre la figure 7 (baseline ±2 %).
-- `validation/` : validation quantitative contre la figure 7 de l'article (voir `validation/README.md`).
-- `audit/` : rapport d'audit 2026-08, constats bruts, baseline de non-régression, scripts de contre-expertise.
-- `PLAN_DE_CORRECTION.md` : feuille de route des corrections issues de l'audit.
+- `validation/` : validation quantitative contre la figure 7 de l'article (voir `validation/README.md`, baseline `validation/baseline_figure7.json`).
 
 ## Installation sur un PC Windows
 

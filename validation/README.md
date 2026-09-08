@@ -30,7 +30,7 @@ Sorties : figures PNG et métriques JSON dans `out/`.
 
 ## Baseline de non-régression
 
-`--baseline` écrit `../audit/baseline/baseline_figure7.json` (pics/vallées de
+`--baseline` écrit `baseline_figure7.json` (dans ce dossier) (pics/vallées de
 force et de couple à deux discrétisations, réduite et production). Le test
 `test_validation_figure7_non_regression` de `../test_scientifique.py` compare
 le moteur courant à cette baseline (tolérance ±2 %) à chaque exécution de la
@@ -38,13 +38,13 @@ suite ; `TCPA_SLOW_VALIDATION=1` ajoute la discrétisation de production,
 `TCPA_SKIP_VALIDATION=1` saute le test.
 
 Ne régénérer la baseline (`--baseline`) qu'après une modification **assumée**
-de la physique, en notant la raison dans le plan de correction (item 0.3).
+de la physique, en notant la raison dans `PATCH_NOTES.md`.
 
 ## Lecture des résultats
 
 Les écarts résiduels connus au moment du gel de la baseline (audit 2026-08) :
 force −4 à −8 % (ε=0,8) et −11 à −13 % (ε=1,0) vs théorie de l'article, couple
 −10 % (ε=0,8) et −25 % (ε=1,0). Pistes documentées dans
-`../PLAN_DE_CORRECTION.md` (items 3.1/3.2). La cible « théorie » numérisée est
+l'ancien `PLAN_DE_CORRECTION.md` (retiré du dépôt, disponible dans l'historique git). La cible « théorie » numérisée est
 tronquée aux pics de couple (occlusion par les marqueurs expérimentaux) : les
 RMSE sont des ordres de grandeur, pas des mesures de précision.

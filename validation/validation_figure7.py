@@ -26,7 +26,7 @@ Usage :
     python validation_figure7.py --pmode raw    # pression numérisée d'origine
 
 Sorties : figures PNG et métriques JSON dans validation/out/. La baseline de
-non-régression est lue/écrite dans ../audit/baseline/baseline_figure7.json et
+non-régression est lue/écrite dans validation/baseline_figure7.json et
 consommée par test_scientifique.py (test_validation_figure7_non_regression).
 
 La numérisation reste volontairement transparente et approximative : les RMSE
@@ -62,7 +62,7 @@ PDF_CANDIDATES = (
 )
 
 OUT_DIR = SCRIPT_DIR / "out"
-BASELINE_PATH = APP_DIR / "audit" / "baseline" / "baseline_figure7.json"
+BASELINE_PATH = SCRIPT_DIR / "baseline_figure7.json"
 
 PAPER_T_MIN = 180.0
 PAPER_T_MAX = 380.0
